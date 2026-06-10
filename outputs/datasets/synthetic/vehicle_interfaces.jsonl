@@ -1,0 +1,2 @@
+{"deployment_clearance_m": 1.6, "door_side": "right", "door_width_m": 1.05, "dwell_time_s": 60.0, "episode_id": "synthetic_mini_0000", "kneeling": true, "lift": false, "low_floor": true, "notification_modes": ["visual", "audio", "app"], "ramp": true, "vehicle_id": "veh_0"}
+{"deployment_clearance_m": 1.6, "door_side": "right", "door_width_m": 1.05, "dwell_time_s": 60.0, "episode_id": "synthetic_mini_0001", "kneeling": true, "lift": false, "low_floor": true, "notification_modes": ["visual", "audio", "app"], "ramp": true, "vehicle_id": "veh_0"}

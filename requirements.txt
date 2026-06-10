@@ -1,0 +1,7 @@
+numpy>=1.23
+pandas>=1.5
+pyyaml>=6.0
+pytest>=7.0
+# Optional for learned CASA-Net variants and nuPlan integration:
+# torch>=2.0
+# nuplan-devkit

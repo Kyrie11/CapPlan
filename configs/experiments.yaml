@@ -1,0 +1,6 @@
+dataset_dir: outputs/datasets/abilitybench_av
+closed_loop_output_dir: outputs/metrics/closed_loop
+main_results_csv: outputs/tables/main_results.csv
+counterfactual_results_csv: outputs/tables/counterfactual_results.csv
+diagnosis_results_csv: outputs/tables/diagnosis_results.csv
+uncertainty_results_csv: outputs/tables/uncertainty_results.csv

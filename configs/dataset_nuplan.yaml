@@ -1,0 +1,7 @@
+nuplan_root: null
+split: mini
+max_scenarios: 8
+output_dir: outputs/datasets/abilitybench_av
+accessibility_source: synthetic
+num_contracts_per_scene: 2
+seed: 13

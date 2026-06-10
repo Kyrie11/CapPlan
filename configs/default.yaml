@@ -1,0 +1,15 @@
+seed: 13
+planner:
+  beta: 1.0
+  no_capability_compiler: false
+  no_service_automaton: false
+  no_casa_net_transitions: false
+  no_typed_resource_ledger: false
+  no_conservative_margins: false
+  no_completion_value_guidance: false
+  soft_only_capability: false
+search:
+  min_availability: 0.05
+  max_expansions: 10000
+outputs:
+  root: outputs

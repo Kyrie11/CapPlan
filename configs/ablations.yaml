@@ -1,0 +1,16 @@
+variants:
+  full: {}
+  no_capability_compiler:
+    no_capability_compiler: true
+  no_service_automaton:
+    no_service_automaton: true
+  no_casa_net_transitions:
+    no_casa_net_transitions: true
+  no_typed_resource_ledger:
+    no_typed_resource_ledger: true
+  no_conservative_margins:
+    no_conservative_margins: true
+  no_completion_value_guidance:
+    no_completion_value_guidance: true
+  soft_only_capability:
+    soft_only_capability: true
