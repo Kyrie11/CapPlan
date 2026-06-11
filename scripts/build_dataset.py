@@ -132,6 +132,7 @@ def main() -> None:
     p.add_argument("--accessibility_source", choices=["synthetic_local", "synthetic", "geojson", "opensidewalks"], default="synthetic_local")
     p.add_argument("--pudo_source", choices=["auto", "synthetic_overlay", "nuplan_route"], default="auto", help="PUDO generation policy. Use nuplan_route to require route/lane-derived anchors in nuPlan mode.")
     p.add_argument("--num_contracts_per_scene", type=int, default=2)
+    p.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=0, help="Number of worker threads passed to the nuPlan scenario builder. Default 0 keeps the existing sequential behavior.")
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--strict", action="store_true")
     p.add_argument("--disable_tqdm", action="store_true", help="Disable preprocessing progress bars.")
@@ -151,6 +152,7 @@ def main() -> None:
         map_version=args.nuplan_map_version,
         split=args.split,
         seed=args.seed,
+        num_workers=args.num_workers,
     )
     acc_builder = SyntheticAccessibilityBuilder()
     pudo_gen = PUDOGenerator()

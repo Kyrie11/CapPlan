@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Sequence
@@ -25,6 +26,26 @@ class NuPlanScenarioRecord:
     agent_history: List[Dict]
     map_context: Dict
     route_corridor: Dict
+
+
+class _LocalNuPlanWorker:
+    """Minimal worker object compatible with nuPlan's ``worker_map`` helper.
+
+    Some nuPlan devkit versions call ``worker.number_of_threads`` before using
+    the scenario builder.  Passing ``None`` therefore crashes with
+    ``AttributeError: 'NoneType' object has no attribute 'number_of_threads'``.
+    This lightweight adapter keeps the default path sequential when
+    ``num_workers == 0`` and enables simple threaded mapping when requested.
+    """
+
+    def __init__(self, num_workers: int = 0) -> None:
+        self.number_of_threads = max(0, int(num_workers))
+
+    def map(self, task: Any, items: Iterable[Any]) -> List[Any]:
+        if self.number_of_threads == 0:
+            return [task(item) for item in items]
+        with ThreadPoolExecutor(max_workers=self.number_of_threads) as executor:
+            return list(executor.map(task, items))
 
 
 def _split_path_list(value: str | Sequence[str] | None) -> List[str]:
@@ -106,6 +127,7 @@ class NuPlanAdapter:
         map_version: str | None = None,
         split: str = "mini",
         seed: int = 0,
+        num_workers: int = 0,
         allow_synthetic_fallback: bool = False,
         # Legacy alias accepted for older scripts; does not imply fallback.
         nuplan_root: str | None = None,
@@ -123,9 +145,11 @@ class NuPlanAdapter:
         self.map_version = map_version
         self.split = split
         self.seed = seed
+        self.num_workers = max(0, int(num_workers))
         self.allow_synthetic_fallback = allow_synthetic_fallback
         self.nuplan_available = self._check_nuplan()
         self._builder = None
+        self._worker = _LocalNuPlanWorker(self.num_workers)
         if self.scene_source == "nuplan":
             self._init_nuplan_or_raise()
         elif self.scene_source == "synthetic":
@@ -253,7 +277,7 @@ class NuPlanAdapter:
         for method in ["get_scenarios", "get_scenario_tokens"]:
             if hasattr(self._builder, method):
                 try:
-                    scenarios = getattr(self._builder, method)(scenario_filter, None)
+                    scenarios = getattr(self._builder, method)(scenario_filter, self._worker)
                     break
                 except TypeError:
                     try:
