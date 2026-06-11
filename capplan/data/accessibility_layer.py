@@ -150,7 +150,7 @@ def attach_pudo_nodes_to_graph(graph: AccessibilityGraph, anchors: List[PUDOAnch
                     near.node_id,
                     ped_id,
                     max(0.1, length),
-                    anchor.sidewalk_width_m if anchor.sidewalk_width_m is not None else connector_width_default_m,
+                    anchor.sidewalk_width_m if anchor.sidewalk_width_m is not None else (connector_width_default_m if anchor.source.startswith("synthetic") else None),
                     None,
                     None,
                     "unknown",

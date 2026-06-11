@@ -11,13 +11,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import read_jsonl
 
 
+def _available_episode_ids(dataset_dir: Path) -> list[str]:
+    ids: set[str] = {str(r.get("episode_id")) for r in read_jsonl(dataset_dir / "episodes.jsonl") if r.get("episode_id")}
+    graph_dir = dataset_dir / "accessibility_graphs"
+    if graph_dir.exists():
+        for path in graph_dir.glob("*.nodes.jsonl"):
+            ids.add(path.name[: -len(".nodes.jsonl")])
+    return sorted(ids)
+
+
+def _resolve_episode_id(dataset_dir: Path, episode_id: str | None) -> str:
+    ids = _available_episode_ids(dataset_dir)
+    if episode_id is None:
+        if not ids:
+            raise RuntimeError(f"No episodes found in {dataset_dir}")
+        return ids[0]
+    requested = str(episode_id)
+    if requested in ids:
+        return requested
+    prefixed = f"nuplan_{requested}"
+    if prefixed in ids:
+        return prefixed
+    suffix_matches = [eid for eid in ids if eid.endswith(requested)]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    if len(suffix_matches) > 1:
+        sample = ", ".join(suffix_matches[:8])
+        raise RuntimeError(f"Ambiguous episode_id suffix {requested!r}; matches: {sample}")
+    sample = ", ".join(ids[:8]) if ids else "<none>"
+    raise RuntimeError(f"Unknown episode_id {requested!r}. Available examples: {sample}")
+
+
 def _load_episode_id(dataset_dir: Path, episode_id: str | None) -> str:
-    if episode_id:
-        return episode_id
-    episodes = read_jsonl(dataset_dir / "episodes.jsonl")
-    if not episodes:
-        raise RuntimeError(f"No episodes found in {dataset_dir}")
-    return str(episodes[0]["episode_id"])
+    return _resolve_episode_id(dataset_dir, episode_id)
 
 
 def main() -> None:
@@ -33,6 +59,12 @@ def main() -> None:
     edges = read_jsonl(dataset_dir / "accessibility_graphs" / f"{eid}.edges.jsonl")
     pudo = [r for r in read_jsonl(dataset_dir / "pudo_anchors.jsonl") if r.get("episode_id") == eid]
     entrances = [r for r in read_jsonl(dataset_dir / "entrances.jsonl") if r.get("episode_id") == eid]
+    if not nodes or not edges or not pudo or not entrances:
+        raise RuntimeError(
+            "Cannot visualize incomplete episode overlay: "
+            f"episode_id={eid}, nodes={len(nodes)}, edges={len(edges)}, "
+            f"pudo={len(pudo)}, entrances={len(entrances)}"
+        )
 
     try:
         import matplotlib.pyplot as plt
@@ -68,6 +100,7 @@ def main() -> None:
     fig.savefig(out, dpi=180)
     diagnostics = {
         "episode_id": eid,
+        "requested_episode_id": args.episode_id,
         "num_nodes": len(nodes),
         "num_edges": len(edges),
         "num_pudo": len(pudo),

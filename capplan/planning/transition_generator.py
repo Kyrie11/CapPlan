@@ -247,25 +247,50 @@ class TransitionGenerator:
                 ))
         return out
 
+    def _evidence_or_missing(
+        self,
+        resource_name: str,
+        kind: str,
+        value: Any,
+        *,
+        missing: bool = False,
+        reason: str | None = None,
+        **kwargs: Any,
+    ) -> ResourceEvidence:
+        """Create evidence without leaking aggregate values for missing fields.
+
+        A path can be partially observed: for example one edge may have a slope
+        value while the connector into a route-derived PUDO has no audited slope.
+        In that case the aggregate may be numerically non-null, but the resource
+        label must still be marked missing and its supervised value must be
+        ``None``. The raw aggregate is retained in ``observed`` for debugging.
+        """
+        if missing or value is None:
+            return ResourceEvidence(resource_name, kind, None, observed=value, missing=True, reason=reason or "not_observed", **kwargs)
+        return ResourceEvidence(resource_name, kind, value, observed=value, missing=False, **kwargs)
+
     def _path_evidence(self, phase: str, path: Dict[str, Any]) -> List[ResourceEvidence]:
         prefix = "access" if phase == "access" else "egress"
         missing = set(path.get("missing_fields") or [])
+        conf = path.get("confidence", 0.0)
         return [
-            ResourceEvidence(f"{prefix}_distance_m", "cumulative", path.get("distance"), sigma=(path.get("distance") or 0.0) * 0.03, confidence=path.get("confidence", 0.0), source="pedestrian_graph", missing=path.get("distance") is None),
-            ResourceEvidence("slope", "upper", path.get("slope"), sigma=0.005, confidence=path.get("confidence", 0.0), source="accessibility_map", missing="slope" in missing or path.get("slope") is None),
-            ResourceEvidence("cross_slope", "upper", path.get("cross_slope"), sigma=0.003, confidence=path.get("confidence", 0.0), source="accessibility_map", missing="cross_slope" in missing or path.get("cross_slope") is None),
-            ResourceEvidence("path_width_m", "lower", path.get("width"), sigma=0.05, confidence=path.get("confidence", 0.0), source="accessibility_map", missing="path_width_m" in missing or path.get("width") is None),
-            ResourceEvidence("curb_ramp", "categorical", path.get("curb_ramp"), confidence=path.get("confidence", 0.0), source="accessibility_map", missing="curb_ramp" in missing or path.get("curb_ramp") is None),
-            ResourceEvidence("step_free", "categorical", path.get("step_free"), confidence=path.get("confidence", 0.0), source="accessibility_map", missing="step_free" in missing or path.get("step_free") is None),
-            ResourceEvidence("surface", "categorical", path.get("surface"), confidence=path.get("confidence", 0.0), source="accessibility_map", missing="surface" in missing or path.get("surface") is None),
-            ResourceEvidence("lighting", "categorical", path.get("lighting"), confidence=path.get("confidence", 0.0), source="accessibility_map", missing=path.get("lighting") is None),
-            ResourceEvidence("map_confidence", "lower", path.get("confidence"), sigma=0.02, confidence=path.get("confidence", 0.0), source="accessibility_map", missing=path.get("confidence") is None),
-            ResourceEvidence("blockage_risk", "probabilistic", path.get("blockage_risk", 0.02), sigma=0.02, confidence=path.get("confidence", 0.0), source="perception"),
+            self._evidence_or_missing(f"{prefix}_distance_m", "cumulative", path.get("distance"), sigma=(path.get("distance") or 0.0) * 0.03, confidence=conf, source="pedestrian_graph", missing=path.get("distance") is None),
+            self._evidence_or_missing("slope", "upper", path.get("slope"), sigma=0.005, confidence=conf, source="accessibility_map", missing="slope" in missing or path.get("slope") is None, reason="partial_path_slope_missing" if "slope" in missing else None),
+            self._evidence_or_missing("cross_slope", "upper", path.get("cross_slope"), sigma=0.003, confidence=conf, source="accessibility_map", missing="cross_slope" in missing or path.get("cross_slope") is None, reason="partial_path_cross_slope_missing" if "cross_slope" in missing else None),
+            self._evidence_or_missing("path_width_m", "lower", path.get("width"), sigma=0.05, confidence=conf, source="accessibility_map", missing="path_width_m" in missing or path.get("width") is None, reason="partial_path_width_missing" if "path_width_m" in missing else None),
+            self._evidence_or_missing("curb_ramp", "categorical", path.get("curb_ramp"), confidence=conf, source="accessibility_map", missing="curb_ramp" in missing or path.get("curb_ramp") is None, reason="partial_path_curb_ramp_missing" if "curb_ramp" in missing else None),
+            self._evidence_or_missing("step_free", "categorical", path.get("step_free"), confidence=conf, source="accessibility_map", missing="step_free" in missing or path.get("step_free") is None, reason="partial_path_step_free_missing" if "step_free" in missing else None),
+            self._evidence_or_missing("surface", "categorical", path.get("surface"), confidence=conf, source="accessibility_map", missing="surface" in missing or path.get("surface") is None, reason="partial_path_surface_missing" if "surface" in missing else None),
+            self._evidence_or_missing("lighting", "categorical", path.get("lighting"), confidence=conf, source="accessibility_map", missing=path.get("lighting") is None),
+            self._evidence_or_missing("map_confidence", "lower", path.get("confidence"), sigma=0.02, confidence=conf, source="accessibility_map", missing=path.get("confidence") is None),
+            ResourceEvidence("blockage_risk", "probabilistic", path.get("blockage_risk", 0.02), sigma=0.02, confidence=conf, source="perception"),
         ]
 
     def _interface_evidence(self, anchor: PUDOAnchor, vehicle: VehicleInterface, phase: str) -> List[ResourceEvidence]:
-        clearance = min(vehicle.deployment_clearance_m, anchor.deployment_clearance_m if anchor.deployment_clearance_m is not None else 0.0)
-        low_floor_kneeling = bool(vehicle.low_floor and vehicle.kneeling and (anchor.curb_height_m is not None and anchor.curb_height_m <= 0.06))
+        clearance_missing = anchor.deployment_clearance_m is None
+        clearance = None if clearance_missing else min(vehicle.deployment_clearance_m, anchor.deployment_clearance_m)
+        low_floor_kneeling_missing = anchor.curb_height_m is None
+        low_floor_kneeling = None if low_floor_kneeling_missing else bool(vehicle.low_floor and vehicle.kneeling and anchor.curb_height_m <= 0.06)
         side_obs = {"vehicle_side": vehicle.door_side, "curb_side": anchor.side, "observed": vehicle.door_side}
         return [
             ResourceEvidence("door_side", "categorical", side_obs, confidence=min(1.0, anchor.map_confidence), source="vehicle_spec+curbside_map", observed=side_obs, required=None, missing=anchor.side == "unknown"),
@@ -273,12 +298,12 @@ class TransitionGenerator:
             ResourceEvidence("lift", "categorical", vehicle.lift, confidence=1.0, source="vehicle_spec"),
             ResourceEvidence("low_floor", "categorical", vehicle.low_floor, confidence=1.0, source="vehicle_spec"),
             ResourceEvidence("kneeling", "categorical", vehicle.kneeling, confidence=1.0, source="vehicle_spec"),
-            ResourceEvidence("low_floor_kneeling", "categorical", low_floor_kneeling, confidence=min(1.0, anchor.map_confidence), source="vehicle_spec+curbside_map"),
+            self._evidence_or_missing("low_floor_kneeling", "categorical", low_floor_kneeling, confidence=min(1.0, anchor.map_confidence), source="vehicle_spec+curbside_map", missing=low_floor_kneeling_missing, reason="curb_height_missing" if low_floor_kneeling_missing else None),
             ResourceEvidence("door_width_m", "lower", vehicle.door_width_m, sigma=0.01, confidence=1.0, source="vehicle_spec"),
-            ResourceEvidence("door_side_clearance_m", "lower", clearance, sigma=0.05, confidence=anchor.map_confidence, source="vehicle_spec+curbside_map", missing=anchor.deployment_clearance_m is None),
-            ResourceEvidence("deployment_clearance_m", "lower", clearance, sigma=0.05, confidence=anchor.map_confidence, source="vehicle_spec+curbside_map", missing=anchor.deployment_clearance_m is None),
-            ResourceEvidence("ramp_clearance_m", "lower", clearance, sigma=0.05, confidence=anchor.map_confidence, source="vehicle_spec+curbside_map", missing=anchor.deployment_clearance_m is None),
-            ResourceEvidence("curb_height_m", "upper", anchor.curb_height_m, sigma=0.01, confidence=anchor.map_confidence, source="curbside_map", missing=anchor.curb_height_m is None),
+            self._evidence_or_missing("door_side_clearance_m", "lower", clearance, sigma=0.05, confidence=anchor.map_confidence, source="vehicle_spec+curbside_map", missing=clearance_missing, reason="deployment_clearance_missing" if clearance_missing else None),
+            self._evidence_or_missing("deployment_clearance_m", "lower", clearance, sigma=0.05, confidence=anchor.map_confidence, source="vehicle_spec+curbside_map", missing=clearance_missing, reason="deployment_clearance_missing" if clearance_missing else None),
+            self._evidence_or_missing("ramp_clearance_m", "lower", clearance, sigma=0.05, confidence=anchor.map_confidence, source="vehicle_spec+curbside_map", missing=clearance_missing, reason="deployment_clearance_missing" if clearance_missing else None),
+            self._evidence_or_missing("curb_height_m", "upper", anchor.curb_height_m, sigma=0.01, confidence=anchor.map_confidence, source="curbside_map", missing=anchor.curb_height_m is None, reason="curb_height_missing" if anchor.curb_height_m is None else None),
             ResourceEvidence("dwell_time_s", "cumulative", vehicle.dwell_time_s, sigma=5.0, confidence=1.0, source="vehicle_spec"),
             ResourceEvidence("map_confidence", "lower", anchor.map_confidence, sigma=0.02, confidence=anchor.map_confidence, source="curbside_map"),
             ResourceEvidence("blockage_risk", "probabilistic", anchor.blockage_risk, sigma=0.03, confidence=anchor.dynamic_confidence, source="prediction"),
