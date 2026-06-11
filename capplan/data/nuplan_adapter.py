@@ -329,7 +329,9 @@ class NuPlanAdapter:
             metadata={"source": "nuplan", "data_root": self.data_root, "db_files": self.db_files},
         )
         ep = EpisodeMetadata(eid, str(token), self.split, "origin", "destination", times[0] if times else 0.0, route_len, max(route_len * 0.9, 1.0), self.seed + idx, True, "nuplan", str(map_name), self.map_version, str(token), str(log_name), list(route_ids), {"source": "nuplan", "route_corridor": scene.route_corridor})
-        return NuPlanScenarioRecord(ep, scene, ego_hist, agents, {"map_name": map_name, "map_version": self.map_version}, scene.route_corridor)
+        # Keep the map API only in the in-memory record.  The serializable SceneRecord
+        # above intentionally stores only map identifiers and route metadata.
+        return NuPlanScenarioRecord(ep, scene, ego_hist, agents, {"map_name": map_name, "map_version": self.map_version, "map_api": map_api}, scene.route_corridor)
 
     @staticmethod
     def _pose_from_any(obj: Any) -> Pose2D:

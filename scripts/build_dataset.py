@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from capplan.data.accessibility_layer import SyntheticAccessibilityBuilder, write_accessibility_graph
+from capplan.data.accessibility_layer import SyntheticAccessibilityBuilder, attach_pudo_nodes_to_graph, write_accessibility_graph
 from capplan.data.capability_contracts import sample_contracts_with_pairs
 from capplan.data.label_oracle import IndependentLabelOracle
 from capplan.data.nuplan_adapter import NuPlanAdapter
@@ -90,6 +90,30 @@ def _write_splits(out: Path, episode_ids: List[str]) -> None:
         (split_dir / f"{name}_episodes.txt").write_text("\n".join(ids) + ("\n" if ids else ""), encoding="utf-8")
 
 
+
+def _scene_service_entrance_poses(scene: Any) -> tuple[Pose2D, Pose2D, str]:
+    """Return passenger service entrance proxies in the scene coordinate frame.
+
+    Standard nuPlan planners receive the ego state, route roadblocks, and mission
+    goal rather than passenger entrances.  CapPlan still needs service anchors for
+    first/last-meter reasoning, so in nuPlan builds we use the initial ego pose
+    and mission goal as map-frame proxy entrances unless a richer service-request
+    overlay is provided later.
+    """
+    if getattr(scene, "source", None) == "nuplan":
+        origin = scene.initial_ego_pose
+        destination = scene.mission_goal
+        if destination is None:
+            length = float(scene.route_corridor.get("length_m", 100.0) or 100.0)
+            destination = Pose2D(
+                origin.x + length * __import__("math").cos(origin.heading),
+                origin.y + length * __import__("math").sin(origin.heading),
+                origin.heading,
+                origin.frame,
+            )
+        return origin, destination, "nuplan_scene_proxy"
+    return Pose2D(0.0, 0.0, 0.0, "local"), Pose2D(160.0, 24.0, 0.0, "local"), "synthetic_service_overlay"
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Build the passenger capability-aware CapPlan dataset.")
     p.add_argument("--scene_source", choices=["synthetic", "nuplan"], default="synthetic")
@@ -106,6 +130,7 @@ def main() -> None:
     p.add_argument("--max_scenarios", type=int, default=4)
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
     p.add_argument("--accessibility_source", choices=["synthetic_local", "synthetic", "geojson", "opensidewalks"], default="synthetic_local")
+    p.add_argument("--pudo_source", choices=["auto", "synthetic_overlay", "nuplan_route"], default="auto", help="PUDO generation policy. Use nuplan_route to require route/lane-derived anchors in nuPlan mode.")
     p.add_argument("--num_contracts_per_scene", type=int, default=2)
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--strict", action="store_true")
@@ -159,21 +184,40 @@ def main() -> None:
         episodes.append(to_dict(ep))
         eid = ep.episode_id
 
-        origin_pose = Pose2D(0.0, 0.0, 0.0, "local")
-        dest_pose = Pose2D(160.0, 24.0, 0.0, "local")
-        origin = EntranceAnchor("origin", eid, "origin_entrance", origin_pose, "origin", 0.98, "synthetic_service_overlay")
-        destination = EntranceAnchor("destination", eid, "destination_entrance", dest_pose, "destination", 0.98, "synthetic_service_overlay")
+        origin_pose, dest_pose, entrance_source = _scene_service_entrance_poses(scene)
+        origin = EntranceAnchor("origin", eid, "origin_entrance", origin_pose, "origin", 0.98, entrance_source)
+        destination = EntranceAnchor("destination", eid, "destination_entrance", dest_pose, "destination", 0.98, entrance_source)
         entrances.extend([to_dict(origin), to_dict(destination)])
 
         if args.accessibility_source not in {"synthetic", "synthetic_local"}:
             raise RuntimeError("Only synthetic_local accessibility overlays are available in this repository smoke implementation; provide prepared GeoJSON through the builder API for real overlays")
         graph = acc_builder.build(eid, seed=ep.seed, origin=origin_pose, destination=dest_pose)
-        write_accessibility_graph(out, graph)
 
         vehicles = vehicle_interface_profiles(eid)
         vehicle_records.extend(to_dict(v) for v in vehicles)
         primary_vehicle = next(v for v in vehicles if v.vehicle_id == "wav_ramp_right")
-        pudo = pudo_gen.generate({"episode_id": eid, "seed": ep.seed, "metadata": ep.metadata}, graph, primary_vehicle)
+        pudo_context = {
+            "episode_id": eid,
+            "seed": ep.seed,
+            "metadata": ep.metadata,
+            "scene_source": scene.source,
+            "route_roadblock_ids": scene.route_roadblock_ids,
+            "route_corridor": scene.route_corridor,
+            "agent_history": scene.agent_history,
+            "map_context": record.map_context,
+        }
+        pudo = pudo_gen.generate(
+            pudo_context,
+            graph,
+            primary_vehicle,
+            {
+                "n_candidates": 4,
+                "pudo_source": "synthetic_overlay" if args.pudo_source == "synthetic_overlay" else ("nuplan_route" if args.pudo_source == "nuplan_route" else "auto"),
+                "strict_nuplan_pudo": args.scene_source == "nuplan" and args.pudo_source == "nuplan_route",
+            },
+        )
+        graph, pudo = attach_pudo_nodes_to_graph(graph, pudo)
+        write_accessibility_graph(out, graph)
         pudo_records.extend(to_dict(x) for x in pudo)
 
         trip_context = {**to_dict(ep), "route_corridor": scene.route_corridor, "trip_modifiers": {}}
@@ -221,7 +265,7 @@ def main() -> None:
         "version": "0.1.0",
         "scene_source": args.scene_source,
         "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files_requested": resolved_db_files, "db_files_expanded": adapter.db_files if args.scene_source == "nuplan" else [], "map_version": args.nuplan_map_version},
-        "accessibility_source": args.accessibility_source,
+        "accessibility_source": args.accessibility_source, "pudo_source": args.pudo_source,
         "builder_git_commit": _git_commit(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "strict_mode": bool(args.strict),
