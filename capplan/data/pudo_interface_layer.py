@@ -199,21 +199,101 @@ def _select_spaced(points: List[tuple[float, Pose2D, Any]], count: int, min_spac
     return selected
 
 
-def _near_walkway(map_api: Any, pose: Pose2D) -> bool:
+def _polygon_width_estimate(obj: Any) -> float | None:
+    """Estimate a pedestrian-space width from a map polygon when available.
+
+    nuPlan walkway objects expose different wrappers across devkit versions.
+    This helper intentionally returns ``None`` unless there is actual polygon
+    geometry to inspect; callers must not convert a missing width into a
+    supervised accessibility value.
+    """
+    polygon = _safe_attr(obj, ["polygon"], None)
+    exterior = _safe_attr(polygon, ["exterior"], None) if polygon is not None else None
+    coords = _safe_attr(exterior, ["coords"], None) if exterior is not None else None
+    pts: List[tuple[float, float]] = []
+    for xy in list(coords or []):
+        try:
+            pts.append((float(xy[0]), float(xy[1])))
+        except Exception:
+            continue
+    if len(pts) < 3:
+        return None
+
+    # Prefer the minimum side of the rotated minimum bounding rectangle; for
+    # long thin walkway polygons this is a conservative proxy for clear width.
+    try:
+        mrr = polygon.minimum_rotated_rectangle
+        rect_coords = list(mrr.exterior.coords)
+        side_lengths = [
+            math.hypot(rect_coords[i + 1][0] - rect_coords[i][0], rect_coords[i + 1][1] - rect_coords[i][1])
+            for i in range(min(4, len(rect_coords) - 1))
+        ]
+        positives = [x for x in side_lengths if x > 1e-6]
+        if positives:
+            return float(min(positives))
+    except Exception:
+        pass
+
+    # Fallback that works for simple axis-aligned fake polygons in tests.
+    xs = [x for x, _ in pts]
+    ys = [y for _, y in pts]
+    width = min(max(xs) - min(xs), max(ys) - min(ys))
+    return float(width) if width > 1e-6 else None
+
+
+def _walkway_context(map_api: Any, pose: Pose2D, search_radius_m: float = 6.0) -> tuple[bool, float | None, float | None]:
+    """Return ``(near_walkway, width_estimate_m, distance_m)``.
+
+    A boolean near-walkway hit is useful for confidence/provenance, but it is
+    not enough to supervise width or deployment-clearance resources.  Width is
+    only returned when polygon geometry is available.
+    """
     layer = _semantic_layer("WALKWAYS")
     p = _point2d(pose.x, pose.y)
     if layer is None or p is None:
-        return False
+        return False, None, None
+
+    near = False
+    nearest_dist: float | None = None
+    candidate_objs: List[Any] = []
+
     try:
-        if bool(map_api.is_in_layer(p, layer)):
-            return True
+        near = bool(map_api.is_in_layer(p, layer))
+        if near:
+            nearest_dist = 0.0
     except Exception:
         pass
+
     try:
-        _, dist = map_api.get_distance_to_nearest_map_object(p, layer)
-        return dist is not None and float(dist) <= 3.0
+        obj, dist = map_api.get_distance_to_nearest_map_object(p, layer)
+        if dist is not None:
+            nearest_dist = float(dist)
+            near = near or nearest_dist <= 3.0
+        if obj is not None:
+            candidate_objs.append(obj)
     except Exception:
-        return False
+        pass
+
+    try:
+        proximal = map_api.get_proximal_map_objects(p, search_radius_m, [layer])
+        if isinstance(proximal, dict):
+            for objs in proximal.values():
+                candidate_objs.extend(list(objs or []))
+        else:
+            candidate_objs.extend(list(proximal or []))
+    except Exception:
+        pass
+
+    widths = [w for w in (_polygon_width_estimate(obj) for obj in candidate_objs) if w is not None]
+    # Clip implausibly large polygon extents; a huge region label is not a clear
+    # pedestrian width measurement.
+    widths = [min(float(w), 6.0) for w in widths if float(w) > 0.0]
+    width = max(widths) if widths else None
+    return near or width is not None, width, nearest_dist
+
+
+def _near_walkway(map_api: Any, pose: Pose2D) -> bool:
+    return _walkway_context(map_api, pose)[0]
 
 
 def nuplan_route_pudo_anchors(
@@ -261,11 +341,19 @@ def nuplan_route_pudo_anchors(
         else:
             nx, ny = -math.sin(stop.heading), math.cos(stop.heading)
         curb = Pose2D(stop.x + 3.2 * nx, stop.y + 3.2 * ny, stop.heading, "map")
-        near_walkway = _near_walkway(map_api, curb)
+        near_walkway, sidewalk_width, walkway_dist = _walkway_context(map_api, curb)
+        # Do not fabricate accessibility supervision from a route-lane hit.
+        # Presence of a nearby walkway raises confidence/provenance, but sidewalk
+        # width and deployment clearance remain missing unless polygon geometry
+        # supports a width estimate.
+        if sidewalk_width is not None:
+            sidewalk_width = round(max(0.1, float(sidewalk_width)), 3)
+        deployment_clearance = round(min(float(sidewalk_width), 1.20), 3) if sidewalk_width is not None else None
         risk, dyn_conf = _dynamic_blockage_risk(stop, agent_history or [])
         lane_id = str(_safe_attr(obj, ["id"], "")) or None
         rb_id = _safe_attr(obj, ["get_roadblock_id", "roadblock_id"], None)
-        map_conf = 0.75 if near_walkway else 0.62
+        map_conf = 0.80 if sidewalk_width is not None else (0.68 if near_walkway else 0.55)
+        source = "nuplan_route_map_walkway_width_proxy" if sidewalk_width is not None else ("nuplan_route_map_walkway_unmeasured" if near_walkway else "nuplan_route_map_no_walkway")
         anchors.append(PUDOAnchor(
             anchor_id=f"nuplan_{kind}_{idx}",
             episode_id=episode_id,
@@ -280,15 +368,15 @@ def nuplan_route_pudo_anchors(
             lane_connector_id=None,
             adjacent_ped_node_id=f"nuplan_{kind}_{idx}",
             curb_height_m=None,
-            sidewalk_width_m=1.20 if near_walkway else None,
-            deployment_clearance_m=1.20 if near_walkway else 0.85,
+            sidewalk_width_m=sidewalk_width,
+            deployment_clearance_m=deployment_clearance,
             blockage_risk=risk,
             map_confidence=map_conf,
             dynamic_confidence=dyn_conf,
             lighting=None,
             shelter=None,
             timestamp_s=0.0,
-            source="nuplan_route_map",
+            source=source,
         ))
     return anchors
 
