@@ -1,28 +1,32 @@
-"""Typed safe-budget search over CASA service transitions."""
+"""Typed safe-budget search over passenger-service transitions."""
 from __future__ import annotations
 
 import heapq
 import itertools
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from capplan.data.schemas import CandidateTransition, LedgerStep, PassengerCompleteSkeleton, ViolationRecord
+from capplan.data.schemas import CandidateTransition, LedgerStep, PassengerCompleteSkeleton, ResourceEvidence, ViolationRecord
 from capplan.models.predictors import TransitionPrediction
-from capplan.semantics.capability_compiler import CompiledContract
+from capplan.planning.certificates import select_certificate
+from capplan.semantics.capability_compiler import CompiledContract, UncertaintySpec
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
 from capplan.semantics.service_automaton import ServiceAutomaton
 from capplan.semantics.typed_resource_algebra import (
+    MissingEvidence,
     active_clauses,
+    active_groups,
     all_margins,
     conservative_value,
     dominates,
-    initial_value,
+    init_ledger,
+    is_missing,
     satisfy,
+    satisfy_all,
     signed_margin,
     update_value,
 )
-from capplan.planning.certificates import select_certificate
 
 
 @dataclass
@@ -61,13 +65,15 @@ class TypedSafeBudgetSearch:
         episode_id: str,
         compiled: CompiledContract,
         transitions: List[CandidateTransition],
-        predictions: Dict[str, TransitionPrediction],
+        predictions: Dict[str, TransitionPrediction] | None = None,
         initial_anchor: str = "origin",
         initial_phase: str = "origin",
     ):
+        predictions = predictions or {}
         clauses = [] if (compiled.soft_only or self.config.soft_only_capability) else compiled.clauses
+        groups = [] if (compiled.soft_only or self.config.soft_only_capability) else compiled.groups
         init_resources = {c.resource_name for c in clauses}
-        ledger = {name: initial_value(self.registry.get(name)) for name in init_resources}
+        ledger = init_ledger(init_resources, self.registry)
         start = SearchLabel(initial_anchor, initial_phase, ledger, 0.0, [], [])
         pq: List[Tuple[float, int, SearchLabel]] = []
         counter = itertools.count()
@@ -77,15 +83,13 @@ class TypedSafeBudgetSearch:
         outgoing: Dict[Tuple[str, str], List[CandidateTransition]] = {}
         for e in transitions:
             outgoing.setdefault((e.from_anchor, e.from_phase), []).append(e)
-            # Also allow phase-only matching for synthetic transitions whose anchor
-            # names are replan placeholders.
-            outgoing.setdefault(("*", e.from_phase), []).append(e)
 
         expansions = 0
         while pq and expansions < self.config.max_expansions:
             _, _, label = heapq.heappop(pq)
             expansions += 1
-            if self.automaton.accept(label.phase) and self._all_satisfied(label.resource_ledger, clauses):
+            ok_final, _, _ = satisfy_all(label.resource_ledger, clauses, groups, self.registry)
+            if self.automaton.accept(label.phase) and ok_final:
                 return PassengerCompleteSkeleton(
                     episode_id=episode_id,
                     passenger_id=compiled.passenger_id,
@@ -97,13 +101,14 @@ class TypedSafeBudgetSearch:
                 ), None, {"expansions": expansions, "violations": len(violations)}
 
             candidates = list(outgoing.get((label.anchor, label.phase), []))
-            # If anchor-specific transitions are absent but phase transitions exist,
-            # permit matching by phase. This supports nuPlan/mock adapters whose
-            # anchors are generated at runtime.
             if not candidates:
-                candidates = [e for e in transitions if e.from_phase == label.phase]
+                # Phase-only fallback is intentionally restricted to the disabled
+                # automaton ablation and to transitions whose source anchor is a
+                # real current anchor or a replan edge.
+                if self.automaton.disabled:
+                    candidates = [e for e in transitions if e.from_phase == label.phase]
             for e in candidates:
-                ok, new_ledger, step, vios = self._try_expand(label, e, compiled, clauses, predictions.get(e.transition_id))
+                ok, new_ledger, step, vios = self._try_expand(label, e, compiled, clauses, groups, predictions.get(e.transition_id))
                 if not ok:
                     violations.extend(vios)
                     continue
@@ -118,68 +123,111 @@ class TypedSafeBudgetSearch:
         cert = select_certificate(episode_id, compiled.passenger_id, violations)
         return None, cert, {"expansions": expansions, "violations": len(violations), "frontier_exhausted": True}
 
-    def _try_expand(self, label: SearchLabel, e: CandidateTransition, compiled: CompiledContract, clauses, pred: Optional[TransitionPrediction]):
-        violations: List[ViolationRecord] = []
-        if not self.automaton.legal(label.phase, e.action, e.to_phase):
+    def _try_expand(self, label: SearchLabel, e: CandidateTransition, compiled: CompiledContract, clauses: Sequence, groups: Sequence, pred: Optional[TransitionPrediction]):
+        # 1. Legal lifecycle.
+        if not self.automaton.legal(label.phase, e.action, e.to_phase) or not e.tests.legal_lifecycle:
             return False, label.resource_ledger, None, [ViolationRecord(label.phase, e.transition_id, "lifecycle", -1.0, "service_automaton", 1.0, "illegal_lifecycle")]
-        if e.availability < self.config.min_availability:
-            return False, label.resource_ledger, None, [ViolationRecord(label.phase, e.transition_id, "availability", e.availability - self.config.min_availability, "prediction", e.map_confidence, "dynamic_unavailable")]
-        if e.dynamic.get("blocked"):
-            return False, label.resource_ledger, None, [ViolationRecord(label.phase, e.transition_id, "dynamic_blockage", -1.0, "perception", e.map_confidence, "blocked")]
+        # 2. Anchor/spatial/topological/physical tests.
+        for attr, resource, reason in [
+            ("spatially_anchored", "anchor", "not_spatially_anchored"),
+            ("topologically_valid", "topology", "not_topologically_valid"),
+            ("physically_valid", "physical", "not_physically_valid"),
+        ]:
+            if not getattr(e.tests, attr):
+                return False, label.resource_ledger, None, [ViolationRecord(e.to_phase, e.transition_id, resource, -1.0, "transition_tests", e.map_confidence, reason)]
+        # 3. Interface validity independent of passenger-specific resource clauses.
+        if not e.tests.interface_valid:
+            return False, label.resource_ledger, None, [ViolationRecord(e.to_phase, e.transition_id, "interface", -1.0, "transition_tests", e.map_confidence, ";".join(e.tests.reasons) or "interface_invalid")]
+        # 4. Dynamic availability from CASA prediction and tests.
+        a_hat = pred.dynamic_availability if pred else e.availability
+        if a_hat < self.config.min_availability or not e.tests.dynamically_available or e.dynamic.get("blocked", False):
+            margin = float(a_hat) - self.config.min_availability
+            return False, label.resource_ledger, None, [ViolationRecord(e.to_phase, e.transition_id, "availability", margin, "prediction", e.map_confidence, "dynamic_unavailable")]
 
         if self.config.no_typed_resource_ledger:
-            # Targeted ablation: collapse numeric resources into one scalar burden.
             burden = float(label.resource_ledger.get("scalar_budget", 0.0))
-            for ev in e.resource_evidence:
-                if ev.kind != "categorical":
-                    burden += abs(float(ev.value))
+            for ev in (pred.typed_evidence if pred else e.resource_evidence):
+                if ev.kind != "categorical" and ev.value is not None:
+                    try:
+                        burden += abs(float(ev.value))
+                    except Exception:
+                        pass
             new_ledger = {"scalar_budget": burden}
             step = LedgerStep(e.transition_id, e.to_phase, e.action, new_ledger, {}, [ev.__dict__ for ev in e.resource_evidence])
             return True, new_ledger, step, []
 
+        # 5. Resource update using conservative evidence and per-resource beta.
         new_ledger = dict(label.resource_ledger)
-        # Apply categorical clauses using clause-specific compatibility before
-        # storing predicate conjunction as a ledger value.
-        for ev in (pred.typed_evidence if pred else e.resource_evidence):
+        evidence_list = pred.typed_evidence if pred else e.resource_evidence
+        active = active_clauses(clauses, [e.from_phase, e.to_phase])
+        active_by_resource: Dict[str, List[Any]] = {}
+        for c in active:
+            active_by_resource.setdefault(c.resource_name, []).append(c)
+        observed_resources = set()
+        for ev in evidence_list:
             if not self.registry.has(ev.resource_name):
                 continue
+            observed_resources.add(ev.resource_name)
             rt = self.registry.get(ev.resource_name)
             if ev.resource_name not in new_ledger:
-                new_ledger[ev.resource_name] = initial_value(rt)
-            beta = 0.0 if self.config.no_conservative_margins else self.config.beta
-            if rt.kind == "categorical":
-                ok = True
-                for c in [c for c in clauses if c.resource_name == ev.resource_name and (e.to_phase in c.phase_scope or e.from_phase in c.phase_scope or "all" in c.phase_scope)]:
-                    from capplan.semantics.typed_resource_algebra import compatible
-                    ok = ok and compatible(ev.value, c.threshold, c.operator)
-                if not [c for c in clauses if c.resource_name == ev.resource_name]:
-                    ok = bool(ev.value)
-                new_ledger[ev.resource_name] = bool(new_ledger.get(ev.resource_name, True)) and ok
+                new_ledger[ev.resource_name] = MissingEvidence(ev.resource_name, phase=e.to_phase)
+            clauses_for_resource = active_by_resource.get(ev.resource_name, [])
+            # Categorical evidence must be evaluated clause-specifically so any_of
+            # alternatives retain their own observed/required audit values.
+            if rt.kind == "categorical" and clauses_for_resource:
+                for c in clauses_for_resource:
+                    beta = self._beta_for(compiled, c.resource_name)
+                    new_ledger[ev.resource_name] = update_value(new_ledger.get(ev.resource_name), ev.value if not ev.missing else MissingEvidence(ev.resource_name, e.to_phase, ev.reason or "not_observed", ev.source, ev.confidence), rt, evidence=ev, clause=c)
             else:
-                xbar = conservative_value(ev.value, ev.sigma, rt, beta=beta)
-                new_ledger[ev.resource_name] = update_value(new_ledger.get(ev.resource_name, initial_value(rt)), xbar, rt)
+                beta = self._beta_for(compiled, ev.resource_name)
+                if self.config.no_conservative_margins:
+                    beta = 0.0
+                elif beta is None:
+                    beta = self.config.beta
+                xbar = MissingEvidence(ev.resource_name, e.to_phase, ev.reason or "not_observed", ev.source, ev.confidence) if ev.missing or ev.value is None else conservative_value(ev.value, ev.sigma, rt, beta=float(beta))
+                new_ledger[ev.resource_name] = update_value(new_ledger.get(ev.resource_name), xbar, rt, evidence=ev)
 
-        check_phases = [e.from_phase, e.to_phase]
-        active = active_clauses(clauses, check_phases)
+        violations: List[ViolationRecord] = []
+        active_groups_for_edge = active_groups(groups, [e.from_phase, e.to_phase])
+        # 6. Uncertainty: missing hard evidence and confidence thresholds fail closed.
+        grouped_clause_ids = {cid for g in active_groups_for_edge for cid in g.clause_ids}
         for c in active:
-            if not satisfy(new_ledger, c, self.registry):
-                violations.append(ViolationRecord(
-                    phase=e.to_phase,
-                    transition_id=e.transition_id,
-                    resource_type=c.resource_name,
-                    signed_margin=signed_margin(new_ledger, c, self.registry),
-                    evidence_source=c.source,
-                    confidence=c.confidence,
-                    reason="resource_or_interface",
-                ))
+            if c.id in grouped_clause_ids:
+                # Group logic, especially any_of, decides whether missing one
+                # alternative is fatal.
+                continue
+            if c.resource_name not in observed_resources and c.hard and c.missing_policy == "fail_closed":
+                # Missing evidence fails only when the ledger has not already
+                # observed this active resource on an earlier edge.
+                if is_missing(new_ledger.get(c.resource_name)) and (e.to_phase in c.phase_scope or e.from_phase in c.phase_scope or "all" in c.phase_scope):
+                    violations.append(ViolationRecord(e.to_phase, e.transition_id, c.resource_name, -1.0, c.source, 0.0, "missing_evidence"))
+            elif c.resource_name in observed_resources:
+                evs = [ev for ev in evidence_list if ev.resource_name == c.resource_name]
+                for ev in evs:
+                    uspec = compiled.uncertainty.get(c.resource_name)
+                    if ev.missing and c.hard and c.missing_policy == "fail_closed":
+                        violations.append(ViolationRecord(e.to_phase, e.transition_id, c.resource_name, -1.0, ev.source, ev.confidence, "missing_evidence"))
+                    if uspec and uspec.min_confidence > 0 and ev.confidence < uspec.min_confidence and c.hard:
+                        margin = (ev.confidence - uspec.min_confidence) / max(abs(uspec.min_confidence), 1e-9)
+                        violations.append(ViolationRecord(e.to_phase, e.transition_id, c.resource_name if c.resource_name == "map_confidence" else "map_confidence", margin, ev.source, ev.confidence, "low_confidence" if uspec.missing_policy != "inconclusive_if_low_confidence" else "inconclusive_low_confidence"))
         if violations:
             return False, new_ledger, None, violations
-        margins = all_margins(new_ledger, active, self.registry)
+
+        # 7. Hard resource and requirement-group satisfaction.
+        ok, margins, failed = satisfy_all(new_ledger, active, active_groups_for_edge, self.registry)
+        if not ok:
+            for name in failed:
+                c = next((x for x in active if x.resource_name == name or x.id == name), None)
+                violations.append(ViolationRecord(e.to_phase, e.transition_id, name, signed_margin(new_ledger, c, self.registry) if c else -1.0, c.source if c else "capability_contract", c.confidence if c else e.map_confidence, "resource_or_interface"))
+            return False, new_ledger, None, violations
         step = LedgerStep(e.transition_id, e.to_phase, e.action, dict(new_ledger), margins, [ev.__dict__ for ev in e.resource_evidence])
         return True, new_ledger, step, []
 
-    def _all_satisfied(self, ledger: Mapping[str, Any], clauses) -> bool:
-        return all(satisfy(ledger, c, self.registry) for c in clauses)
+    def _beta_for(self, compiled: CompiledContract, resource_name: str) -> float:
+        if self.config.no_conservative_margins:
+            return 0.0
+        spec: UncertaintySpec | None = compiled.uncertainty.get(resource_name)
+        return float(spec.beta_tau if spec else self.config.beta)
 
     def _priority(self, label: SearchLabel, pred: Optional[TransitionPrediction]) -> float:
         value = pred.completion_value if pred else 0.5

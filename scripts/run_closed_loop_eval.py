@@ -11,12 +11,16 @@ from capplan.planning.planner import PlannerConfig
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Run CapPlan closed-loop/strict mock evaluation over a saved dataset.")
     p.add_argument("--dataset_dir", default="outputs/datasets/synthetic")
-    p.add_argument("--output_dir", default="outputs/metrics/closed_loop")
+    p.add_argument("--output_dir", default="outputs/eval/closed_loop")
+    p.add_argument("--trajectory_mode", choices=["mock_strict", "nuplan_closed_loop"], default="mock_strict")
+    p.add_argument("--casa_mode", choices=["heuristic_oracle_baseline", "learned"], default="heuristic_oracle_baseline")
     args = p.parse_args()
-    res = ClosedLoopRunner(PlannerConfig()).run_dataset(args.dataset_dir, args.output_dir)
+    cfg = PlannerConfig(trajectory_mode=args.trajectory_mode, casa_mode=args.casa_mode)
+    res = ClosedLoopRunner(cfg).run_dataset(args.dataset_dir, args.output_dir)
     print(res["metrics"])
+
 
 if __name__ == "__main__":
     main()

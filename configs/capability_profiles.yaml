@@ -1,0 +1,174 @@
+# Auditable functional defaults for synthetic/smoke profiles.  These are planning
+# defaults, not universal truths about any passenger.  Baselines are centered on
+# common accessible-route guidance such as 36 in / 0.915 m minimum clear width,
+# walking-surface running slope around 1:20, cross slope around 1:48, and ramp
+# slope around 1:12, then varied by archetype and trip modifiers.
+version: v1
+resources:
+  clear_width_m_baseline: 0.915
+  walking_surface_slope_max: 0.05
+  cross_slope_max: 0.0208
+  ramp_slope_max: 0.0833
+archetypes:
+  standard_ambulatory:
+    mobility:
+      device_type: none
+      device_width_m: 0.55
+      turning_radius_m: 0.6
+      max_access_distance_m: [280, 520]
+      max_egress_distance_m: [280, 520]
+      max_single_segment_m: [160, 320]
+      rest_required: false
+      max_slope: [0.08, 0.12]
+      max_cross_slope: [0.03, 0.05]
+      min_clear_width_m: [0.75, 0.95]
+      step_free_required: false
+      curb_ramp_required: false
+      allowed_surfaces: [paved, concrete, asphalt, compacted_gravel]
+    wait: {max_wait_exposure_s: [420, 900], shelter_required: false, min_lighting: day_or_lit, identification_modalities_any_of: [audio, haptic, app, visual]}
+    interface: {boarding_any_of: [], min_door_width_m: 0.72, min_deployment_clearance_m: 0.7, preferred_door_side: either, max_dwell_time_s: null}
+    ride: {max_ride_time_s: 5400, max_peak_accel_mps2: 2.6, max_peak_jerk_mps3: 4.5, max_motion_exposure: 5.0}
+    uncertainty: {min_map_confidence: 0.60, max_blockage_risk: 0.45, max_deployment_risk: 0.30, beta_tau: 1.0, missing_policy: fail_closed}
+  manual_wheelchair:
+    mobility:
+      device_type: manual_wheelchair
+      device_width_m: 0.65
+      turning_radius_m: 0.9
+      max_access_distance_m: [120, 260]
+      max_egress_distance_m: [120, 260]
+      max_single_segment_m: [80, 160]
+      rest_required: false
+      max_slope: [0.045, 0.083]
+      max_cross_slope: [0.015, 0.025]
+      min_clear_width_m: [0.92, 1.1]
+      step_free_required: true
+      curb_ramp_required: true
+      allowed_surfaces: [paved, concrete, asphalt]
+    wait: {max_wait_exposure_s: [300, 600], shelter_required: false, min_lighting: day_or_lit, identification_modalities_any_of: [audio, haptic, app, visual]}
+    interface:
+      boarding_any_of: [{ramp: true}, {lift: true}, {low_floor: true, kneeling: true, curb_height_m_max: 0.06}]
+      min_door_width_m: 0.82
+      min_deployment_clearance_m: 1.2
+      preferred_door_side: right
+      max_dwell_time_s: 180
+    ride: {max_ride_time_s: 3600, max_peak_accel_mps2: 2.0, max_peak_jerk_mps3: 3.0, max_motion_exposure: 3.0}
+    uncertainty: {min_map_confidence: 0.70, max_blockage_risk: 0.35, max_deployment_risk: 0.20, beta_tau: 1.2, missing_policy: fail_closed}
+  power_wheelchair:
+    mobility:
+      device_type: power_wheelchair
+      device_width_m: 0.75
+      turning_radius_m: 1.15
+      max_access_distance_m: [180, 340]
+      max_egress_distance_m: [180, 340]
+      max_single_segment_m: [100, 220]
+      rest_required: false
+      max_slope: [0.04, 0.075]
+      max_cross_slope: [0.012, 0.022]
+      min_clear_width_m: [1.0, 1.25]
+      step_free_required: true
+      curb_ramp_required: true
+      allowed_surfaces: [paved, concrete, asphalt]
+    wait: {max_wait_exposure_s: [300, 600], shelter_required: false, min_lighting: day_or_lit, identification_modalities_any_of: [app, haptic, visual]}
+    interface:
+      boarding_any_of: [{ramp: true}, {lift: true}]
+      min_door_width_m: 0.9
+      min_deployment_clearance_m: 1.4
+      preferred_door_side: right
+      max_dwell_time_s: 210
+    ride: {max_ride_time_s: 3600, max_peak_accel_mps2: 2.0, max_peak_jerk_mps3: 3.0, max_motion_exposure: 3.2}
+    uncertainty: {min_map_confidence: 0.72, max_blockage_risk: 0.30, max_deployment_risk: 0.18, beta_tau: 1.3, missing_policy: fail_closed}
+  walker_or_cane:
+    mobility:
+      device_type: walker
+      device_width_m: 0.62
+      turning_radius_m: 0.8
+      max_access_distance_m: [100, 240]
+      max_egress_distance_m: [100, 240]
+      max_single_segment_m: [60, 140]
+      rest_required: true
+      max_slope: [0.04, 0.08]
+      max_cross_slope: [0.015, 0.030]
+      min_clear_width_m: [0.9, 1.1]
+      step_free_required: true
+      curb_ramp_required: true
+      allowed_surfaces: [paved, concrete, asphalt]
+    wait: {max_wait_exposure_s: [240, 480], shelter_required: true, min_lighting: day_or_lit, identification_modalities_any_of: [audio, app, visual]}
+    interface: {boarding_any_of: [{low_floor: true}, {ramp: true}, {lift: true}], min_door_width_m: 0.78, min_deployment_clearance_m: 1.0, preferred_door_side: either, max_dwell_time_s: 180}
+    ride: {max_ride_time_s: 3600, max_peak_accel_mps2: 2.2, max_peak_jerk_mps3: 3.5, max_motion_exposure: 3.5}
+    uncertainty: {min_map_confidence: 0.68, max_blockage_risk: 0.35, max_deployment_risk: 0.22, beta_tau: 1.2, missing_policy: fail_closed}
+  low_vision:
+    mobility:
+      device_type: none
+      device_width_m: 0.55
+      turning_radius_m: 0.6
+      max_access_distance_m: [180, 420]
+      max_egress_distance_m: [180, 420]
+      max_single_segment_m: [100, 260]
+      rest_required: false
+      max_slope: [0.06, 0.10]
+      max_cross_slope: [0.02, 0.04]
+      min_clear_width_m: [0.85, 1.05]
+      step_free_required: false
+      curb_ramp_required: false
+      allowed_surfaces: [paved, concrete, asphalt]
+    wait: {max_wait_exposure_s: [300, 600], shelter_required: false, min_lighting: lit, identification_modalities_any_of: [audio, haptic, app]}
+    interface: {boarding_any_of: [], min_door_width_m: 0.75, min_deployment_clearance_m: 0.8, preferred_door_side: either, max_dwell_time_s: null}
+    ride: {max_ride_time_s: 4200, max_peak_accel_mps2: 2.4, max_peak_jerk_mps3: 4.0, max_motion_exposure: 4.5}
+    uncertainty: {min_map_confidence: 0.72, max_blockage_risk: 0.30, max_deployment_risk: 0.25, beta_tau: 1.2, missing_policy: fail_closed}
+  hearing_limited:
+    mobility:
+      device_type: none
+      device_width_m: 0.55
+      turning_radius_m: 0.6
+      max_access_distance_m: [220, 500]
+      max_egress_distance_m: [220, 500]
+      max_single_segment_m: [140, 300]
+      rest_required: false
+      max_slope: [0.06, 0.10]
+      max_cross_slope: [0.02, 0.04]
+      min_clear_width_m: [0.80, 1.0]
+      step_free_required: false
+      curb_ramp_required: false
+      allowed_surfaces: [paved, concrete, asphalt]
+    wait: {max_wait_exposure_s: [360, 720], shelter_required: false, min_lighting: day_or_lit, identification_modalities_any_of: [app, haptic, visual]}
+    interface: {boarding_any_of: [], min_door_width_m: 0.75, min_deployment_clearance_m: 0.8, preferred_door_side: either, max_dwell_time_s: null}
+    ride: {max_ride_time_s: 4200, max_peak_accel_mps2: 2.5, max_peak_jerk_mps3: 4.0, max_motion_exposure: 4.5}
+    uncertainty: {min_map_confidence: 0.65, max_blockage_risk: 0.40, max_deployment_risk: 0.25, beta_tau: 1.0, missing_policy: fail_closed}
+  motion_sensitive:
+    mobility:
+      device_type: none
+      device_width_m: 0.55
+      turning_radius_m: 0.6
+      max_access_distance_m: [220, 500]
+      max_egress_distance_m: [220, 500]
+      max_single_segment_m: [140, 300]
+      rest_required: false
+      max_slope: [0.06, 0.10]
+      max_cross_slope: [0.02, 0.04]
+      min_clear_width_m: [0.80, 1.0]
+      step_free_required: false
+      curb_ramp_required: false
+      allowed_surfaces: [paved, concrete, asphalt]
+    wait: {max_wait_exposure_s: [360, 720], shelter_required: false, min_lighting: day_or_lit, identification_modalities_any_of: [audio, app, visual]}
+    interface: {boarding_any_of: [], min_door_width_m: 0.75, min_deployment_clearance_m: 0.8, preferred_door_side: either, max_dwell_time_s: null}
+    ride: {max_ride_time_s: 3600, max_peak_accel_mps2: 1.5, max_peak_jerk_mps3: 2.2, max_motion_exposure: 2.0}
+    uncertainty: {min_map_confidence: 0.65, max_blockage_risk: 0.40, max_deployment_risk: 0.25, beta_tau: 1.1, missing_policy: fail_closed}
+  temporary_luggage_or_companion:
+    mobility:
+      device_type: none
+      device_width_m: 0.85
+      turning_radius_m: 0.85
+      max_access_distance_m: [160, 360]
+      max_egress_distance_m: [160, 360]
+      max_single_segment_m: [100, 220]
+      rest_required: false
+      max_slope: [0.055, 0.09]
+      max_cross_slope: [0.02, 0.035]
+      min_clear_width_m: [1.0, 1.25]
+      step_free_required: false
+      curb_ramp_required: false
+      allowed_surfaces: [paved, concrete, asphalt]
+    wait: {max_wait_exposure_s: [300, 600], shelter_required: false, min_lighting: day_or_lit, identification_modalities_any_of: [audio, app, visual, haptic]}
+    interface: {boarding_any_of: [], min_door_width_m: 0.82, min_deployment_clearance_m: 1.1, preferred_door_side: either, max_dwell_time_s: 180}
+    ride: {max_ride_time_s: 4200, max_peak_accel_mps2: 2.2, max_peak_jerk_mps3: 3.5, max_motion_exposure: 4.0}
+    uncertainty: {min_map_confidence: 0.68, max_blockage_risk: 0.35, max_deployment_risk: 0.25, beta_tau: 1.1, missing_policy: fail_closed}

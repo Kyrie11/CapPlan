@@ -12,12 +12,15 @@ from capplan.utils.serialization import dump_json, read_jsonl
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--episode_metrics", default="outputs/metrics/closed_loop/episode_metrics.jsonl")
-    p.add_argument("--output", default="outputs/tables/metrics.json")
+    p.add_argument("--episode_metrics", required=True)
+    p.add_argument("--counterfactual_pairs", default=None)
+    p.add_argument("--output", required=True)
     args = p.parse_args()
-    metrics = compute_all_metrics(read_jsonl(args.episode_metrics))
+    pairs = read_jsonl(args.counterfactual_pairs) if args.counterfactual_pairs else []
+    metrics = compute_all_metrics(read_jsonl(args.episode_metrics), pairs)
     dump_json(args.output, metrics)
     print(metrics)
+
 
 if __name__ == "__main__":
     main()

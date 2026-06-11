@@ -32,7 +32,9 @@ def test_categorical_resources_use_predicate_conjunction():
     s = {"ramp": True}
     s = update(s, ResourceEvidence("ramp", "categorical", True), rt)
     s = update(s, ResourceEvidence("ramp", "categorical", False), rt)
-    assert s["ramp"] is False
+    assert bool(s["ramp"]) is False
+    assert s["ramp"].observed is False
+    assert s["ramp"].required is True
 
 
 def test_conservative_evidence_direction_is_correct():

@@ -3,7 +3,7 @@ from capplan.data.capability_contracts import default_contract
 from capplan.data.pudo_interface_layer import synthetic_pudo_anchors, synthetic_vehicle_interface
 from capplan.planning.planner import CapPlanPlanner, PlannerConfig
 from capplan.semantics.capability_compiler import CapabilityCompiler
-from capplan.semantics.typed_resource_algebra import satisfy
+from capplan.semantics.typed_resource_algebra import satisfy_all
 
 
 def test_typed_safe_budget_search_never_returns_violating_skeleton():
@@ -12,7 +12,8 @@ def test_typed_safe_budget_search_never_returns_violating_skeleton():
     result = CapPlanPlanner().plan(eid, contract, synthetic_accessibility_graph(eid), synthetic_pudo_anchors(eid), synthetic_vehicle_interface(eid))
     assert result.success
     compiled = CapabilityCompiler().compile(contract)
-    assert all(satisfy(result.skeleton.final_ledger, c) for c in compiled.clauses)
+    ok, _, _ = satisfy_all(result.skeleton.final_ledger, compiled.clauses, compiled.groups)
+    assert ok
 
 
 def test_stricter_contract_does_not_admit_infeasible_plan_accepted_by_weaker():

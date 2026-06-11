@@ -1,0 +1,14 @@
+{
+  "batch_size": 2,
+  "casa_mode": "learned",
+  "dataset_dir": "outputs/datasets/synthetic_smoke",
+  "device": "cpu",
+  "device_resolved": "cpu",
+  "epochs": 1,
+  "input_dim": 11,
+  "lr": 0.001,
+  "mode": "learned",
+  "num_train_samples": 110,
+  "output_dir": "outputs/models/casa_smoke",
+  "seed": 13
+}

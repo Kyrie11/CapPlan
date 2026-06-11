@@ -54,8 +54,17 @@ def passenger_completion_rate(episodes: List[Dict[str, Any]]) -> float:
 
 
 def traffic_safe_passenger_incomplete_rate(episodes: List[Dict[str, Any]], rc_threshold: float = 0.95) -> float:
-    """TSPIR = fraction with no collision, route complete, and PC = 0."""
-    return _mean([1.0 if (not e.get("collision", False) and float(e.get("route_completion", 0.0)) >= rc_threshold and not e.get("passenger_complete", False)) else 0.0 for e in episodes])
+    """TSPIR = traffic-safe route-complete but passenger-incomplete rate.
+
+    Vehicle route success is evaluated independently of passenger completion so
+    first/last-meter or interface failures remain visible.
+    """
+    vals = []
+    for e in episodes:
+        traffic_safe = bool(e.get("traffic_safe", (not e.get("collision", False) and e.get("drivable_area", True) and not e.get("rule_violation", False))))
+        route_complete = float(e.get("route_completion", 0.0)) >= rc_threshold
+        vals.append(1.0 if (traffic_safe and route_complete and not e.get("passenger_complete", False)) else 0.0)
+    return _mean(vals)
 
 
 def phase_acceptance_rate(episodes: List[Dict[str, Any]]) -> float:
@@ -156,8 +165,21 @@ def capability_responsiveness(pairs: List[Dict[str, Any]]) -> float:
 
 
 def efficiency_cost_of_accommodation(episodes: List[Dict[str, Any]]) -> float:
-    """ECA = (TT_cap - TT_std)/(TT_std + eps), averaged over episodes."""
-    return _mean([(float(e.get("tt_cap_s", e.get("travel_time_s", 0.0))) - float(e.get("tt_std_s", e.get("travel_time_s", 0.0)))) / (float(e.get("tt_std_s", e.get("travel_time_s", 0.0))) + EPS) for e in episodes])
+    """ECA = nonnegative accommodation cost or nan-excluded average.
+
+    Only episodes with both capability-aware and standard service times available
+    are included.  Negative values caused by different baselines are clipped to
+    zero rather than interpreted as negative accommodation burden.
+    """
+    vals = []
+    for e in episodes:
+        if "tt_cap_s" not in e or "tt_std_s" not in e:
+            continue
+        std = float(e.get("tt_std_s", 0.0))
+        if std <= 0:
+            continue
+        vals.append(max(0.0, (float(e.get("tt_cap_s", 0.0)) - std) / (std + EPS)))
+    return _mean(vals)
 
 
 def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: List[Dict[str, Any]] | None = None) -> Dict[str, float]:

@@ -1,0 +1,19 @@
+{
+  "accessibility_source": "synthetic_local",
+  "builder_git_commit": "ba83227f1afc98c40973f963f1a6f46fa75081af",
+  "created_at": "2026-06-10T10:56:29.108165+00:00",
+  "dataset_name": "synthetic_smoke",
+  "num_contracts": 12,
+  "num_episodes": 4,
+  "num_transitions": 220,
+  "nuplan": {
+    "data_root": null,
+    "db_files": null,
+    "map_root": null,
+    "map_version": null,
+    "sensor_root": null
+  },
+  "scene_source": "synthetic",
+  "strict_mode": false,
+  "version": "0.1.0"
+}

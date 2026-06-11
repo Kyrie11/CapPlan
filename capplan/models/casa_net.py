@@ -1,8 +1,8 @@
 """CASA-Net interface.
 
-A lightweight deterministic implementation is provided so the full pipeline runs
-without GPU or PyTorch.  If PyTorch is installed, the class can be extended with
-an MLP while preserving the input/output interface required by the planner.
+The interface exposes two explicitly named modes: a deterministic
+``heuristic_oracle_baseline`` and a separate trainable ``learned`` mode.  The
+planner never describes the heuristic baseline as a learned CASA-Net model.
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from capplan.data.schemas import CandidateTransition
-from capplan.models.predictors import HeuristicTransitionPredictor, TransitionPrediction
+from capplan.models.predictors import HeuristicTransitionPredictor, LearnedLinearTransitionPredictor, TransitionPrediction
 
 
 @dataclass
@@ -30,13 +30,19 @@ class CASAOutput:
 
 
 class CASANet:
-    def __init__(self, mode: str = "heuristic", disabled: bool = False) -> None:
-        self.mode = mode
+    def __init__(self, mode: str = "heuristic_oracle_baseline", disabled: bool = False, checkpoint: Dict[str, Any] | None = None) -> None:
+        if mode not in {"heuristic_oracle_baseline", "learned", "heuristic"}:
+            raise ValueError(f"unsupported CASA mode {mode}")
+        self.mode = "heuristic_oracle_baseline" if mode == "heuristic" else mode
         self.disabled = disabled
-        self.heuristic = HeuristicTransitionPredictor()
+        self.predictor = (
+            HeuristicTransitionPredictor()
+            if self.mode == "heuristic_oracle_baseline"
+            else LearnedLinearTransitionPredictor(checkpoint=checkpoint)
+        )
 
     def forward(self, inputs: CASAInput) -> CASAOutput:
-        preds = self.heuristic.predict(inputs.transitions, context={
+        preds = self.predictor.predict(inputs.transitions, context={
             "tokens": inputs.active_capability_tokens,
             "phase_belief": inputs.phase_belief,
             "features": inputs.ego_agent_map_features,

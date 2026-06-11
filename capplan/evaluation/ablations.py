@@ -19,12 +19,18 @@ ABLATION_FLAGS = {
 }
 
 
-def run_ablations(dataset_dir: str | Path, output_dir: str | Path, variants: List[str] | None = None) -> Dict[str, Dict]:
+def ablation_config(name: str, trajectory_mode: str = "mock_strict") -> PlannerConfig:
+    if name not in ABLATION_FLAGS:
+        raise KeyError(name)
+    return PlannerConfig(**ABLATION_FLAGS[name], trajectory_mode=trajectory_mode)
+
+
+def run_ablations(dataset_dir: str | Path, output_dir: str | Path, variants: List[str] | None = None, trajectory_mode: str = "mock_strict") -> Dict[str, Dict]:
     output_dir = Path(output_dir)
     variants = variants or list(ABLATION_FLAGS.keys())
     results = {}
     for name in variants:
-        cfg = PlannerConfig(**ABLATION_FLAGS[name])
+        cfg = ablation_config(name, trajectory_mode=trajectory_mode)
         runner = ClosedLoopRunner(cfg)
         res = runner.run_dataset(dataset_dir, output_dir / name)
         results[name] = res["metrics"]
