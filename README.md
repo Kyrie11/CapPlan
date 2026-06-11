@@ -71,16 +71,16 @@ This writes deterministic local scenes, routable pedestrian graphs, PUDO anchors
 ```bash
 python scripts/build_dataset.py \
   --scene_source nuplan \
-  --nuplan_data_root /data/sets/nuplan \
-  --nuplan_map_root /data/sets/nuplan/maps \
-  --nuplan_sensor_root /data/sets/nuplan/sensor_blobs \
-  --nuplan_db_files /data/sets/nuplan/nuplan-v1.1/splits/mini \
+  --nuplan_data_root /data0/senzeyu2/dataset/nuplan/data/cache \
+  --nuplan_map_root /data0/senzeyu2/dataset/nuplan/maps \
+  --nuplan_db_root /data0/senzeyu2/dataset/nuplan/data/cache \
+  --nuplan_db_dirs train_boston train_pittsburgh \
   --nuplan_map_version nuplan-maps-v1.0 \
-  --split mini \
+  --split train \
   --max_scenarios 100 \
   --accessibility_source synthetic_local \
   --num_contracts_per_scene 4 \
-  --output_dir outputs/datasets/abilitybench_av_mini \
+  --output_dir outputs/datasets/abilitybench_av_train_boston_pittsburgh \
   --strict
 
 python scripts/validate_dataset.py \

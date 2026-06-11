@@ -5,12 +5,14 @@ only for deterministic smoke tests and marks records as ``source='synthetic'``.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import importlib.util
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List
+from typing import Any, Dict, Iterable, Iterator, List, Sequence
 
 from capplan.data.schemas import EpisodeMetadata, Pose2D, SceneRecord
 
@@ -23,6 +25,61 @@ class NuPlanScenarioRecord:
     agent_history: List[Dict]
     map_context: Dict
     route_corridor: Dict
+
+
+def _split_path_list(value: str | Sequence[str] | None) -> List[str]:
+    """Split CLI-style nuPlan DB inputs into path-like tokens.
+
+    Supported forms:
+    - one absolute/relative path string;
+    - comma-separated paths;
+    - plus-separated paths, e.g. ``train_boston+train_pittsburgh``;
+    - a Python sequence already produced by argparse.
+    """
+    if value is None:
+        return []
+    raw = list(value) if isinstance(value, (list, tuple, set)) else [str(value)]
+    pieces: List[str] = []
+    for item in raw:
+        for part in re.split(r"[,+]", str(item)):
+            part = part.strip()
+            if part:
+                pieces.append(part)
+    return pieces
+
+
+def expand_nuplan_db_files(db_files: str | Sequence[str] | None) -> List[str]:
+    """Expand nuPlan DB file/folder/glob inputs into concrete ``.db`` files.
+
+    The official nuPlan scenario builder expects database files in most devkit
+    versions.  This helper accepts either individual ``.db`` files or folders
+    containing DB sets, including folders such as ``train_boston`` and
+    ``train_pittsburgh`` under a cache root.  It is intentionally strict: an
+    existing folder with no ``.db`` files is treated as a configuration error
+    instead of silently producing an empty/synthetic dataset.
+    """
+    expanded: List[str] = []
+    for token in _split_path_list(db_files):
+        matches = sorted(glob.glob(token)) if any(ch in token for ch in "*?[]") else [token]
+        if not matches:
+            raise RuntimeError(f"nuPlan DB pattern matched no files: {token}")
+        for match in matches:
+            path = Path(match)
+            if path.is_dir():
+                dbs = sorted(path.rglob("*.db"))
+                if not dbs:
+                    raise RuntimeError(f"nuPlan DB directory contains no .db files: {path}")
+                expanded.extend(str(p) for p in dbs)
+            else:
+                expanded.append(str(path))
+    # De-duplicate while preserving deterministic order.
+    seen = set()
+    out: List[str] = []
+    for item in expanded:
+        if item not in seen:
+            out.append(item)
+            seen.add(item)
+    return out
 
 
 def safe_call(obj: Any, names: List[str], default: Any = None) -> Any:
@@ -45,7 +102,7 @@ class NuPlanAdapter:
         data_root: str | None = None,
         map_root: str | None = None,
         sensor_root: str | None = None,
-        db_files: str | None = None,
+        db_files: str | Sequence[str] | None = None,
         map_version: str | None = None,
         split: str = "mini",
         seed: int = 0,
@@ -61,7 +118,8 @@ class NuPlanAdapter:
         self.data_root = data_root
         self.map_root = map_root
         self.sensor_root = sensor_root
-        self.db_files = db_files
+        self.db_files_requested = db_files
+        self.db_files = expand_nuplan_db_files(db_files) if scene_source == "nuplan" and db_files else ([] if scene_source == "nuplan" else db_files)
         self.map_version = map_version
         self.split = split
         self.seed = seed
@@ -93,9 +151,12 @@ class NuPlanAdapter:
             raise RuntimeError(f"scene_source=nuplan requires real nuPlan paths: missing {', '.join(missing_args)}")
         if not self.nuplan_available:
             raise RuntimeError("scene_source=nuplan requested, but the nuPlan devkit is not installed; no synthetic fallback is allowed")
-        for label, path in [("nuplan_data_root", self.data_root), ("nuplan_map_root", self.map_root), ("nuplan_db_files", self.db_files)]:
+        for label, path in [("nuplan_data_root", self.data_root), ("nuplan_map_root", self.map_root)]:
             if path and not Path(path).exists():
                 raise RuntimeError(f"scene_source=nuplan requested, but {label} does not exist: {path}")
+        for db_path in self.db_files:
+            if not Path(db_path).exists():
+                raise RuntimeError(f"scene_source=nuplan requested, but nuPlan DB file does not exist: {db_path}")
         try:
             from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder  # type: ignore
         except Exception as e:  # pragma: no cover - depends on local devkit

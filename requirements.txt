@@ -5,3 +5,5 @@ pytest>=7.0
 # Optional for learned CASA-Net variants and nuPlan integration:
 # torch>=2.0
 # nuplan-devkit
+
+tqdm>=4.66

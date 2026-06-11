@@ -23,9 +23,51 @@ from capplan.planning.transition_generator import TransitionGenerator
 from capplan.utils.serialization import dump_json, write_jsonl
 
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm is an optional UX dependency
+    def tqdm(iterable, **kwargs):
+        return iterable
+
+
+def _split_cli_path_list(values: List[str] | str | None) -> List[str]:
+    if values is None:
+        return []
+    raw = values if isinstance(values, list) else [values]
+    out: List[str] = []
+    for item in raw:
+        for piece in str(item).replace(",", "+").split("+"):
+            piece = piece.strip()
+            if piece:
+                out.append(piece)
+    return out
+
+
+def _resolve_db_inputs(args: argparse.Namespace) -> List[str] | str | None:
+    """Resolve user-friendly DB-set folder arguments for nuPlan builds.
+
+    Users may pass either the original ``--nuplan_db_files`` argument or the new
+    pair ``--nuplan_db_root ... --nuplan_db_dirs train_boston train_pittsburgh``.
+    Relative folder names are resolved under ``nuplan_db_root`` when provided,
+    otherwise under ``nuplan_data_root`` / ``nuplan_root``.  The adapter expands
+    directories into concrete ``.db`` files.
+    """
+    tokens: List[str] = []
+    root = Path(args.nuplan_db_root or args.nuplan_data_root or args.nuplan_root or ".")
+    for token in _split_cli_path_list(args.nuplan_db_files):
+        p = Path(token)
+        tokens.append(str(p if p.is_absolute() else root / p))
+    for token in _split_cli_path_list(args.nuplan_db_dirs):
+        p = Path(token)
+        tokens.append(str(p if p.is_absolute() else root / p))
+    if tokens:
+        return tokens
+    return args.nuplan_db_files
+
+
 def _git_commit() -> str | None:
     try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], text=True).strip()
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
         return None
 
@@ -54,7 +96,9 @@ def main() -> None:
     p.add_argument("--nuplan_data_root", default=None)
     p.add_argument("--nuplan_map_root", default=None)
     p.add_argument("--nuplan_sensor_root", default=None)
-    p.add_argument("--nuplan_db_files", default=None)
+    p.add_argument("--nuplan_db_files", default=None, help="nuPlan .db file, folder, glob, or comma/plus-separated list. Relative entries resolve under --nuplan_db_root or --nuplan_data_root.")
+    p.add_argument("--nuplan_db_root", default=None, help="Root directory containing nuPlan DB-set folders such as train_boston, train_pittsburgh, val.")
+    p.add_argument("--nuplan_db_dirs", nargs="*", default=None, help="One or more DB-set folder names/paths, e.g. train_boston train_pittsburgh or train_boston+train_pittsburgh.")
     p.add_argument("--nuplan_map_version", default=None)
     # Backward-compatible alias; mapped to nuplan_data_root only when provided.
     p.add_argument("--nuplan_root", default=None)
@@ -65,18 +109,20 @@ def main() -> None:
     p.add_argument("--num_contracts_per_scene", type=int, default=2)
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--strict", action="store_true")
+    p.add_argument("--disable_tqdm", action="store_true", help="Disable preprocessing progress bars.")
     args = p.parse_args()
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "accessibility_graphs").mkdir(parents=True, exist_ok=True)
 
+    resolved_db_files = _resolve_db_inputs(args)
     adapter = NuPlanAdapter(
         scene_source=args.scene_source,
         data_root=args.nuplan_data_root or args.nuplan_root,
         map_root=args.nuplan_map_root,
         sensor_root=args.nuplan_sensor_root,
-        db_files=args.nuplan_db_files,
+        db_files=resolved_db_files,
         map_version=args.nuplan_map_version,
         split=args.split,
         seed=args.seed,
@@ -102,7 +148,11 @@ def main() -> None:
     certificate_labels: List[Dict[str, Any]] = []
     counterfactual_pairs: List[Dict[str, Any]] = []
 
-    for record in adapter.iter_scenarios(args.max_scenarios):
+    scenario_iter = adapter.iter_scenarios(args.max_scenarios)
+    if not args.disable_tqdm:
+        scenario_iter = tqdm(scenario_iter, total=args.max_scenarios, desc=f"build {args.scene_source} dataset", unit="scenario")
+
+    for record in scenario_iter:
         scene = record.scene
         ep = record.episode
         scenes.append(to_dict(scene))
@@ -170,7 +220,7 @@ def main() -> None:
         "dataset_name": out.name,
         "version": "0.1.0",
         "scene_source": args.scene_source,
-        "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files": args.nuplan_db_files, "map_version": args.nuplan_map_version},
+        "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files_requested": resolved_db_files, "db_files_expanded": adapter.db_files if args.scene_source == "nuplan" else [], "map_version": args.nuplan_map_version},
         "accessibility_source": args.accessibility_source,
         "builder_git_commit": _git_commit(),
         "created_at": datetime.now(timezone.utc).isoformat(),
