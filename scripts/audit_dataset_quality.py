@@ -96,6 +96,26 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
     for row in passenger_labels:
         failed_resources.update(row.get("failed_resources") or [])
 
+    passenger_true = sum(1 for r in passenger_labels if r.get("y_e_p"))
+    passenger_false = sum(1 for r in passenger_labels if not r.get("y_e_p"))
+    transition_true = sum(1 for r in transition_labels if r.get("z_e"))
+    transition_false = sum(1 for r in transition_labels if not r.get("z_e"))
+    issues: List[str] = []
+    if validation.get("ok") is False:
+        issues.append("schema_validation_failed")
+    if len(skeletons) == 0:
+        issues.append("no_passenger_complete_skeletons")
+    if passenger_labels and passenger_true == 0:
+        issues.append("no_passenger_feasible_edges")
+    if transition_labels and transition_true == 0:
+        issues.append("no_transition_valid_edges")
+    if fabricated_clearance:
+        issues.append("route_pudo_clearance_without_sidewalk_width")
+    if any("proxy" in str(e.get("source", "")) for e in entrances):
+        issues.append("proxy_entrances_used")
+    if any("synthetic" in str(src) for src in graph_edge_sources):
+        issues.append("synthetic_accessibility_edges_used")
+
     report = {
         "dataset_dir": str(root),
         "manifest": {
@@ -149,8 +169,13 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
         },
         "label_health": {
             "transition_z_by_action": {k: dict(v) for k, v in sorted(transition_z_by_action.items())},
-            "passenger_y_true": sum(1 for r in passenger_labels if r.get("y_e_p")),
-            "passenger_y_false": sum(1 for r in passenger_labels if not r.get("y_e_p")),
+            "transition_z_true": transition_true,
+            "transition_z_false": transition_false,
+            "transition_z_true_rate": transition_true / max(1, transition_true + transition_false),
+            "passenger_y_true": passenger_true,
+            "passenger_y_false": passenger_false,
+            "passenger_y_true_rate": passenger_true / max(1, passenger_true + passenger_false),
+            "skeleton_label_count": len(skeletons),
             "failed_resources": dict(failed_resources.most_common(30)),
         },
         "truthfulness_flags": {
@@ -158,6 +183,11 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
             "uses_synthetic_accessibility_edges": any("synthetic" in str(src) for src in graph_edge_sources),
             "route_pudo_clearance_without_width_count": len(fabricated_clearance),
             "route_pudo_clearance_without_width_examples": [p.get("anchor_id") for p in fabricated_clearance[:10]],
+        },
+        "publication_readiness": {
+            "ready_for_main_results": len(issues) == 0,
+            "issues": issues,
+            "note": "Proxy/synthetic evidence can support smoke or ablation experiments only if it is disclosed separately from real accessibility-map results.",
         },
     }
     return report
