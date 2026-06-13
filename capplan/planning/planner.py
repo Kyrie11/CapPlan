@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List
 
 from capplan.data.schemas import AccessibilityGraph, CapabilityContract, CandidateTransition, FailureCertificate, PlannerResult, PUDOAnchor, VehicleInterface, ViolationRecord
@@ -27,6 +28,7 @@ class PlannerConfig:
     beta: float = 1.0
     trajectory_mode: str = "mock_strict"
     casa_mode: str = "heuristic_oracle_baseline"
+    casa_checkpoint: str | Path | Dict[str, Any] | None = None
 
 
 class CapPlanPlanner:
@@ -35,7 +37,7 @@ class CapPlanPlanner:
         self.registry = registry
         self.compiler = CapabilityCompiler(registry, disabled=self.config.no_capability_compiler, soft_only=self.config.soft_only_capability)
         self.automaton = ServiceAutomaton(disabled=self.config.no_service_automaton)
-        self.casa = CASANet(mode=self.config.casa_mode, disabled=self.config.no_casa_net_transitions)
+        self.casa = CASANet(mode=self.config.casa_mode, disabled=self.config.no_casa_net_transitions, checkpoint=self.config.casa_checkpoint)
         self.generator = TransitionGenerator()
         self.searcher = TypedSafeBudgetSearch(
             self.automaton,

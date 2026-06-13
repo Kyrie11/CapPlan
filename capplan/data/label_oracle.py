@@ -138,6 +138,7 @@ class IndependentLabelOracle:
 
     def _update_ledger_for_edge(self, ledger: Dict[str, Any], e: CandidateTransition, compiled, phases: Sequence[str], violations: List[ViolationRecord]) -> Dict[str, Any]:
         active = active_clauses(compiled.clauses, phases)
+        active_grouped_clause_ids = {cid for g in active_groups(compiled.groups, phases) for cid in g.clause_ids}
         active_by_resource: Dict[str, List[Any]] = {}
         for c in active:
             active_by_resource.setdefault(c.resource_name, []).append(c)
@@ -158,13 +159,14 @@ class IndependentLabelOracle:
                 beta = compiled.uncertainty.get(ev.resource_name).beta_tau if ev.resource_name in compiled.uncertainty else 1.0
                 val = MissingEvidence(ev.resource_name, e.to_phase, ev.reason or "not_observed", ev.source, ev.confidence) if ev.missing or ev.value is None else conservative_value(ev.value, ev.sigma, rt, beta=beta)
                 ledger[ev.resource_name] = update_value(ledger.get(ev.resource_name), val, rt, evidence=ev)
+            non_grouped_hard = [c for c in clauses_for if c.hard and c.id not in active_grouped_clause_ids]
             uspec = compiled.uncertainty.get(ev.resource_name)
-            if ev.missing:
+            if ev.missing and any(c.missing_policy == "fail_closed" for c in non_grouped_hard):
                 violations.append(ViolationRecord(e.to_phase, e.transition_id, ev.resource_name, -1.0, ev.source, ev.confidence, "missing_evidence"))
-            if uspec and uspec.min_confidence > 0 and ev.confidence < uspec.min_confidence:
+            if non_grouped_hard and uspec and uspec.min_confidence > 0 and ev.confidence < uspec.min_confidence:
                 margin = (ev.confidence - uspec.min_confidence) / max(uspec.min_confidence, 1e-9)
                 violations.append(ViolationRecord(e.to_phase, e.transition_id, ev.resource_name if ev.resource_name == "map_confidence" else "map_confidence", margin, ev.source, ev.confidence, "low_confidence"))
-        grouped_clause_ids = {cid for g in active_groups(compiled.groups, phases) for cid in g.clause_ids}
+        grouped_clause_ids = active_grouped_clause_ids
         for c in active:
             if c.id in grouped_clause_ids:
                 continue

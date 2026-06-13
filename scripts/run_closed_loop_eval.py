@@ -16,8 +16,9 @@ def main() -> None:
     p.add_argument("--output_dir", default="outputs/eval/closed_loop")
     p.add_argument("--trajectory_mode", choices=["mock_strict", "nuplan_closed_loop"], default="mock_strict")
     p.add_argument("--casa_mode", choices=["heuristic_oracle_baseline", "learned"], default="heuristic_oracle_baseline")
+    p.add_argument("--casa_checkpoint", default=None, help="Checkpoint produced by scripts.train_casa; required for a meaningful learned CASA run.")
     args = p.parse_args()
-    cfg = PlannerConfig(trajectory_mode=args.trajectory_mode, casa_mode=args.casa_mode)
+    cfg = PlannerConfig(trajectory_mode=args.trajectory_mode, casa_mode=args.casa_mode, casa_checkpoint=args.casa_checkpoint)
     res = ClosedLoopRunner(cfg).run_dataset(args.dataset_dir, args.output_dir)
     print(res["metrics"])
 

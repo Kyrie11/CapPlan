@@ -193,8 +193,10 @@ class TypedSafeBudgetSearch:
         grouped_clause_ids = {cid for g in active_groups_for_edge for cid in g.clause_ids}
         for c in active:
             if c.id in grouped_clause_ids:
-                # Group logic, especially any_of, decides whether missing one
-                # alternative is fatal.
+                # Group logic, especially any_of, decides whether missing or low
+                # confidence on one alternative is fatal.  Do not fail a ramp OR
+                # lift OR low-floor group merely because one unused alternative is
+                # unobserved.
                 continue
             if c.resource_name not in observed_resources and c.hard and c.missing_policy == "fail_closed":
                 # Missing evidence fails only when the ledger has not already

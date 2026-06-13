@@ -100,6 +100,8 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
     passenger_false = sum(1 for r in passenger_labels if not r.get("y_e_p"))
     transition_true = sum(1 for r in transition_labels if r.get("z_e"))
     transition_false = sum(1 for r in transition_labels if not r.get("z_e"))
+    passenger_true_rate = passenger_true / max(1, passenger_true + passenger_false)
+    skeleton_rate = len(skeletons) / max(1, len(certificates) + len(skeletons))
     issues: List[str] = []
     if validation.get("ok") is False:
         issues.append("schema_validation_failed")
@@ -107,6 +109,10 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
         issues.append("no_passenger_complete_skeletons")
     if passenger_labels and passenger_true == 0:
         issues.append("no_passenger_feasible_edges")
+    elif passenger_labels and passenger_true_rate < 0.05:
+        issues.append("passenger_feasible_edges_too_sparse")
+    if (certificates or skeletons) and skeleton_rate < 0.05:
+        issues.append("oracle_passenger_complete_skeletons_too_sparse")
     if transition_labels and transition_true == 0:
         issues.append("no_transition_valid_edges")
     if fabricated_clearance:
@@ -174,8 +180,9 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
             "transition_z_true_rate": transition_true / max(1, transition_true + transition_false),
             "passenger_y_true": passenger_true,
             "passenger_y_false": passenger_false,
-            "passenger_y_true_rate": passenger_true / max(1, passenger_true + passenger_false),
+            "passenger_y_true_rate": passenger_true_rate,
             "skeleton_label_count": len(skeletons),
+            "oracle_skeleton_rate": skeleton_rate,
             "failed_resources": dict(failed_resources.most_common(30)),
         },
         "truthfulness_flags": {

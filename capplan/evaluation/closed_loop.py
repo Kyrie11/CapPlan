@@ -169,7 +169,13 @@ class ClosedLoopRunner:
                 elif not weak.get("passenger_complete") and not strict.get("passenger_complete"):
                     wc = weak.get("oracle_certificate") or weak.get("certificate") or {}
                     sc = strict.get("oracle_certificate") or strict.get("certificate") or {}
-                    responsive = float(sc.get("signed_margin", -1.0)) <= float(wc.get("signed_margin", 0.0)) + 1e-9 or sc.get("resource_type") != wc.get("resource_type")
+                    same_failure = all(sc.get(k) == wc.get(k) for k in ["phase", "transition_id", "resource_type", "reason"])
+                    margin_drop = float(sc.get("signed_margin", 0.0)) < float(wc.get("signed_margin", 0.0)) - 1e-9
+                    certificate_changed = any(sc.get(k) != wc.get(k) for k in ["phase", "transition_id", "resource_type", "reason"])
+                    # Identical failure certificates are not capability-responsive;
+                    # they usually mean the scene/evidence is already impossible
+                    # before the stricter contract matters.
+                    responsive = (margin_drop or certificate_changed) and not same_failure
                 else:
                     responsive = pair.get("relation") != "stricter_or_equal"
             rows.append({**pair, "responsive": bool(responsive)})
