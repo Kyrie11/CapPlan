@@ -79,6 +79,9 @@ def result_to_episode_metrics(result, metadata: Dict[str, Any], contract, oracle
         "tt_cap_s": float(traj.get("travel_time_s", 0.0)),
         "tt_std_s": max(1.0, float(metadata.get("route_length_m", 4000.0)) / 10.0),
         "failed_resources": failed,
+        "failure_phase": (cert or oracle_certificate or {}).get("phase"),
+        "failure_resource": (cert or oracle_certificate or {}).get("resource_type"),
+        "failure_source": (cert or oracle_certificate or {}).get("evidence_source"),
     }
 
 
@@ -139,7 +142,7 @@ class ClosedLoopRunner:
             for contract in data["contracts"].get(eid, []):
                 result = self.planner.plan(eid, contract, graph, pudo, vehicle, transitions=transitions, trip_context=trip_context)
                 oracle_cert = data["oracle_certs"].get((eid, contract.passenger_id))
-                row = result_to_episode_metrics(result, meta, contract, oracle_cert)
+                row = result_to_episode_metrics(result, trip_context, contract, oracle_cert)
                 metrics_rows.append(row)
                 result_lookup[(eid, contract.passenger_id)] = row
                 plans.append({"episode_id": eid, "passenger_id": contract.passenger_id, "success": result.success, "skeleton": to_dict(result.skeleton) if result.skeleton else None, "certificate": to_dict(result.certificate) if result.certificate else None})

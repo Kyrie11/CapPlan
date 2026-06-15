@@ -23,6 +23,45 @@ class SyntheticAccessibilityBuilder:
         return synthetic_accessibility_graph(episode_id, seed=seed, n_pudo=n_pudo, origin=origin, destination=destination)
 
 
+class PreparedAccessibilityBuilder:
+    """Load audited/prepared accessibility graphs from JSONL files.
+
+    The builder looks first for per-episode files
+    ``<graph_dir>/<episode_id>.nodes.jsonl`` and
+    ``<graph_dir>/<episode_id>.edges.jsonl``.  If those are absent it falls
+    back to shared ``nodes.jsonl`` and ``edges.jsonl``.  Records should match
+    ``AccessibilityNode`` and ``AccessibilityEdge`` fields. Missing evidence is
+    preserved as missing and is never converted into feasible defaults.
+    """
+
+    def __init__(self, graph_dir: str | Path, source: str = "prepared_accessibility_jsonl") -> None:
+        self.graph_dir = Path(graph_dir)
+        self.source = source
+
+    def _paths_for(self, episode_id: str) -> tuple[Path, Path]:
+        ep_nodes = self.graph_dir / f"{episode_id}.nodes.jsonl"
+        ep_edges = self.graph_dir / f"{episode_id}.edges.jsonl"
+        if ep_nodes.exists() and ep_edges.exists():
+            return ep_nodes, ep_edges
+        shared_nodes = self.graph_dir / "nodes.jsonl"
+        shared_edges = self.graph_dir / "edges.jsonl"
+        if shared_nodes.exists() and shared_edges.exists():
+            return shared_nodes, shared_edges
+        raise FileNotFoundError(
+            f"missing prepared accessibility graph for {episode_id}; expected "
+            f"{ep_nodes.name}/{ep_edges.name} or shared nodes.jsonl/edges.jsonl in {self.graph_dir}"
+        )
+
+    def build(self, episode_id: str, **_: Any) -> AccessibilityGraph:
+        nodes_path, edges_path = self._paths_for(episode_id)
+        return graph_from_records(
+            episode_id,
+            read_jsonl(nodes_path),
+            read_jsonl(edges_path),
+            {"source": self.source, "nodes_path": str(nodes_path), "edges_path": str(edges_path)},
+        )
+
+
 class GeoJSONAccessibilityBuilder:
     """Minimal prepared-JSON/JSONL graph reader.
 

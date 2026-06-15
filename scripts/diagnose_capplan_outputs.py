@@ -120,7 +120,8 @@ def diagnose_dataset(dataset_dir: str | _Path, eval_dir: str | _Path | None = No
                 'traffic_safe_rate': _rate(sum(1 for r in em if r.get('traffic_safe')), len(em)),
                 'route_completion': _q(float(r.get('route_completion', 0.0)) for r in em),
                 'completion_by_passenger_index': {k: {'ok': ok[k], 'total': denom[k], 'rate': _rate(ok[k], denom[k])} for k in sorted(denom)},
-                'failure_phase': dict(Counter(str(r.get('failure_phase')) for r in em if not r.get('passenger_complete')).most_common()),
+                'failure_phase': dict(Counter(str(r.get('failure_phase') or (r.get('certificate') or {}).get('phase') or (r.get('oracle_certificate') or {}).get('phase')) for r in em if not r.get('passenger_complete')).most_common()),
+                'failure_resource': dict(Counter(str(r.get('failure_resource') or (r.get('certificate') or {}).get('resource_type') or (r.get('oracle_certificate') or {}).get('resource_type')) for r in em if not r.get('passenger_complete')).most_common()),
             }
         metrics = _safe_json(eroot / 'metrics.json')
         if metrics:

@@ -51,6 +51,7 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--device", default="auto")
     p.add_argument("--casa_mode", choices=["learned", "heuristic_oracle_baseline"], default="learned")
+    p.add_argument("--edge_pos_weight", default="auto", help="Positive-class weight for sparse passenger edge labels. Use auto or a numeric value.")
     args = p.parse_args()
 
     random.seed(args.seed)
@@ -66,6 +67,13 @@ def main() -> None:
     xv, yv_edge, yv_value, _ = val.arrays() if val.samples else train.arrays()
     input_dim = x.shape[1]
     device = _device_auto(args.device)
+    pos = float(np.sum(y_edge >= 0.5))
+    neg = float(len(y_edge) - pos)
+    if str(args.edge_pos_weight).lower() == "auto":
+        edge_pos_weight = (neg / max(pos, 1.0)) if pos > 0 else 1.0
+    else:
+        edge_pos_weight = max(0.0, float(args.edge_pos_weight))
+
 
     # Lightweight trainable NumPy model: shared linear features with edge and
     # value sigmoid heads.  This is a real supervised optimization path and keeps
@@ -90,7 +98,8 @@ def main() -> None:
             yv = y_value[batch]
             pe = _sigmoid(xb @ W_edge + b_edge)
             pv = _sigmoid(xb @ W_value + b_value)
-            ge = (pe - ye) / len(batch)
+            edge_w = np.where(ye >= 0.5, edge_pos_weight, 1.0).astype(np.float32)
+            ge = (pe - ye) * edge_w / max(float(np.sum(edge_w)), 1.0)
             gv = (pv - yv) / len(batch)
             W_edge -= args.lr * (xb.T @ ge)
             b_edge -= args.lr * ge.sum()
@@ -104,9 +113,27 @@ def main() -> None:
     val_edge = _sigmoid(xvn @ W_edge + b_edge)
     val_value = _sigmoid(xvn @ W_value + b_value)
     val_losses = casa_loss(val_edge, yv_edge, val_value, yv_value)
+
+    pred_edge_binary = val_edge >= 0.5
+    true_edge_binary = yv_edge >= 0.5
+    tp = int(np.sum(pred_edge_binary & true_edge_binary))
+    fp = int(np.sum(pred_edge_binary & ~true_edge_binary))
+    tn = int(np.sum(~pred_edge_binary & ~true_edge_binary))
+    fn = int(np.sum(~pred_edge_binary & true_edge_binary))
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    specificity = tn / max(tn + fp, 1)
+    f1 = (2 * precision * recall / max(precision + recall, 1e-9))
     val_metrics = {
         **val_losses,
-        "edge_accuracy": float(np.mean((val_edge >= 0.5) == (yv_edge >= 0.5))),
+        "edge_accuracy": float(np.mean(pred_edge_binary == true_edge_binary)),
+        "edge_balanced_accuracy": float(0.5 * (recall + specificity)),
+        "edge_precision": float(precision),
+        "edge_recall": float(recall),
+        "edge_f1": float(f1),
+        "edge_true_positive_rate": float(np.mean(true_edge_binary)),
+        "edge_pred_positive_rate": float(np.mean(pred_edge_binary)),
+        "edge_pos_weight": float(edge_pos_weight),
         "num_val_samples": int(len(xv)),
         "mode": args.casa_mode,
         "device": device,
@@ -117,11 +144,11 @@ def main() -> None:
         "weights": {"W_edge": W_edge.tolist(), "b_edge": float(b_edge), "W_value": W_value.tolist(), "b_value": float(b_value), "mean": mean.tolist(), "std": std.tolist()},
         "input_dim": int(input_dim),
         "vocab": vocab.to_dict(),
-        "config": vars(args),
+        "config": {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight)},
     }
     _save_checkpoint(out / "checkpoint.pt", checkpoint)
     dump_json(out / "vocab.json", vocab.to_dict())
-    dump_json(out / "config.json", {**vars(args), "mode": args.casa_mode, "device_resolved": device, "input_dim": int(input_dim), "num_train_samples": len(train.samples)})
+    dump_json(out / "config.json", {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight), "mode": args.casa_mode, "device_resolved": device, "input_dim": int(input_dim), "num_train_samples": len(train.samples), "edge_train_positive_rate": float(np.mean(y_edge >= 0.5))})
     write_jsonl(out / "train_metrics.jsonl", metrics_rows)
     dump_json(out / "val_metrics.json", val_metrics)
     print(f"wrote CASA checkpoint and metrics to {out}")

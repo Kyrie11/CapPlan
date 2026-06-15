@@ -7,20 +7,20 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 import argparse
 import subprocess
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from capplan.data.accessibility_layer import SyntheticAccessibilityBuilder, attach_pudo_nodes_to_graph, write_accessibility_graph
+from capplan.data.accessibility_layer import PreparedAccessibilityBuilder, SyntheticAccessibilityBuilder, attach_pudo_nodes_to_graph, write_accessibility_graph
 from capplan.data.capability_contracts import sample_contracts_with_pairs
 from capplan.data.label_oracle import IndependentLabelOracle
 from capplan.data.nuplan_adapter import NuPlanAdapter
 from capplan.data.pudo_interface_layer import PUDOGenerator, synthetic_vehicle_interface, vehicle_interface_profiles
-from capplan.data.schemas import EntranceAnchor, Pose2D, to_dict, transition_label_from_transition
+from capplan.data.schemas import EntranceAnchor, Pose2D, PUDOAnchor, to_dict, transition_label_from_transition
 from capplan.data.validate_dataset import validate_dataset
 from capplan.planning.transition_generator import TransitionGenerator
-from capplan.utils.serialization import dump_json, write_jsonl
+from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 
 
 try:
@@ -64,6 +64,60 @@ def _resolve_db_inputs(args: argparse.Namespace) -> List[str] | str | None:
         return tokens
     return args.nuplan_db_files
 
+
+
+def _make_accessibility_builder(args: argparse.Namespace):
+    if args.accessibility_source in {"synthetic", "synthetic_local"}:
+        return SyntheticAccessibilityBuilder(), True
+    if not args.accessibility_graph_dir:
+        raise RuntimeError(
+            f"--accessibility_source {args.accessibility_source} requires --accessibility_graph_dir with prepared node/edge JSONL files"
+        )
+    return PreparedAccessibilityBuilder(args.accessibility_graph_dir, source=args.accessibility_source), False
+
+
+def _load_pudo_evidence(path: str | None) -> Dict[tuple[str | None, str], Dict[str, Any]]:
+    """Load optional audited curbside/PUDO evidence overrides.
+
+    Keys may be either (episode_id, anchor_id) or global (None, anchor_id).
+    Supported fields include curb_height_m, sidewalk_width_m,
+    deployment_clearance_m, legal_stop, side, lighting, shelter, map_confidence,
+    dynamic_confidence, blockage_risk, and source.
+    """
+    if not path:
+        return {}
+    out: Dict[tuple[str | None, str], Dict[str, Any]] = {}
+    for row in read_jsonl(path):
+        anchor_id = row.get("anchor_id") or row.get("pudo_id")
+        if not anchor_id:
+            continue
+        eid = row.get("episode_id")
+        out[(str(eid) if eid else None, str(anchor_id))] = dict(row)
+    return out
+
+
+def _apply_pudo_evidence_overrides(anchors: List[PUDOAnchor], evidence: Dict[tuple[str | None, str], Dict[str, Any]]) -> List[PUDOAnchor]:
+    if not evidence:
+        return anchors
+    fields = {
+        "curb_height_m", "sidewalk_width_m", "deployment_clearance_m",
+        "blockage_risk", "map_confidence", "dynamic_confidence",
+        "lighting", "shelter", "legal_stop", "side", "legal_stop_source", "source",
+    }
+    updated: List[PUDOAnchor] = []
+    for a in anchors:
+        row = evidence.get((a.episode_id, a.anchor_id)) or evidence.get((None, a.anchor_id))
+        if not row:
+            updated.append(a)
+            continue
+        kwargs = {k: row[k] for k in fields if k in row}
+        if kwargs:
+            src = kwargs.get("source") or f"{a.source}+pudo_evidence_override"
+            kwargs["source"] = src
+            updated.append(replace(a, **kwargs))
+        else:
+            updated.append(a)
+    return updated
 
 def _git_commit() -> str | None:
     try:
@@ -129,7 +183,9 @@ def main() -> None:
     p.add_argument("--split", default="mini")
     p.add_argument("--max_scenarios", type=int, default=4)
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
-    p.add_argument("--accessibility_source", choices=["synthetic_local", "synthetic", "geojson", "opensidewalks"], default="synthetic_local")
+    p.add_argument("--accessibility_source", choices=["synthetic_local", "synthetic", "prepared_jsonl", "geojson", "opensidewalks"], default="synthetic_local")
+    p.add_argument("--accessibility_graph_dir", default=None, help="Directory containing prepared accessibility graph JSONL files: <episode_id>.nodes.jsonl/<episode_id>.edges.jsonl or shared nodes.jsonl/edges.jsonl.")
+    p.add_argument("--pudo_evidence_jsonl", default=None, help="Optional JSONL with audited PUDO/curbside evidence overrides keyed by episode_id and anchor_id.")
     p.add_argument("--pudo_source", choices=["auto", "synthetic_overlay", "nuplan_route"], default="auto", help="PUDO generation policy. Use nuplan_route to require route/lane-derived anchors in nuPlan mode.")
     p.add_argument("--num_contracts_per_scene", type=int, default=2)
     p.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=0, help="Number of worker threads passed to the nuPlan scenario builder. Default 0 keeps the existing sequential behavior.")
@@ -154,7 +210,8 @@ def main() -> None:
         seed=args.seed,
         num_workers=args.num_workers,
     )
-    acc_builder = SyntheticAccessibilityBuilder()
+    acc_builder, synthetic_accessibility_mode = _make_accessibility_builder(args)
+    pudo_evidence_overrides = _load_pudo_evidence(args.pudo_evidence_jsonl)
     pudo_gen = PUDOGenerator()
     trans_gen = TransitionGenerator()
     oracle = IndependentLabelOracle(max_depth=16)
@@ -191,8 +248,6 @@ def main() -> None:
         destination = EntranceAnchor("destination", eid, "destination_entrance", dest_pose, "destination", 0.98, entrance_source)
         entrances.extend([to_dict(origin), to_dict(destination)])
 
-        if args.accessibility_source not in {"synthetic", "synthetic_local"}:
-            raise RuntimeError("Only synthetic_local accessibility overlays are available in this repository smoke implementation; provide prepared GeoJSON through the builder API for real overlays")
         graph = acc_builder.build(eid, seed=ep.seed, origin=origin_pose, destination=dest_pose)
 
         vehicles = vehicle_interface_profiles(eid)
@@ -218,6 +273,7 @@ def main() -> None:
                 "strict_nuplan_pudo": args.scene_source == "nuplan" and args.pudo_source == "nuplan_route",
             },
         )
+        pudo = _apply_pudo_evidence_overrides(pudo, pudo_evidence_overrides)
         graph, pudo = attach_pudo_nodes_to_graph(graph, pudo)
         write_accessibility_graph(out, graph)
         pudo_records.extend(to_dict(x) for x in pudo)
@@ -267,7 +323,7 @@ def main() -> None:
         "version": "0.1.0",
         "scene_source": args.scene_source,
         "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files_requested": resolved_db_files, "db_files_expanded": adapter.db_files if args.scene_source == "nuplan" else [], "map_version": args.nuplan_map_version},
-        "accessibility_source": args.accessibility_source, "pudo_source": args.pudo_source,
+        "accessibility_source": args.accessibility_source, "accessibility_graph_dir": args.accessibility_graph_dir, "pudo_source": args.pudo_source, "pudo_evidence_jsonl": args.pudo_evidence_jsonl,
         "builder_git_commit": _git_commit(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "strict_mode": bool(args.strict),
