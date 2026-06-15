@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 import math
 
 from capplan.data.schemas import CandidateTransition, ResourceEvidence
-from capplan.models.casa_features import FeatureVocab, encode_transition
+from capplan.models.casa_features import FeatureVocab, encode_transition_with_capability
 
 
 @dataclass
@@ -80,16 +80,19 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
         except Exception:
             return None
 
-    def _normalized_features(self, transition: CandidateTransition) -> List[float]:
-        x = [float(v) for v in encode_transition(transition, self.vocab)]
+    def _normalized_features(self, transition: CandidateTransition, context: Dict[str, Any] | None = None) -> List[float]:
+        tokens = []
+        if isinstance(context, dict):
+            tokens = context.get("tokens") or []
+        x = [float(v) for v in encode_transition_with_capability(transition, tokens, self.vocab)]
         mean = self.weights.get("mean")
         std = self.weights.get("std")
         if isinstance(mean, list) and isinstance(std, list) and len(mean) == len(x) and len(std) == len(x):
             return [(xi - float(mu)) / max(float(si), 1e-6) for xi, mu, si in zip(x, mean, std)]
         return x
 
-    def _predict_heads(self, transition: CandidateTransition) -> tuple[float | None, float | None]:
-        x = self._normalized_features(transition)
+    def _predict_heads(self, transition: CandidateTransition, context: Dict[str, Any] | None = None) -> tuple[float | None, float | None]:
+        x = self._normalized_features(transition, context)
         edge_logit = self._dot(self.weights.get("W_edge"), x)
         value_logit = self._dot(self.weights.get("W_value"), x)
         if edge_logit is not None:
@@ -114,7 +117,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                 e.tests.interface_valid,
                 e.tests.dynamically_available,
             ])
-            edge_prob, value_prob = self._predict_heads(e)
+            edge_prob, value_prob = self._predict_heads(e, context)
             if edge_prob is None:
                 edge_prob = 1.0 if test_ok else 0.05
             if value_prob is None:

@@ -79,7 +79,7 @@ def synthetic_accessibility_graph(episode_id: str, seed: int = 0, n_pudo: int = 
         edges.append(AccessibilityEdge(f"{spine}_to_{pudo}", spine, pudo, max(3.0, math.hypot(nodes[-1].x - sx, nodes[-1].y - sy)), width, slope, cross, "concrete", curb, step, obstacle, "day", i % 2 == 0, conf, [[sx, sy], [nodes[-1].x, nodes[-1].y]], crossing_type="curb", obstacle_state="blocked" if obstacle else None, source=overlay_source))
         # Direct access edge to keep hidden tests honest: sometimes longer than via spine.
         direct_len = math.hypot(nodes[-1].x - origin.x, nodes[-1].y - origin.y) * (1.15 + 0.05 * i)
-        edges.append(AccessibilityEdge(f"origin_direct_to_{pudo}", "origin", pudo, direct_len, width, slope, cross, "paved", curb, step, obstacle, "day", i % 2 == 0, conf, [[origin.x, origin.y], [nodes[-1].x, nodes[-1].y]], source=overlay_source))
+        edges.append(AccessibilityEdge(f"origin_direct_to_{pudo}", "origin", pudo, direct_len, width, slope, cross, "paved", curb, step, obstacle, "day", i % 2 == 0, conf, [[origin.x, origin.y], [nodes[-1].x, nodes[-1].y]], crossing_type="curb", obstacle_state="blocked" if obstacle else None, source=overlay_source))
         last_spine = spine
     last_node = next(n for n in nodes if n.node_id == last_spine)
     edges.append(AccessibilityEdge(f"{last_spine}_to_destination", last_spine, "destination", math.hypot(destination.x - last_node.x, destination.y - last_node.y), 1.2, 0.035, 0.018, "paved", True, True, False, "day", True, 0.90, [[last_node.x, last_node.y], [destination.x, destination.y]], source=overlay_source))
@@ -93,7 +93,7 @@ def synthetic_accessibility_graph(episode_id: str, seed: int = 0, n_pudo: int = 
         obstacle = i == 3
         conf = 0.94 - 0.045 * i
         # Egress connector to destination; not necessarily shortest if spine is better.
-        edges.append(AccessibilityEdge(f"pudo_{i}_to_destination", f"pudo_{i}", "destination", math.hypot(destination.x - pudo_node.x, destination.y - pudo_node.y) * (1.05 + 0.03 * i), width, slope, cross, "paved", curb, step, obstacle, "day", i % 2 == 1, conf, [[pudo_node.x, pudo_node.y], [destination.x, destination.y]], source=overlay_source))
+        edges.append(AccessibilityEdge(f"pudo_{i}_to_destination", f"pudo_{i}", "destination", math.hypot(destination.x - pudo_node.x, destination.y - pudo_node.y) * (1.05 + 0.03 * i), width, slope, cross, "paved", curb, step, obstacle, "day", i % 2 == 1, conf, [[pudo_node.x, pudo_node.y], [destination.x, destination.y]], crossing_type="curb", obstacle_state="blocked" if obstacle else None, source=overlay_source))
     return AccessibilityGraph(episode_id=episode_id, nodes=nodes, edges=edges, metadata={"source": overlay_source, "seed": seed, "frame": origin.frame if origin.frame == destination.frame else "mixed"})
 
 
@@ -329,7 +329,16 @@ def shortest_accessible_path_stats(graph: AccessibilityGraph, start_node: str, e
     width_vals = [e.width_m for e in edges]; missing_check("path_width_m", width_vals)
     slope_vals = [e.slope for e in edges]; missing_check("slope", slope_vals)
     cross_vals = [e.cross_slope for e in edges]; missing_check("cross_slope", cross_vals)
-    curb_vals = [e.curb_ramp for e in edges if e.crossing_type == "curb" or "curb" in e.edge_id]
+    node_kinds = {n.node_id: n.kind for n in graph.nodes}
+    def touches_curb_context(e: AccessibilityEdge) -> bool:
+        return (
+            e.crossing_type == "curb"
+            or "curb" in e.edge_id
+            or node_kinds.get(e.from_node) in {"pudo", "curb"}
+            or node_kinds.get(e.to_node) in {"pudo", "curb"}
+        )
+
+    curb_vals = [e.curb_ramp for e in edges if touches_curb_context(e)]
     step_vals = [e.step_free for e in edges]
     surface_vals = [e.surface for e in edges]
     if any(v is None for v in curb_vals): missing_fields.append("curb_ramp")
