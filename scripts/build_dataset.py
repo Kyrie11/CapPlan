@@ -13,10 +13,16 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from capplan.data.accessibility_layer import PreparedAccessibilityBuilder, SyntheticAccessibilityBuilder, attach_pudo_nodes_to_graph, write_accessibility_graph
-from capplan.data.capability_contracts import sample_contracts_with_pairs
+from capplan.data.capability_contracts import load_contracts_from_profiles, sample_contracts_with_pairs
 from capplan.data.label_oracle import IndependentLabelOracle
 from capplan.data.nuplan_adapter import NuPlanAdapter
 from capplan.data.pudo_interface_layer import PUDOGenerator, synthetic_vehicle_interface, vehicle_interface_profiles
+from capplan.data.passenger_service_layer import (
+    bind_service_request_to_graph,
+    load_fleet_interfaces,
+    load_service_requests_by_episode,
+    service_request_to_trip_context,
+)
 from capplan.data.schemas import EntranceAnchor, Pose2D, PUDOAnchor, to_dict, transition_label_from_transition
 from capplan.data.validate_dataset import validate_dataset
 from capplan.planning.transition_generator import TransitionGenerator
@@ -64,6 +70,73 @@ def _resolve_db_inputs(args: argparse.Namespace) -> List[str] | str | None:
         return tokens
     return args.nuplan_db_files
 
+
+
+def _assert_path(path: str | None, label: str) -> Path:
+    if not path:
+        raise RuntimeError(f"paper_mode requires {label}")
+    p = Path(path)
+    if not p.exists():
+        raise RuntimeError(f"paper_mode requires existing {label}: {p}")
+    return p
+
+
+def _assert_paper_mode_config(args: argparse.Namespace) -> None:
+    """Fail fast when a command could silently build a proxy dataset.
+
+    Paper mode is intentionally stricter than schema validation: it rejects
+    synthetic/proxy layers before any dataset rows are written.  Smoke mode keeps
+    the old lightweight pipeline for CI and quick debugging.
+    """
+    if not getattr(args, "paper_mode", False):
+        return
+    if args.scene_source != "nuplan":
+        raise RuntimeError("paper_mode requires --scene_source nuplan")
+    if args.accessibility_source in {"synthetic", "synthetic_local"}:
+        raise RuntimeError("paper_mode rejects synthetic accessibility; use --accessibility_source prepared_jsonl/geojson/opensidewalks")
+    if args.pudo_source in {"synthetic_overlay", "auto"}:
+        raise RuntimeError("paper_mode requires audited PUDO evidence; use --pudo_source evidence_jsonl or nuplan_route with --pudo_evidence_jsonl")
+    if args.service_layer_source == "synthetic_smoke":
+        raise RuntimeError("paper_mode requires --service_layer_source real_jsonl or calibrated_od")
+    _assert_path(args.accessibility_graph_dir, "--accessibility_graph_dir")
+    _assert_path(args.pudo_evidence_jsonl, "--pudo_evidence_jsonl")
+    _assert_path(args.service_requests_jsonl, "--service_requests_jsonl")
+    _assert_path(args.capability_profiles_jsonl, "--capability_profiles_jsonl")
+    _assert_path(args.fleet_jsonl, "--fleet_jsonl")
+
+
+def _source_is_synthetic_or_proxy(value: Any) -> bool:
+    s = str(value or "").lower()
+    return s.startswith("synthetic") or "proxy" in s or s in {"toy", "mock"}
+
+
+def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: Any, origin: EntranceAnchor, destination: EntranceAnchor, pudo: List[PUDOAnchor]) -> None:
+    if not getattr(args, "paper_mode", False):
+        return
+    if args.reject_proxy_entrances and (_source_is_synthetic_or_proxy(origin.source) or _source_is_synthetic_or_proxy(destination.source)):
+        raise RuntimeError(f"paper_mode rejects proxy/synthetic entrances for {eid}: {origin.source}, {destination.source}")
+    if args.reject_synthetic_accessibility:
+        bad_edges = [e.edge_id for e in graph.edges if _source_is_synthetic_or_proxy(e.source)]
+        if bad_edges:
+            raise RuntimeError(f"paper_mode rejects synthetic/proxy accessibility edges for {eid}; first examples: {bad_edges[:5]}")
+        if _source_is_synthetic_or_proxy(graph.metadata.get("source")):
+            raise RuntimeError(f"paper_mode rejects synthetic/proxy accessibility graph source for {eid}: {graph.metadata.get('source')}")
+    if len(graph.nodes) < args.min_graph_nodes or len(graph.edges) < args.min_graph_edges:
+        raise RuntimeError(f"paper_mode graph for {eid} is too small: {len(graph.nodes)} nodes/{len(graph.edges)} edges; required {args.min_graph_nodes}/{args.min_graph_edges}")
+    if not pudo:
+        raise RuntimeError(f"paper_mode requires audited PUDO candidates for {eid}")
+    missing = {"curb_height_m": 0, "deployment_clearance_m": 0, "sidewalk_width_m": 0}
+    for a in pudo:
+        for k in list(missing):
+            if getattr(a, k) is None:
+                missing[k] += 1
+        if _source_is_synthetic_or_proxy(a.source):
+            raise RuntimeError(f"paper_mode rejects synthetic/proxy PUDO source for {eid}: {a.anchor_id} source={a.source}")
+    n = max(1, len(pudo))
+    for k, count in missing.items():
+        rate = count / n
+        if rate > args.max_core_pudo_missing_rate:
+            raise RuntimeError(f"paper_mode PUDO core evidence missing rate too high for {eid}: {k}={rate:.3f} > {args.max_core_pudo_missing_rate:.3f}")
 
 
 def _make_accessibility_builder(args: argparse.Namespace):
@@ -183,16 +256,37 @@ def main() -> None:
     p.add_argument("--split", default="mini")
     p.add_argument("--max_scenarios", type=int, default=4)
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
+    p.add_argument("--paper_mode", action="store_true", help="Enable publication-grade data gates: no synthetic/proxy fallbacks, no missing core evidence, and real service/profile/fleet inputs required.")
+    p.add_argument("--service_layer_source", choices=["synthetic_smoke", "real_jsonl", "calibrated_od"], default="synthetic_smoke", help="Passenger-service request source. Paper mode rejects synthetic_smoke.")
+    p.add_argument("--service_requests_jsonl", default=None, help="Real/calibrated service requests JSONL with request_id, episode_id, origin/destination entrance IDs, request time, profile, vehicle/fleet fields.")
+    p.add_argument("--fleet_jsonl", default=None, help="Fleet vehicle/interface JSONL. Paper mode requires this instead of the fixed smoke vehicle set.")
+    p.add_argument("--capability_profiles_jsonl", default=None, help="Capability profiles in JSONL/YAML form. Paper mode requires this; smoke mode samples archetypes.")
+    p.add_argument("--reject_proxy_entrances", action="store_true", help="Fail if entrances are proxy/synthetic sources.")
+    p.add_argument("--reject_synthetic_accessibility", action="store_true", help="Fail if accessibility graph nodes/edges have synthetic/proxy provenance.")
+    p.add_argument("--min_graph_nodes", type=int, default=100)
+    p.add_argument("--min_graph_edges", type=int, default=150)
+    p.add_argument("--max_core_pudo_missing_rate", type=float, default=0.05)
+    p.add_argument("--min_edge_positive_rate", type=float, default=0.10)
+    p.add_argument("--min_skeleton_positive_rate", type=float, default=0.10)
     p.add_argument("--accessibility_source", choices=["synthetic_local", "synthetic", "prepared_jsonl", "geojson", "opensidewalks"], default="synthetic_local")
     p.add_argument("--accessibility_graph_dir", default=None, help="Directory containing prepared accessibility graph JSONL files: <episode_id>.nodes.jsonl/<episode_id>.edges.jsonl or shared nodes.jsonl/edges.jsonl.")
     p.add_argument("--pudo_evidence_jsonl", default=None, help="Optional JSONL with audited PUDO/curbside evidence overrides keyed by episode_id and anchor_id.")
-    p.add_argument("--pudo_source", choices=["auto", "synthetic_overlay", "nuplan_route"], default="auto", help="PUDO generation policy. Use nuplan_route to require route/lane-derived anchors in nuPlan mode.")
+    p.add_argument("--pudo_source", choices=["auto", "synthetic_overlay", "nuplan_route", "evidence_jsonl"], default="auto", help="PUDO generation policy. Paper mode should use evidence_jsonl or nuplan_route plus audited evidence overrides.")
     p.add_argument("--num_contracts_per_scene", type=int, default=2)
     p.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=0, help="Number of worker threads passed to the nuPlan scenario builder. Default 0 keeps the existing sequential behavior.")
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--strict", action="store_true")
     p.add_argument("--disable_tqdm", action="store_true", help="Disable preprocessing progress bars.")
     args = p.parse_args()
+    if args.paper_mode:
+        # Reject proxy entries by default in paper mode even if the explicit flags were omitted.
+        args.reject_proxy_entrances = True
+        args.reject_synthetic_accessibility = True
+    _assert_paper_mode_config(args)
+
+    service_requests_by_episode = load_service_requests_by_episode(args.service_requests_jsonl) if args.service_requests_jsonl else {}
+    fleet_by_episode = load_fleet_interfaces(args.fleet_jsonl) if args.fleet_jsonl else {}
+    profile_contracts_by_episode = load_contracts_from_profiles(args.capability_profiles_jsonl, service_requests_by_episode) if args.capability_profiles_jsonl else {}
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -231,6 +325,7 @@ def main() -> None:
     skeleton_labels: List[Dict[str, Any]] = []
     certificate_labels: List[Dict[str, Any]] = []
     counterfactual_pairs: List[Dict[str, Any]] = []
+    service_request_records: List[Dict[str, Any]] = []
 
     scenario_iter = adapter.iter_scenarios(args.max_scenarios)
     if not args.disable_tqdm:
@@ -239,20 +334,42 @@ def main() -> None:
     for record in scenario_iter:
         scene = record.scene
         ep = record.episode
-        scenes.append(to_dict(scene))
-        episodes.append(to_dict(ep))
         eid = ep.episode_id
 
-        origin_pose, dest_pose, entrance_source = _scene_service_entrance_poses(scene)
-        origin = EntranceAnchor("origin", eid, "origin_entrance", origin_pose, "origin", 0.98, entrance_source)
-        destination = EntranceAnchor("destination", eid, "destination_entrance", dest_pose, "destination", 0.98, entrance_source)
+        request = None
+        if args.service_layer_source in {"real_jsonl", "calibrated_od"}:
+            requests = service_requests_by_episode.get(eid, [])
+            if not requests:
+                raise RuntimeError(f"{args.service_layer_source} service layer has no request for episode {eid}")
+            request = requests[0]
+            service_request_records.append(dict(request))
+            graph = acc_builder.build(eid, seed=ep.seed)
+            origin, destination = bind_service_request_to_graph(request, graph)
+            ep.origin_anchor = origin.anchor_id
+            ep.destination_anchor = destination.anchor_id
+            ep.request_time_s = float(request.get("request_time_s", ep.request_time_s))
+            if request.get("source"):
+                ep.metadata = {**ep.metadata, "service_request_source": request.get("source"), "request_id": request.get("request_id"), "service_layer_source": args.service_layer_source}
+        else:
+            origin_pose, dest_pose, entrance_source = _scene_service_entrance_poses(scene)
+            origin = EntranceAnchor("origin", eid, "origin_entrance", origin_pose, "origin", 0.98, entrance_source)
+            destination = EntranceAnchor("destination", eid, "destination_entrance", dest_pose, "destination", 0.98, entrance_source)
+            graph = acc_builder.build(eid, seed=ep.seed, origin=origin.pose, destination=destination.pose)
+            ep.metadata = {**ep.metadata, "service_layer_source": args.service_layer_source}
+
         entrances.extend([to_dict(origin), to_dict(destination)])
+        scenes.append(to_dict(scene))
+        episodes.append(to_dict(ep))
 
-        graph = acc_builder.build(eid, seed=ep.seed, origin=origin_pose, destination=dest_pose)
-
-        vehicles = vehicle_interface_profiles(eid)
+        vehicles = fleet_by_episode.get(eid) or vehicle_interface_profiles(eid)
         vehicle_records.extend(to_dict(v) for v in vehicles)
-        primary_vehicle = next(v for v in vehicles if v.vehicle_id == "wav_ramp_right")
+        requested_vehicle_id = (request or {}).get("vehicle_id") or (request or {}).get("fleet_vehicle_id")
+        if requested_vehicle_id:
+            primary_vehicle = next((v for v in vehicles if v.vehicle_id == requested_vehicle_id), None)
+            if primary_vehicle is None:
+                raise RuntimeError(f"service request for {eid} requested vehicle {requested_vehicle_id}, but it is not present in fleet_jsonl")
+        else:
+            primary_vehicle = next((v for v in vehicles if v.vehicle_id == "wav_ramp_right"), vehicles[0])
         pudo_context = {
             "episode_id": eid,
             "seed": ep.seed,
@@ -269,16 +386,19 @@ def main() -> None:
             primary_vehicle,
             {
                 "n_candidates": 4,
-                "pudo_source": "synthetic_overlay" if args.pudo_source == "synthetic_overlay" else ("nuplan_route" if args.pudo_source == "nuplan_route" else "auto"),
-                "strict_nuplan_pudo": args.scene_source == "nuplan" and args.pudo_source == "nuplan_route",
+                "pudo_source": "synthetic_overlay" if args.pudo_source == "synthetic_overlay" else ("nuplan_route" if args.pudo_source in {"nuplan_route", "evidence_jsonl"} else "auto"),
+                "strict_nuplan_pudo": args.scene_source == "nuplan" and args.pudo_source in {"nuplan_route", "evidence_jsonl"},
             },
         )
         pudo = _apply_pudo_evidence_overrides(pudo, pudo_evidence_overrides)
         graph, pudo = attach_pudo_nodes_to_graph(graph, pudo)
+        _enforce_paper_episode_quality(args, eid, graph, origin, destination, pudo)
         write_accessibility_graph(out, graph)
         pudo_records.extend(to_dict(x) for x in pudo)
 
         trip_context = {**to_dict(ep), "route_corridor": scene.route_corridor, "trip_modifiers": {}}
+        if request:
+            trip_context.update(service_request_to_trip_context(request))
         ts = trans_gen.generate(eid, graph, pudo, primary_vehicle, origin.anchor_id, destination.anchor_id, scene_context=trip_context)
         transitions.extend(to_dict(t) for t in ts)
         transition_labels.extend(to_dict(transition_label_from_transition(t)) for t in ts)
@@ -286,11 +406,29 @@ def main() -> None:
             for ev in t.resource_evidence:
                 resource_labels.append({"episode_id": eid, "transition_id": t.transition_id, **to_dict(ev)})
 
-        episode_contracts, pairs = sample_contracts_with_pairs(eid, args.num_contracts_per_scene, seed=ep.seed)
+        if args.capability_profiles_jsonl:
+            episode_contracts = profile_contracts_by_episode.get(eid, [])
+            if not episode_contracts:
+                raise RuntimeError(f"no capability profile/contract available for episode {eid}")
+            pairs = []
+        else:
+            episode_contracts, pairs = sample_contracts_with_pairs(eid, args.num_contracts_per_scene, seed=ep.seed)
         counterfactual_pairs.extend(to_dict(pair) for pair in pairs)
         for contract in episode_contracts:
             profiles.append(contract.profile)
             contracts.append(to_dict(contract))
+            if args.service_layer_source == "synthetic_smoke":
+                service_request_records.append({
+                    "request_id": f"{contract.passenger_id}:request",
+                    "episode_id": eid,
+                    "origin_entrance_id": origin.anchor_id,
+                    "destination_entrance_id": destination.anchor_id,
+                    "request_time_s": ep.request_time_s,
+                    "passenger_profile_id": str(contract.passenger_id).split(":")[-1],
+                    "passenger_id": contract.passenger_id,
+                    "vehicle_id": primary_vehicle.vehicle_id,
+                    "source": "synthetic_smoke",
+                })
             req_groups.extend(to_dict(g) | {"episode_id": eid, "passenger_id": contract.passenger_id} for g in contract.groups)
             labels = oracle.verify_episode(eid, contract, graph, pudo, primary_vehicle, ts)
             passenger_edge_labels.extend(to_dict(v) for v in labels["passenger_edge_labels"].values())
@@ -316,6 +454,7 @@ def main() -> None:
     write_jsonl(out / "skeleton_labels.jsonl", skeleton_labels)
     write_jsonl(out / "certificate_labels.jsonl", certificate_labels)
     write_jsonl(out / "counterfactual_pairs.jsonl", counterfactual_pairs)
+    write_jsonl(out / "service_requests.jsonl", service_request_records)
     _write_splits(out, [e["episode_id"] for e in episodes])
 
     manifest = {
@@ -324,6 +463,7 @@ def main() -> None:
         "scene_source": args.scene_source,
         "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files_requested": resolved_db_files, "db_files_expanded": adapter.db_files if args.scene_source == "nuplan" else [], "map_version": args.nuplan_map_version},
         "accessibility_source": args.accessibility_source, "accessibility_graph_dir": args.accessibility_graph_dir, "pudo_source": args.pudo_source, "pudo_evidence_jsonl": args.pudo_evidence_jsonl,
+        "paper_mode": bool(args.paper_mode), "service_layer_source": args.service_layer_source, "service_requests_jsonl": args.service_requests_jsonl, "capability_profiles_jsonl": args.capability_profiles_jsonl, "fleet_jsonl": args.fleet_jsonl,
         "builder_git_commit": _git_commit(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "strict_mode": bool(args.strict),
@@ -333,6 +473,14 @@ def main() -> None:
     }
     dump_json(out / "dataset_manifest.json", manifest)
     validation = validate_dataset(out, strict=args.strict)
+    if args.paper_mode:
+        pos = sum(1 for r in passenger_edge_labels if bool(to_dict(r).get("y_e_p")))
+        rate = pos / max(1, len(passenger_edge_labels))
+        skel_rate = len(skeleton_labels) / max(1, len(skeleton_labels) + len(certificate_labels))
+        if rate < args.min_edge_positive_rate:
+            raise RuntimeError(f"paper_mode passenger edge positive rate too low: {rate:.4f} < {args.min_edge_positive_rate:.4f}")
+        if skel_rate < args.min_skeleton_positive_rate:
+            raise RuntimeError(f"paper_mode skeleton positive rate too low: {skel_rate:.4f} < {args.min_skeleton_positive_rate:.4f}")
     dump_json(out / "validation_report.json", validation)
     print(f"Wrote dataset to {out} with {len(episodes)} episodes, {len(contracts)} contracts, {len(transitions)} transitions")
     print(f"Validation ok={validation['ok']} errors={len(validation['errors'])} warnings={len(validation['warnings'])}")

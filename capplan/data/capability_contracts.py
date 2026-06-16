@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import copy
+import json
 import random
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 import yaml
 
-from capplan.data.schemas import CapabilityClause, CapabilityContract, CounterfactualPair, RequirementGroup
+from capplan.data.schemas import CapabilityClause, CapabilityContract, CounterfactualPair, RequirementGroup, contract_from_dict
+from capplan.utils.serialization import read_jsonl
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "capability_profiles.yaml"
 ARCHETYPES = [
@@ -229,3 +231,114 @@ def sample_contracts_with_pairs(episode_id: str, num_contracts: int = 2, seed: i
     if len(contracts) >= 2:
         pairs.append(CounterfactualPair(f"{episode_id}:cf0", episode_id, contracts[0].passenger_id, contracts[1].passenger_id, "stricter_or_equal", True))
     return contracts, pairs
+
+
+
+def _read_profile_records(path: str | Path) -> List[Dict[str, Any]]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(p)
+    if p.suffix.lower() in {".yaml", ".yml"}:
+        payload = yaml.safe_load(p.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            for key in ["profiles", "capability_profiles", "contracts"]:
+                if isinstance(payload.get(key), list):
+                    return [dict(x) for x in payload[key]]
+            return [payload]
+        if isinstance(payload, list):
+            return [dict(x) for x in payload]
+        return []
+    return read_jsonl(p)
+
+
+def _reject_proxy_profile_source(row: Dict[str, Any]) -> None:
+    source = str(row.get("source") or row.get("metadata", {}).get("source") or row.get("profile_source") or "").lower()
+    if source.startswith("synthetic") or "proxy" in source or source in {"mock", "toy"}:
+        raise ValueError(f"paper-mode capability profile/contract rejects synthetic/proxy source: {row.get('profile_id') or row.get('passenger_id')} source={source}")
+
+
+def load_profiles(path: str | Path) -> List[Dict[str, Any]]:
+    """Load passenger capability profiles from JSONL/YAML without sampling.
+
+    Records may be high-level profiles accepted by ``profile_to_contract`` or
+    full ``CapabilityContract`` dictionaries.  The source field must be real or
+    calibrated, not synthetic/proxy.
+    """
+    rows = _read_profile_records(path)
+    for row in rows:
+        _reject_proxy_profile_source(row)
+    return rows
+
+
+def _contract_from_profile_record(row: Dict[str, Any], passenger_id: str | None = None) -> CapabilityContract:
+    if "clauses" in row and "passenger_id" in row:
+        c = contract_from_dict(row)
+        if passenger_id and c.passenger_id != passenger_id:
+            c = CapabilityContract(passenger_id, c.clauses, {**c.metadata, "original_passenger_id": c.passenger_id}, c.groups, {**c.profile, "profile_id": passenger_id})
+        return c
+    profile = copy.deepcopy(row)
+    if passenger_id:
+        profile["profile_id"] = passenger_id
+    if "profile_id" not in profile:
+        raise ValueError(f"capability profile missing profile_id/passenger binding: {row}")
+    # Normalize guide.md profile sections into the existing contract compiler schema.
+    profile.setdefault("consent_scope", "trip_planning")
+    profile.setdefault("capability_version", profile.get("version", "v1"))
+    profile.setdefault("archetype", profile.get("source_profile", "real_profile"))
+    profile.setdefault("trip_modifiers", profile.get("modifiers", {}))
+    profile.setdefault("mobility", profile.get("mobility", {}))
+    profile.setdefault("interface", profile.get("interface", {}))
+    profile.setdefault("wait", profile.get("wait", profile.get("interface", {})))
+    profile.setdefault("ride", profile.get("ride", {}))
+    profile.setdefault("uncertainty", profile.get("uncertainty", {}))
+    # Required defaults are conservative but explicit, so callers can omit fields
+    # that are irrelevant to a profile while still producing executable clauses.
+    profile["mobility"].setdefault("max_access_distance_m", profile.get("max_walk_or_roll_distance_m", 250.0))
+    profile["mobility"].setdefault("max_egress_distance_m", profile.get("max_walk_or_roll_distance_m", 250.0))
+    profile["mobility"].setdefault("max_slope", 0.05)
+    profile["mobility"].setdefault("max_cross_slope", 0.02)
+    profile["mobility"].setdefault("min_clear_width_m", 1.0)
+    profile["mobility"].setdefault("step_free_required", False)
+    profile["mobility"].setdefault("curb_ramp_required", False)
+    profile["mobility"].setdefault("allowed_surfaces", ["concrete", "asphalt", "paved"])
+    profile["wait"].setdefault("max_wait_exposure_s", 600.0)
+    profile["wait"].setdefault("shelter_required", False)
+    profile["wait"].setdefault("min_lighting", "day")
+    profile["wait"].setdefault("identification_modalities_any_of", ["visual", "audio"])
+    profile["interface"].setdefault("preferred_door_side", "either")
+    profile["interface"].setdefault("min_door_width_m", 0.78)
+    profile["interface"].setdefault("min_deployment_clearance_m", 0.8)
+    profile["interface"].setdefault("boarding_any_of", [])
+    profile["ride"].setdefault("max_ride_time_s", 3600.0)
+    profile["ride"].setdefault("max_peak_accel_mps2", 2.5)
+    profile["ride"].setdefault("max_peak_jerk_mps3", 4.0)
+    profile["ride"].setdefault("max_motion_exposure", 500.0)
+    profile["uncertainty"].setdefault("min_map_confidence", 0.70)
+    profile["uncertainty"].setdefault("max_blockage_risk", 0.35)
+    profile["uncertainty"].setdefault("max_deployment_risk", 0.25)
+    profile["uncertainty"].setdefault("beta_tau", 1.0)
+    profile["uncertainty"].setdefault("missing_policy", "fail_closed")
+    return profile_to_contract(profile)
+
+
+def load_contracts_from_profiles(path: str | Path, service_requests_by_episode: Dict[str, List[Dict[str, Any]]] | None = None) -> Dict[str, List[CapabilityContract]]:
+    rows = load_profiles(path)
+    by_profile_id = {str(r.get("profile_id") or r.get("passenger_id")): r for r in rows if r.get("profile_id") or r.get("passenger_id")}
+    out: Dict[str, List[CapabilityContract]] = {}
+    service_requests_by_episode = service_requests_by_episode or {}
+    if service_requests_by_episode:
+        for eid, requests in service_requests_by_episode.items():
+            for req in requests:
+                pid = str(req.get("passenger_profile_id"))
+                if pid not in by_profile_id:
+                    raise KeyError(f"service request {req.get('request_id')} references missing passenger_profile_id {pid}")
+                passenger_id = f"{eid}:{pid}"
+                c = _contract_from_profile_record(by_profile_id[pid], passenger_id=passenger_id)
+                c.metadata.update({"episode_id": eid, "request_id": req.get("request_id"), "profile_source": by_profile_id[pid].get("source")})
+                out.setdefault(eid, []).append(c)
+        return out
+    for row in rows:
+        c = _contract_from_profile_record(row)
+        eid = str(row.get("episode_id") or c.metadata.get("episode_id") or c.passenger_id.split(":p")[0])
+        out.setdefault(eid, []).append(c)
+    return out

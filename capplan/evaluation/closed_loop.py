@@ -118,7 +118,11 @@ class ClosedLoopRunner:
         oracle_certs = {_cert_key(c): c for c in read_jsonl(dataset_dir / "certificate_labels.jsonl")}
         skeletons = {(s.get("episode_id"), s.get("passenger_id")): s for s in read_jsonl(dataset_dir / "skeleton_labels.jsonl")}
         counterfactual_pairs = read_jsonl(dataset_dir / "counterfactual_pairs.jsonl")
-        return {"scenes": scenes, "episodes": episodes, "entrances": entrances, "pudos": pudos_by_episode, "vehicles": vehicles_by_episode, "contracts": contracts_by_episode, "transitions": transitions_by_episode, "oracle_certs": oracle_certs, "skeletons": skeletons, "counterfactual_pairs": counterfactual_pairs}
+        service_requests = read_jsonl(dataset_dir / "service_requests.jsonl")
+        requests_by_episode = {}
+        for r in service_requests:
+            requests_by_episode.setdefault(r.get("episode_id"), []).append(r)
+        return {"scenes": scenes, "episodes": episodes, "entrances": entrances, "pudos": pudos_by_episode, "vehicles": vehicles_by_episode, "contracts": contracts_by_episode, "transitions": transitions_by_episode, "oracle_certs": oracle_certs, "skeletons": skeletons, "counterfactual_pairs": counterfactual_pairs, "service_requests": requests_by_episode}
 
     def run_dataset(self, dataset_dir: str | Path, output_dir: str | Path) -> Dict[str, Any]:
         dataset_dir = Path(dataset_dir)
@@ -135,11 +139,17 @@ class ClosedLoopRunner:
             vehicles = data["vehicles"].get(eid, [])
             if not vehicles:
                 raise RuntimeError(f"dataset has no saved vehicle interface for {eid}")
-            vehicle = next((v for v in vehicles if v.vehicle_id == "wav_ramp_right"), vehicles[0])
             transitions = data["transitions"].get(eid, [])
             scene = data["scenes"].get(eid, {})
-            trip_context = {**meta, "route_corridor": scene.get("route_corridor", meta.get("metadata", {}).get("route_corridor", {})), **(meta.get("metadata") or {}), **(scene.get("metadata") or {})}
+            requests = data.get("service_requests", {}).get(eid, [])
+            request_by_profile = {str(r.get("passenger_profile_id")): r for r in requests}
+            trip_context_base = {**meta, "route_corridor": scene.get("route_corridor", meta.get("metadata", {}).get("route_corridor", {})), **(meta.get("metadata") or {}), **(scene.get("metadata") or {})}
             for contract in data["contracts"].get(eid, []):
+                profile_key = str(contract.passenger_id).split(":")[-1]
+                request = request_by_profile.get(profile_key) or (requests[0] if requests else {})
+                requested_vehicle_id = request.get("vehicle_id") or request.get("fleet_vehicle_id")
+                vehicle = next((v for v in vehicles if requested_vehicle_id and v.vehicle_id == requested_vehicle_id), next((v for v in vehicles if v.vehicle_id == "wav_ramp_right"), vehicles[0]))
+                trip_context = {**trip_context_base, "service_request": request, "request_time_s": request.get("request_time_s", trip_context_base.get("request_time_s")), "origin_entrance_id": request.get("origin_entrance_id", trip_context_base.get("origin_entrance_id")), "destination_entrance_id": request.get("destination_entrance_id", trip_context_base.get("destination_entrance_id"))}
                 result = self.planner.plan(eid, contract, graph, pudo, vehicle, transitions=transitions, trip_context=trip_context)
                 oracle_cert = data["oracle_certs"].get((eid, contract.passenger_id))
                 row = result_to_episode_metrics(result, trip_context, contract, oracle_cert)

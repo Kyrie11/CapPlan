@@ -61,6 +61,24 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
         self.vocab = FeatureVocab(**vocab_payload) if isinstance(vocab_payload, dict) and vocab_payload else FeatureVocab()
         weights = self.checkpoint.get("weights", {}) if isinstance(self.checkpoint, dict) else {}
         self.weights = weights if isinstance(weights, dict) else {}
+        self._torch_model = None
+        if isinstance(self.checkpoint, dict) and self.checkpoint.get("torch_state_dict") is not None:
+            self._init_torch_model()
+
+    def _init_torch_model(self) -> None:
+        try:  # pragma: no cover - depends on torch
+            import torch
+            from capplan.models.casa_torch import CASAHetGraphNet
+            input_dim = int(self.checkpoint.get("input_dim", 0) or 0)
+            num_phases = int(self.checkpoint.get("num_phases", len(self.vocab.phases)) or len(self.vocab.phases))
+            num_resources = int(self.checkpoint.get("num_resources", len(self.vocab.resources)) or len(self.vocab.resources))
+            model_type = str(self.checkpoint.get("config", {}).get("model_type", "hgt"))
+            model = CASAHetGraphNet(input_dim, num_phases, num_resources, model_type=model_type)
+            model.load_state_dict(self.checkpoint["torch_state_dict"], strict=False)
+            model.eval()
+            self._torch_model = model
+        except Exception:
+            self._torch_model = None
 
     @staticmethod
     def _sigmoid(x: float) -> float:
@@ -91,8 +109,20 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             return [(xi - float(mu)) / max(float(si), 1e-6) for xi, mu, si in zip(x, mean, std)]
         return x
 
-    def _predict_heads(self, transition: CandidateTransition, context: Dict[str, Any] | None = None) -> tuple[float | None, float | None]:
+    def _predict_heads(self, transition: CandidateTransition, context: Dict[str, Any] | None = None) -> tuple[float | None, float | None, Dict[str, float] | None, Dict[str, float] | None]:
         x = self._normalized_features(transition, context)
+        if self._torch_model is not None:
+            try:  # pragma: no cover - depends on torch
+                import torch
+                with torch.no_grad():
+                    pred = self._torch_model(torch.tensor([x], dtype=torch.float32))
+                    edge_prob = float(torch.sigmoid(pred["edge_logits"])[0].cpu())
+                    value_prob = float(pred["value"][0].cpu())
+                    demand = {r: float(pred["typed_demand"][0, i].cpu()) for i, r in enumerate(self.vocab.resources[: pred["typed_demand"].shape[1]])}
+                    unc = {r: float(pred["uncertainty"][0, i].cpu()) for i, r in enumerate(self.vocab.resources[: pred["uncertainty"].shape[1]])}
+                    return edge_prob, value_prob, demand, unc
+            except Exception:
+                pass
         edge_logit = self._dot(self.weights.get("W_edge"), x)
         value_logit = self._dot(self.weights.get("W_value"), x)
         if edge_logit is not None:
@@ -101,7 +131,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             value_logit += float(self.weights.get("b_value", 0.0))
         edge_prob = self._sigmoid(edge_logit) if edge_logit is not None else None
         value_prob = self._sigmoid(value_logit) if value_logit is not None else None
-        return edge_prob, value_prob
+        return edge_prob, value_prob, None, None
 
     def predict(self, transitions: List[CandidateTransition], context: Dict[str, Any] | None = None) -> Dict[str, TransitionPrediction]:
         out: Dict[str, TransitionPrediction] = {}
@@ -117,7 +147,13 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                 e.tests.interface_valid,
                 e.tests.dynamically_available,
             ])
-            edge_prob, value_prob = self._predict_heads(e, context)
+            edge_prob, value_prob, demand_pred, unc_pred = self._predict_heads(e, context)
+            typed_evidence = e.resource_evidence
+            if demand_pred:
+                # Replace numeric evidence values with learned demand predictions
+                # only for already-observed resources; missing evidence remains missing.
+                from dataclasses import replace as _replace
+                typed_evidence = [_replace(ev, value=demand_pred.get(ev.resource_name, ev.value), sigma=(unc_pred or {}).get(ev.resource_name, ev.sigma)) if (not ev.missing and isinstance(ev.value, (int, float, bool))) else ev for ev in e.resource_evidence]
             if edge_prob is None:
                 edge_prob = 1.0 if test_ok else 0.05
             if value_prob is None:
@@ -130,8 +166,8 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             value = max(1e-4, min(1.0, float(value_prob)))
             out[e.transition_id] = TransitionPrediction(
                 transition_id=e.transition_id,
-                typed_evidence=e.resource_evidence,
-                uncertainty=uncert,
+                typed_evidence=typed_evidence,
+                uncertainty=unc_pred or uncert,
                 dynamic_availability=availability,
                 completion_value=value,
                 phase_belief={e.from_phase: 0.4, e.to_phase: 0.6},

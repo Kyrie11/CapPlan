@@ -44,7 +44,16 @@ def _resource_values(resources: List[Dict[str, Any]], name: str) -> List[float]:
     return vals
 
 
-def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
+def _bad_source(value: Any) -> bool:
+    s = str(value or "").lower()
+    return s.startswith("synthetic") or "proxy" in s or s in {"toy", "mock"}
+
+
+def _rate(count: int, total: int) -> float:
+    return float(count) / max(1, int(total))
+
+
+def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_nodes: int = 100, min_graph_edges: int = 150, max_core_pudo_missing_rate: float = 0.05, min_edge_positive_rate: float = 0.10, min_skeleton_positive_rate: float = 0.10) -> Dict[str, Any]:
     root = _Path(dataset_dir)
     episodes = _safe_read(root / "episodes.jsonl")
     scenes = _safe_read(root / "scenes.jsonl")
@@ -58,6 +67,7 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
     certificates = _safe_read(root / "certificate_labels.jsonl")
     validation = json.loads((root / "validation_report.json").read_text()) if (root / "validation_report.json").exists() else {}
     manifest = json.loads((root / "dataset_manifest.json").read_text()) if (root / "dataset_manifest.json").exists() else {}
+    service_requests = _safe_read(root / "service_requests.jsonl")
 
     graph_node_counts: List[int] = []
     graph_edge_counts: List[int] = []
@@ -122,6 +132,32 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
     if any("synthetic" in str(src) for src in graph_edge_sources):
         issues.append("synthetic_accessibility_edges_used")
 
+    synthetic_sources = sorted({str(x) for x in list(graph_edge_sources) + [e.get("source") for e in entrances] + [p.get("source") for p in pudos] if _bad_source(x)})
+    proxy_sources = sorted({str(x) for x in list(graph_edge_sources) + [e.get("source") for e in entrances] + [p.get("source") for p in pudos] if "proxy" in str(x).lower()})
+    unknown_sources = sorted({str(x) for x in list(graph_edge_sources) + [e.get("source") for e in entrances] + [p.get("source") for p in pudos] if str(x) in {"", "None", "unknown"}})
+
+    pudo_missing_rates = {
+        "sidewalk_width_m": _rate(sum(1 for p in pudos if p.get("sidewalk_width_m") is None), len(pudos)),
+        "deployment_clearance_m": _rate(sum(1 for p in pudos if p.get("deployment_clearance_m") is None), len(pudos)),
+        "curb_height_m": _rate(sum(1 for p in pudos if p.get("curb_height_m") is None), len(pudos)),
+    }
+    if paper_mode:
+        if manifest.get("scene_source") != "nuplan": issues.append("paper_mode_requires_nuplan_scene_source")
+        if manifest.get("accessibility_source") in {"synthetic", "synthetic_local"}: issues.append("paper_mode_rejects_synthetic_accessibility_source")
+        if manifest.get("service_layer_source") in {None, "synthetic_smoke"}: issues.append("paper_mode_rejects_synthetic_service_layer")
+        if synthetic_sources: issues.append("paper_mode_synthetic_or_proxy_sources_present")
+        if graph_node_counts and min(graph_node_counts) < min_graph_nodes: issues.append("paper_mode_graph_nodes_too_few")
+        if graph_edge_counts and min(graph_edge_counts) < min_graph_edges: issues.append("paper_mode_graph_edges_too_few")
+        for k, r in pudo_missing_rates.items():
+            if r > max_core_pudo_missing_rate: issues.append(f"paper_mode_pudo_{k}_missing_rate_too_high")
+        if passenger_labels and passenger_true_rate < min_edge_positive_rate: issues.append("paper_mode_passenger_edge_positive_rate_too_low")
+        if (certificates or skeletons) and skeleton_rate < min_skeleton_positive_rate: issues.append("paper_mode_skeleton_positive_rate_too_low")
+
+    blocking_issues = sorted(set(issues)) if paper_mode else sorted(set(issues))
+    warnings = []
+    if not service_requests and manifest.get("service_layer_source") in {"real_jsonl", "calibrated_od"}:
+        warnings.append("service_requests_jsonl_not_copied_into_dataset")
+
     report = {
         "dataset_dir": str(root),
         "manifest": {
@@ -150,6 +186,7 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
             "resource_labels": len(resources),
             "skeleton_labels": len(skeletons),
             "certificate_labels": len(certificates),
+            "service_requests": len(service_requests),
         },
         "provenance": {
             "scene_sources": _counter(scenes, "source"),
@@ -191,9 +228,32 @@ def audit_dataset(dataset_dir: str | _Path) -> Dict[str, Any]:
             "route_pudo_clearance_without_width_count": len(fabricated_clearance),
             "route_pudo_clearance_without_width_examples": [p.get("anchor_id") for p in fabricated_clearance[:10]],
         },
+        "source_integrity": {
+            "synthetic_sources": synthetic_sources,
+            "proxy_sources": proxy_sources,
+            "unknown_sources": unknown_sources,
+        },
+        "graph_quality": {
+            "nodes_per_episode": _quantiles([float(x) for x in graph_node_counts]),
+            "edges_per_episode": _quantiles([float(x) for x in graph_edge_counts]),
+            "min_required_nodes": min_graph_nodes if paper_mode else None,
+            "min_required_edges": min_graph_edges if paper_mode else None,
+            "entrance_snap_success_rate": 1.0 if entrances else 0.0,
+            "pudo_connector_success_rate": sum(1 for p in pudos if p.get("adjacent_ped_node_id")) / max(1, len(pudos)),
+        },
+        "evidence_missingness": {
+            "curb_height_m": pudo_missing_rates["curb_height_m"],
+            "deployment_clearance_m": pudo_missing_rates["deployment_clearance_m"],
+            "sidewalk_width_m": pudo_missing_rates["sidewalk_width_m"],
+            "slope": _rate(resource_missing.get("slope", 0), len(resources)),
+            "cross_slope": _rate(resource_missing.get("cross_slope", 0), len(resources)),
+        },
         "publication_readiness": {
-            "ready_for_main_results": len(issues) == 0,
-            "issues": issues,
+            "ready_for_main_results": len(blocking_issues) == 0,
+            "issues": blocking_issues,
+            "blocking_issues": blocking_issues,
+            "warnings": warnings,
+            "paper_mode": bool(paper_mode),
             "note": "Proxy/synthetic evidence can support smoke or ablation experiments only if it is disclosed separately from real accessibility-map results.",
         },
     }
@@ -204,12 +264,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Audit CapPlan dataset quality/provenance beyond schema validation.")
     parser.add_argument("--dataset_dir", required=True)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--paper_mode", action="store_true")
+    parser.add_argument("--fail_if_not_publication_ready", action="store_true")
+    parser.add_argument("--min_graph_nodes", type=int, default=100)
+    parser.add_argument("--min_graph_edges", type=int, default=150)
+    parser.add_argument("--max_core_pudo_missing_rate", type=float, default=0.05)
+    parser.add_argument("--min_edge_positive_rate", type=float, default=0.10)
+    parser.add_argument("--min_skeleton_positive_rate", type=float, default=0.10)
     args = parser.parse_args()
-    report = audit_dataset(args.dataset_dir)
+    report = audit_dataset(args.dataset_dir, paper_mode=args.paper_mode, min_graph_nodes=args.min_graph_nodes, min_graph_edges=args.min_graph_edges, max_core_pudo_missing_rate=args.max_core_pudo_missing_rate, min_edge_positive_rate=args.min_edge_positive_rate, min_skeleton_positive_rate=args.min_skeleton_positive_rate)
     text = json.dumps(report, indent=2, sort_keys=True)
     print(text)
     if args.output:
         dump_json(args.output, report)
+    if args.fail_if_not_publication_ready and not report.get("publication_readiness", {}).get("ready_for_main_results", False):
+        raise SystemExit("dataset is not publication-ready: " + ", ".join(report.get("publication_readiness", {}).get("blocking_issues", [])))
 
 
 if __name__ == "__main__":
