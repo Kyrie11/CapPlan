@@ -192,6 +192,76 @@ def _apply_pudo_evidence_overrides(anchors: List[PUDOAnchor], evidence: Dict[tup
             updated.append(a)
     return updated
 
+
+def _pose_from_evidence_row(row: Dict[str, Any], prefix: str = "curb") -> Pose2D:
+    """Parse a curb/stop pose from an audited PUDO evidence row.
+
+    Paper-mode ``--pudo_source evidence_jsonl`` should use audited PUDO
+    candidates directly instead of regenerating route-lane proxies and hoping
+    their IDs match evidence overrides.  This parser accepts common materialized
+    schemas: ``curb_pose``/``stop_pose`` dictionaries, ``x``/``y`` or
+    ``curb_x``/``curb_y`` scalars, and point/polyline ``geometry``.
+    """
+    pose_key = f"{prefix}_pose"
+    if isinstance(row.get(pose_key), dict):
+        d = row[pose_key]
+        return Pose2D(float(d.get("x", 0.0)), float(d.get("y", 0.0)), float(d.get("heading", 0.0)), str(d.get("frame", row.get("frame", "map"))))
+    x_key = f"{prefix}_x"
+    y_key = f"{prefix}_y"
+    if row.get(x_key) is not None and row.get(y_key) is not None:
+        return Pose2D(float(row[x_key]), float(row[y_key]), float(row.get(f"{prefix}_heading", row.get("heading", 0.0)) or 0.0), str(row.get("frame", "map")))
+    if prefix == "curb" and row.get("x") is not None and row.get("y") is not None:
+        return Pose2D(float(row["x"]), float(row["y"]), float(row.get("heading", 0.0) or 0.0), str(row.get("frame", "map")))
+    geom = row.get("geometry")
+    if prefix == "curb" and isinstance(geom, list) and geom:
+        first = geom[0]
+        if isinstance(first, dict):
+            return Pose2D(float(first.get("x", 0.0)), float(first.get("y", 0.0)), float(first.get("heading", row.get("heading", 0.0)) or 0.0), str(first.get("frame", row.get("frame", "map"))))
+        if isinstance(first, (list, tuple)) and len(first) >= 2:
+            return Pose2D(float(first[0]), float(first[1]), float(row.get("heading", 0.0) or 0.0), str(row.get("frame", "map")))
+    raise RuntimeError(f"PUDO evidence row {row.get('anchor_id') or row.get('pudo_id')} is missing {prefix} pose/x/y geometry")
+
+
+def _pudo_anchors_from_evidence_rows(evidence: Dict[tuple[str | None, str], Dict[str, Any]], episode_id: str) -> List[PUDOAnchor]:
+    """Materialize audited PUDO candidates for one episode from evidence JSONL."""
+    rows = [r for (eid, _), r in evidence.items() if eid == episode_id]
+    anchors: List[PUDOAnchor] = []
+    for row in rows:
+        anchor_id = str(row.get("anchor_id") or row.get("pudo_id"))
+        if not anchor_id:
+            continue
+        curb_pose = _pose_from_evidence_row(row, "curb")
+        try:
+            stop_pose = _pose_from_evidence_row(row, "stop")
+        except RuntimeError:
+            stop_pose = curb_pose
+        source = str(row.get("source") or row.get("evidence_source") or "audited_pudo_evidence")
+        anchors.append(PUDOAnchor(
+            anchor_id=anchor_id,
+            episode_id=episode_id,
+            kind=str(row.get("kind") or row.get("pudo_kind") or "pickup_dropoff"),
+            curb_pose=curb_pose,
+            stop_pose=stop_pose,
+            side=str(row.get("side", "unknown")),
+            legal_stop=bool(row.get("legal_stop", row.get("vehicle_stop_feasible", False))),
+            legal_stop_source=str(row.get("legal_stop_source") or row.get("regulation_id") or row.get("curb_regulation_source") or source),
+            roadblock_id=row.get("roadblock_id"),
+            lane_id=row.get("lane_id"),
+            lane_connector_id=row.get("lane_connector_id"),
+            adjacent_ped_node_id=row.get("adjacent_ped_node_id") or row.get("ped_node_id"),
+            curb_height_m=row.get("curb_height_m"),
+            sidewalk_width_m=row.get("sidewalk_width_m"),
+            deployment_clearance_m=row.get("deployment_clearance_m"),
+            blockage_risk=float(row.get("blockage_risk", row.get("curb_occupancy", 0.0)) or 0.0),
+            map_confidence=float(row.get("map_confidence", row.get("confidence", 1.0)) or 1.0),
+            dynamic_confidence=float(row.get("dynamic_confidence", row.get("availability", 1.0)) or 1.0),
+            lighting=row.get("lighting"),
+            shelter=row.get("shelter"),
+            timestamp_s=row.get("timestamp_s"),
+            source=source,
+        ))
+    return anchors
+
 def _git_commit() -> str | None:
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], text=True, stderr=subprocess.DEVNULL).strip()
@@ -380,17 +450,22 @@ def main() -> None:
             "agent_history": scene.agent_history,
             "map_context": record.map_context,
         }
-        pudo = pudo_gen.generate(
-            pudo_context,
-            graph,
-            primary_vehicle,
-            {
-                "n_candidates": 4,
-                "pudo_source": "synthetic_overlay" if args.pudo_source == "synthetic_overlay" else ("nuplan_route" if args.pudo_source in {"nuplan_route", "evidence_jsonl"} else "auto"),
-                "strict_nuplan_pudo": args.scene_source == "nuplan" and args.pudo_source in {"nuplan_route", "evidence_jsonl"},
-            },
-        )
-        pudo = _apply_pudo_evidence_overrides(pudo, pudo_evidence_overrides)
+        if args.pudo_source == "evidence_jsonl":
+            pudo = _pudo_anchors_from_evidence_rows(pudo_evidence_overrides, eid)
+            if not pudo:
+                raise RuntimeError(f"--pudo_source evidence_jsonl has no PUDO candidates for episode {eid}")
+        else:
+            pudo = pudo_gen.generate(
+                pudo_context,
+                graph,
+                primary_vehicle,
+                {
+                    "n_candidates": 4,
+                    "pudo_source": "synthetic_overlay" if args.pudo_source == "synthetic_overlay" else ("nuplan_route" if args.pudo_source == "nuplan_route" else "auto"),
+                    "strict_nuplan_pudo": args.scene_source == "nuplan" and args.pudo_source == "nuplan_route",
+                },
+            )
+            pudo = _apply_pudo_evidence_overrides(pudo, pudo_evidence_overrides)
         graph, pudo = attach_pudo_nodes_to_graph(graph, pudo)
         _enforce_paper_episode_quality(args, eid, graph, origin, destination, pudo)
         write_accessibility_graph(out, graph)

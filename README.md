@@ -114,7 +114,7 @@ python scripts/build_pudo_evidence.py \
   --fail_on_missing_core_evidence
 ```
 
-Core PUDO evidence fields are curbside legality, vehicle stop feasibility, curb height, deployment clearance, sidewalk width, dynamic occupancy, availability, and confidence.
+Core PUDO evidence fields are curbside legality, vehicle stop feasibility, curb height, deployment clearance, sidewalk width, dynamic occupancy, availability, and confidence. For `--pudo_source evidence_jsonl`, rows are used as audited PUDO candidates directly and must include a curb pose through `curb_pose`, `curb_x/curb_y`, `x/y`, or point/polyline `geometry`; route-derived PUDO candidates are used only when `--pudo_source nuplan_route`.
 
 ## Passenger-service layer build
 

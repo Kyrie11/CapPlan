@@ -47,8 +47,8 @@ def _save_checkpoint(path: Path, payload: Dict[str, Any]) -> None:
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _metrics_from_predictions(edge_prob, y_edge, value_prob, y_value, phase_prob, y_phase, demand_pred, y_demand, demand_mask, edge_pos_weight: float, mode: str, device: str, num_val: int) -> Dict[str, Any]:
-    losses = casa_loss(edge_prob, y_edge, value_prob, y_value, uncertainty=np.ones_like(edge_prob) * 0.1, phase_pred=phase_prob, phase_target=y_phase, demand_pred=demand_pred, demand_target=y_demand, demand_mask=demand_mask)
+def _metrics_from_predictions(edge_prob, y_edge, value_prob, y_value, phase_prob, y_phase, demand_pred, y_demand, demand_mask, edge_pos_weight: float, mode: str, device: str, num_val: int, uncertainty_pred=None) -> Dict[str, Any]:
+    losses = casa_loss(edge_prob, y_edge, value_prob, y_value, uncertainty=uncertainty_pred if uncertainty_pred is not None else np.ones_like(edge_prob) * 0.1, phase_pred=phase_prob, phase_target=y_phase, demand_pred=demand_pred, demand_target=y_demand, demand_mask=demand_mask)
     pred_edge_binary = edge_prob >= 0.5
     true_edge_binary = y_edge >= 0.5
     tp = int(np.sum(pred_edge_binary & true_edge_binary))
@@ -116,7 +116,8 @@ def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, y
     val_value = _sigmoid(xvn @ W_value + b_value)
     val_phase = _softmax(xvn @ W_phase + b_phase)
     val_demand = xvn @ W_demand + b_demand
-    val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv))
+    val_uncertainty = np.ones_like(val_edge) * 0.1
+    val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv), uncertainty_pred=val_uncertainty)
     checkpoint = {
         "mode": args.casa_mode,
         "model_type": "linear_smoke" if args.model_type == "linear_smoke" else f"{args.model_type}_numpy_surrogate",
@@ -153,7 +154,8 @@ def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, y
             value_loss = F.mse_loss(outp["value"], Yv[b])
             phase_loss = F.cross_entropy(outp["phase_logits"], Yp[b])
             demand_loss = (((outp["typed_demand"] - Yd[b]) ** 2) * M[b]).sum() / torch.clamp(M[b].sum(), min=1.0)
-            cal_loss = torch.relu(torch.abs(torch.sigmoid(outp["edge_logits"]) - Ye[b]) - 0.1).mean() + 0.001 * outp["uncertainty"].mean()
+            sigma_edge = outp["uncertainty"].mean(dim=1)
+            cal_loss = torch.relu(torch.abs(torch.sigmoid(outp["edge_logits"]) - Ye[b]) - sigma_edge).mean() + 0.001 * sigma_edge.mean()
             loss = phase_loss + edge_loss + demand_loss + cal_loss + value_loss
             opt.zero_grad(); loss.backward(); opt.step()
         with torch.no_grad():
@@ -166,7 +168,8 @@ def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, y
         val_value = predv["value"].cpu().numpy()
         val_phase = torch.softmax(predv["phase_logits"], dim=1).cpu().numpy()
         val_demand = predv["typed_demand"].cpu().numpy()
-    val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv))
+    val_uncertainty = predv["uncertainty"].mean(dim=1).cpu().numpy()
+    val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv), uncertainty_pred=val_uncertainty)
     checkpoint = {
         "mode": args.casa_mode,
         "model_type": f"casa_{args.model_type}_multihead",
@@ -202,6 +205,19 @@ def main() -> None:
     args = p.parse_args()
     if args.paper_mode and args.model_type == "linear_smoke":
         raise RuntimeError("paper_mode training requires --model_type hgt or rgcn; linear_smoke is CI/smoke only")
+    if args.paper_mode:
+        missing_flags = [
+            name for name, enabled in {
+                "--phase_supervision": args.phase_supervision,
+                "--predict_typed_demand": args.predict_typed_demand,
+                "--predict_uncertainty": args.predict_uncertainty,
+                "--predict_availability": args.predict_availability,
+            }.items() if not enabled
+        ]
+        if missing_flags:
+            raise RuntimeError("paper_mode CASA training requires explicit heads: " + ", ".join(missing_flags))
+        if args.value_target != "offline_tsbs":
+            raise RuntimeError("paper_mode CASA training requires --value_target offline_tsbs")
     random.seed(args.seed); np.random.seed(args.seed)
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     vocab = FeatureVocab()
