@@ -6,11 +6,17 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, AccessibilityNode, Pose2D, edge_from_dict, graph_from_records, node_from_dict, to_dict
+from capplan.data.gis_fusion import (
+    AccessibilityFusionBuilder,
+    CoordinateTransformer,
+    load_gis_features,
+    read_scene_contexts,
+)
+from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, AccessibilityNode, Pose2D, to_dict
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 
 
@@ -114,11 +120,21 @@ def _reject_synthetic(records: Iterable[Dict[str, Any]], label: str) -> None:
         raise RuntimeError(f"--fail_on_synthetic rejects {label}; first examples: {bad[:5]}")
 
 
-def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
+def _episode_ids(value: str | None) -> List[str]:
+    return [x.strip() for x in (value or "shared").replace(",", "+").split("+") if x.strip()]
+
+
+def _write_graph(out: Path, graph: AccessibilityGraph) -> None:
+    write_jsonl(out / f"{graph.episode_id}.nodes.jsonl", [to_dict(n) for n in graph.nodes])
+    write_jsonl(out / f"{graph.episode_id}.edges.jsonl", [to_dict(e) for e in graph.edges])
+    write_jsonl(out / f"{graph.episode_id}.jsonl", [to_dict(graph)])
+
+
+def _build_prepared(args: argparse.Namespace) -> Dict[str, Any]:
     node_rows = _read_json_records(args.nodes_jsonl or args.osm_nodes_jsonl)
     edge_rows = _read_json_records(args.edges_jsonl or args.osm_edges_jsonl)
     if not node_rows or not edge_rows:
-        raise RuntimeError("real accessibility graph build requires explicit node and edge records; no synthetic fallback is available")
+        raise RuntimeError("prepared accessibility graph build requires explicit node and edge records")
     if args.fail_on_synthetic:
         _reject_synthetic(node_rows, "nodes")
         _reject_synthetic(edge_rows, "edges")
@@ -127,40 +143,91 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
     edges = [_edge(r, args.source_name, by_id) for r in edge_rows]
     if len(nodes) < args.min_nodes_per_episode or len(edges) < args.min_edges_per_episode:
         raise RuntimeError(f"accessibility graph too small: {len(nodes)} nodes/{len(edges)} edges; required {args.min_nodes_per_episode}/{args.min_edges_per_episode}")
-    episode_ids = [x.strip() for x in (args.episode_ids or "shared").replace(",", "+").split("+") if x.strip()]
     out = Path(args.output_graph_dir)
     out.mkdir(parents=True, exist_ok=True)
-    for eid in episode_ids:
-        graph = AccessibilityGraph(eid, nodes, edges, {"source": args.source_name, "builder": "build_accessibility_graphs", "episode_radius_m": args.episode_radius_m, "snap_tolerance_m": args.snap_tolerance_m})
-        write_jsonl(out / f"{eid}.nodes.jsonl", [to_dict(n) for n in graph.nodes])
-        write_jsonl(out / f"{eid}.edges.jsonl", [to_dict(e) for e in graph.edges])
-        write_jsonl(out / f"{eid}.jsonl", [to_dict(graph)])
-    report = {"episodes": episode_ids, "nodes": len(nodes), "edges": len(edges), "source": args.source_name, "synthetic_rejected": bool(args.fail_on_synthetic)}
+    episodes = _episode_ids(args.episode_ids)
+    for eid in episodes:
+        graph = AccessibilityGraph(eid, nodes, edges, {"source": args.source_name, "builder": "prepared_jsonl_validator", "episode_radius_m": args.episode_radius_m, "snap_tolerance_m": args.snap_tolerance_m})
+        _write_graph(out, graph)
+    return {"episodes": episodes, "nodes": len(nodes), "edges": len(edges), "source": args.source_name, "mode": "prepared_jsonl", "synthetic_rejected": bool(args.fail_on_synthetic)}
+
+
+def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
+    has_prepared = bool(args.nodes_jsonl or args.edges_jsonl or args.osm_nodes_jsonl or args.osm_edges_jsonl)
+    has_gis = bool(args.osm_source or args.opensidewalks_source or args.city_gis_dir or args.curb_inventory_source or args.entrance_source)
+    if has_prepared and not has_gis:
+        report = _build_prepared(args)
+    else:
+        if not has_gis:
+            raise RuntimeError("GIS fusion requires --osm_source/--opensidewalks_source/--city_gis_dir/--curb_inventory_source/--entrance_source or prepared node/edge JSONL")
+        transformer = CoordinateTransformer.from_file(args.georeference_json)
+        features = load_gis_features(
+            [args.osm_source, args.opensidewalks_source, args.city_gis_dir, args.curb_inventory_source, args.entrance_source, args.elevation_source],
+            transformer,
+            args.source_name,
+        )
+        if args.fail_on_synthetic:
+            _reject_synthetic([{"source": f.source, "id": f.feature_id} for f in features], "GIS features")
+        if not features:
+            raise RuntimeError("GIS fusion found no usable OSM/OpenSidewalks/city GIS features")
+        contexts = read_scene_contexts(args.scene_dataset_dir, _episode_ids(args.episode_ids), args.episode_radius_m)
+        out = Path(args.output_graph_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        builder = AccessibilityFusionBuilder(transformer, args.snap_tolerance_m, args.source_name)
+        graphs: List[AccessibilityGraph] = []
+        for scene in contexts:
+            graph = builder.build_for_scene(
+                scene,
+                features,
+                min_nodes=args.min_nodes_per_episode,
+                min_edges=args.min_edges_per_episode,
+                add_bidirectional=not args.no_bidirectional_edges,
+                pudo_connector_radius_m=args.pudo_connector_radius_m,
+            )
+            _write_graph(out, graph)
+            graphs.append(graph)
+        report = {
+            "episodes": [g.episode_id for g in graphs],
+            "nodes": sum(len(g.nodes) for g in graphs),
+            "edges": sum(len(g.edges) for g in graphs),
+            "source": args.source_name,
+            "mode": "gis_fusion",
+            "features_loaded": len(features),
+            "synthetic_rejected": bool(args.fail_on_synthetic),
+            "georeference": args.georeference_json,
+        }
+    out = Path(args.output_graph_dir)
     dump_json(out / "source_report.json", report)
-    dump_json(out / "quality_report.json", {"nodes_per_episode": len(nodes), "edges_per_episode": len(edges), "min_nodes_per_episode": args.min_nodes_per_episode, "min_edges_per_episode": args.min_edges_per_episode})
+    dump_json(out / "quality_report.json", {"min_nodes_per_episode": args.min_nodes_per_episode, "min_edges_per_episode": args.min_edges_per_episode, **report})
     return report
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Build prepared_jsonl accessibility graphs from real/prepared pedestrian and curbside layers.")
-    p.add_argument("--scene_dataset_dir", default=None, help="Optional scene metadata directory; episode IDs may also be supplied with --episode_ids.")
-    p.add_argument("--nuplan_map_root", default=None)
+    p = argparse.ArgumentParser(description="Build AbilityBench-AV accessibility graphs by fusing nuPlan scene corridors with OSM/OpenSidewalks/city sidewalk GIS.")
+    p.add_argument("--scene_dataset_dir", default=None, help="Directory containing scenes.jsonl/episodes.jsonl used for episode IDs, route corridor, and scenario bbox cropping.")
+    p.add_argument("--nuplan_map_root", default=None, help="Accepted for pipeline compatibility; nuPlan HD map semantics are supplied through scene metadata/map API during dataset build.")
     p.add_argument("--nuplan_map_version", default=None)
-    p.add_argument("--osm_source", default=None)
-    p.add_argument("--city_gis_dir", default=None)
-    p.add_argument("--elevation_source", default=None)
-    p.add_argument("--nodes_jsonl", default=None, help="Prepared real accessibility nodes JSONL/JSON.")
-    p.add_argument("--edges_jsonl", default=None, help="Prepared real accessibility edges JSONL/JSON.")
+    p.add_argument("--georeference_json", default=None, help="JSON/YAML with origin_lat/origin_lon/origin_heading_deg or local_crs for nuPlan local frame <-> WGS84 conversion.")
+    p.add_argument("--osm_source", default=None, help="OSM/Overpass JSON, OSM-derived GeoJSON/JSONL, or directory of such files.")
+    p.add_argument("--opensidewalks_source", default=None, help="OpenSidewalks GeoJSON/JSONL/JSON export.")
+    p.add_argument("--city_gis_dir", default=None, help="Directory or file containing city sidewalk/crosswalk/curb ramp GIS layers.")
+    p.add_argument("--curb_inventory_source", default=None, help="City curb/PUDO inventory records with curb height, landing width, clearance, or regulation tags.")
+    p.add_argument("--entrance_source", default=None, help="Building/POI entrance point layer; entrances are snapped to pedestrian topology.")
+    p.add_argument("--elevation_source", default=None, help="DEM/elevation point/line export; endpoint elevations are used to derive missing slopes when possible.")
+    p.add_argument("--nodes_jsonl", default=None, help="Prepared real accessibility nodes JSONL/JSON; used only when GIS sources are absent.")
+    p.add_argument("--edges_jsonl", default=None, help="Prepared real accessibility edges JSONL/JSON; used only when GIS sources are absent.")
     p.add_argument("--osm_nodes_jsonl", default=None, help="Alias for prepared OSM/OpenSidewalks node records.")
     p.add_argument("--osm_edges_jsonl", default=None, help="Alias for prepared OSM/OpenSidewalks edge records.")
     p.add_argument("--output_graph_dir", required=True)
     p.add_argument("--episode_ids", default="shared")
-    p.add_argument("--episode_radius_m", type=float, default=800.0)
+    p.add_argument("--episode_radius_m", type=float, default=800.0, help="Buffer around route corridor for per-scenario crop.")
     p.add_argument("--snap_tolerance_m", type=float, default=3.0)
+    p.add_argument("--pudo_connector_radius_m", type=float, default=75.0, help="Distance from route corridor for curb/curb-ramp nodes marked as PUDO connector candidates.")
     p.add_argument("--min_nodes_per_episode", type=int, default=100)
     p.add_argument("--min_edges_per_episode", type=int, default=150)
-    p.add_argument("--source_name", default="opensidewalks_city_gis_prepared")
+    p.add_argument("--source_name", default="nuplan_osm_opensidewalks_citygis")
     p.add_argument("--fail_on_synthetic", action="store_true")
+    p.add_argument("--no_bidirectional_edges", action="store_true")
     p.add_argument("--num_workers", type=int, default=0)
     args = p.parse_args()
     print(json.dumps(build_graphs(args), indent=2, sort_keys=True))

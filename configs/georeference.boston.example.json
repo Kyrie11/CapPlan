@@ -1,0 +1,9 @@
+{
+  "description": "Example only. Replace origin_* with a validated nuPlan-map-to-WGS84 control point before paper-scale builds.",
+  "origin_lat": 42.3601,
+  "origin_lon": -71.0589,
+  "origin_x": 0.0,
+  "origin_y": 0.0,
+  "origin_heading_deg": 0.0,
+  "wgs84_crs": "EPSG:4326"
+}

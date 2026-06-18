@@ -1,9 +1,0 @@
-{
-  "errors": [],
-  "num_contracts": 12,
-  "num_episodes": 4,
-  "num_passenger_edge_labels": 660,
-  "num_transitions": 220,
-  "ok": true,
-  "warnings": []
-}

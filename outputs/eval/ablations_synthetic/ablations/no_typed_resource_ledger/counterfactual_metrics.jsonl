@@ -1,4 +1,0 @@
-{"episode_id": "synthetic_0000", "expected_monotonic": true, "pair_id": "synthetic_0000:cf0", "relation": "stricter_or_equal", "responsive": true, "strict_passenger_id": "synthetic_0000:p1", "weak_passenger_id": "synthetic_0000:p0"}
-{"episode_id": "synthetic_0001", "expected_monotonic": true, "pair_id": "synthetic_0001:cf0", "relation": "stricter_or_equal", "responsive": true, "strict_passenger_id": "synthetic_0001:p1", "weak_passenger_id": "synthetic_0001:p0"}
-{"episode_id": "synthetic_0002", "expected_monotonic": true, "pair_id": "synthetic_0002:cf0", "relation": "stricter_or_equal", "responsive": true, "strict_passenger_id": "synthetic_0002:p1", "weak_passenger_id": "synthetic_0002:p0"}
-{"episode_id": "synthetic_0003", "expected_monotonic": true, "pair_id": "synthetic_0003:cf0", "relation": "stricter_or_equal", "responsive": true, "strict_passenger_id": "synthetic_0003:p1", "weak_passenger_id": "synthetic_0003:p0"}

@@ -128,6 +128,9 @@ class NuPlanAdapter:
         split: str = "mini",
         seed: int = 0,
         num_workers: int = 0,
+        scenario_types: Sequence[str] | str | None = None,
+        map_names: Sequence[str] | str | None = None,
+        log_names: Sequence[str] | str | None = None,
         allow_synthetic_fallback: bool = False,
         # Legacy alias accepted for older scripts; does not imply fallback.
         nuplan_root: str | None = None,
@@ -146,6 +149,9 @@ class NuPlanAdapter:
         self.split = split
         self.seed = seed
         self.num_workers = max(0, int(num_workers))
+        self.scenario_types = _split_path_list(scenario_types)
+        self.map_names = _split_path_list(map_names)
+        self.log_names = _split_path_list(log_names)
         self.allow_synthetic_fallback = allow_synthetic_fallback
         self.nuplan_available = self._check_nuplan()
         self._builder = None
@@ -259,10 +265,10 @@ class NuPlanAdapter:
         try:
             # API shapes differ across devkit versions.  Try common call forms.
             scenario_filter = ScenarioFilter(
-                scenario_types=None,
+                scenario_types=self.scenario_types or None,
                 scenario_tokens=None,
-                log_names=None,
-                map_names=None,
+                log_names=self.log_names or None,
+                map_names=self.map_names or None,
                 num_scenarios_per_type=None,
                 limit_total_scenarios=max_scenarios,
                 timestamp_threshold_s=None,
@@ -272,7 +278,7 @@ class NuPlanAdapter:
                 shuffle=False,
             )
         except TypeError:
-            scenario_filter = ScenarioFilter(None, None, None, None, None, max_scenarios, None, None, False, True, False)
+            scenario_filter = ScenarioFilter(self.scenario_types or None, None, self.log_names or None, self.map_names or None, None, max_scenarios, None, None, False, True, False)
         scenarios = None
         for method in ["get_scenarios", "get_scenario_tokens"]:
             if hasattr(self._builder, method):

@@ -1,0 +1,10 @@
+# Small-sanity AbilityBench service demand. These are sampling controls, not population estimates.
+profile_mix:
+  - basic_service_complete
+  - mobility_interface_constrained
+  - compound_uncertainty_sensitive
+trip_purposes: [medical, work, shopping, social]
+request_time_start_s: 28800
+request_time_span_s: 43200
+default_demand_weight: 1.0
+modifiers: {}

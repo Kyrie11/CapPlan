@@ -321,6 +321,9 @@ def main() -> None:
     p.add_argument("--nuplan_db_root", default=None, help="Root directory containing nuPlan DB-set folders such as train_boston, train_pittsburgh, val.")
     p.add_argument("--nuplan_db_dirs", nargs="*", default=None, help="One or more DB-set folder names/paths, e.g. train_boston train_pittsburgh or train_boston+train_pittsburgh.")
     p.add_argument("--nuplan_map_version", default=None)
+    p.add_argument("--nuplan_map_names", default=None, help="Optional comma/plus-separated nuPlan map_name filter, e.g. us-ma-boston.")
+    p.add_argument("--nuplan_scenario_types", default=None, help="Optional comma/plus-separated nuPlan scenario_type filter.")
+    p.add_argument("--nuplan_log_names", default=None, help="Optional comma/plus-separated nuPlan log_name filter.")
     # Backward-compatible alias; mapped to nuplan_data_root only when provided.
     p.add_argument("--nuplan_root", default=None)
     p.add_argument("--split", default="mini")
@@ -373,6 +376,9 @@ def main() -> None:
         split=args.split,
         seed=args.seed,
         num_workers=args.num_workers,
+        scenario_types=args.nuplan_scenario_types,
+        map_names=args.nuplan_map_names,
+        log_names=args.nuplan_log_names,
     )
     acc_builder, synthetic_accessibility_mode = _make_accessibility_builder(args)
     pudo_evidence_overrides = _load_pudo_evidence(args.pudo_evidence_jsonl)
@@ -431,7 +437,13 @@ def main() -> None:
         scenes.append(to_dict(scene))
         episodes.append(to_dict(ep))
 
-        vehicles = fleet_by_episode.get(eid) or vehicle_interface_profiles(eid)
+        vehicles = fleet_by_episode.get(eid)
+        if vehicles is None and "*" in fleet_by_episode:
+            vehicles = [replace(v, episode_id=eid) for v in fleet_by_episode["*"]]
+        if vehicles is None:
+            if args.paper_mode:
+                raise RuntimeError(f"paper_mode requires fleet_jsonl vehicles for episode {eid} or global episode_id='*'")
+            vehicles = vehicle_interface_profiles(eid)
         vehicle_records.extend(to_dict(v) for v in vehicles)
         requested_vehicle_id = (request or {}).get("vehicle_id") or (request or {}).get("fleet_vehicle_id")
         if requested_vehicle_id:

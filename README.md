@@ -358,3 +358,54 @@ Not yet paper-main-ready without additional integration/data:
 - the nuPlan simulation runner must be configured in a real nuPlan environment;
 - external baseline planner wrappers/results must be connected;
 - the CASA model is currently a multi-head transition-feature network, not yet a full production heterogeneous graph message-passing implementation.
+
+### AbilityBench-AV main GIS/service construction
+
+For paper-mode data construction, the recommended benchmark decomposition is:
+
+```text
+AbilityBench-AV-main = map information + passenger information
+map information = nuPlan scenes + nuPlan HD map + OSM/OpenSidewalks/city sidewalk GIS + curb/PUDO regulation/evidence
+passenger information = calibrated passenger service requests + three-layer capability profiles
+```
+
+The two groups are stored separately and composed at dataset-build time.  The map layer is strongly coupled internally through common episode IDs, route corridors, local-map coordinates, snapped entrances, pedestrian topology, curb/PUDO candidates, and evidence provenance.  The passenger layer is strongly coupled internally through service requests that reference explicit profile IDs.  A passenger profile is not baked into a map; instead, the executable transition predicates combine one service request/profile with one map scene to test passenger-complete feasibility.
+
+The GIS fusion builder accepts local prepared records, Overpass/OSM JSON, OpenSidewalks-compatible GeoJSON/JSONL, and city GIS exports.  It requires an explicit georeference when WGS84 GIS layers must be transformed into the nuPlan local map frame:
+
+```bash
+python scripts/build_accessibility_graphs.py \
+  --scene_dataset_dir outputs/scenes \
+  --georeference_json configs/georeference_boston.json \
+  --osm_source data/osm/overpass_boston.json \
+  --opensidewalks_source data/opensidewalks/boston.geojson \
+  --city_gis_dir data/city_gis/boston \
+  --curb_inventory_source data/curbs/boston_curbs.geojson \
+  --entrance_source data/entrances/boston_entrances.geojson \
+  --elevation_source data/dem/boston_elevation_points.jsonl \
+  --output_graph_dir outputs/accessibility_graphs \
+  --fail_on_synthetic
+```
+
+The PUDO evidence generator consumes those graphs plus curb regulation/evidence.  It marks route-corridor curb/curb-ramp nodes as PUDO candidates, snaps them to pedestrian nodes, fuses regulation evidence, and fails closed when no legal-stop regulation matches:
+
+```bash
+python scripts/build_pudo_evidence.py \
+  --scene_dataset_dir outputs/scenes \
+  --accessibility_graph_dir outputs/accessibility_graphs \
+  --curb_regulation_jsonl data/curbs/curb_regulations.jsonl \
+  --curb_inventory_jsonl data/curbs/curb_inventory.jsonl \
+  --output_pudo_evidence_jsonl outputs/pudo_evidence.jsonl \
+  --fail_on_missing_core_evidence
+```
+
+The service-layer builder can validate existing real/calibrated requests, or sample calibrated OD requests from real entrance nodes.  If no profile file is supplied, it writes the three benchmark profiles: `basic_service_complete`, `mobility_interface_constrained`, and `compound_uncertainty_sensitive`.
+
+```bash
+python scripts/build_service_layer.py \
+  --accessibility_graph_dir outputs/accessibility_graphs \
+  --demand_sources_config configs/demand_calibration.yaml \
+  --output_service_requests_jsonl outputs/service_requests.jsonl \
+  --output_capability_profiles_jsonl outputs/capability_profiles.jsonl \
+  --num_requests_per_episode 3
+```
