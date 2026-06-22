@@ -1,0 +1,95 @@
+# Real-data AbilityBench-AV preparation config.
+# Paths are set for the server layout described in the user request.
+# The georeference files are intentionally explicit and should be validated with
+# nuPlan map control points before reporting final paper numbers.
+
+seed: 13
+num_workers: 0
+
+nuplan:
+  data_root: /data0/senzeyu2/dataset/nuplan/data/cache
+  db_root: /data0/senzeyu2/dataset/nuplan/data/cache
+  map_root: /data0/senzeyu2/dataset/nuplan/maps
+  map_version: nuplan-maps-v1.0
+
+external_root: /data0/senzeyu2/dataset/abilitybench_external
+outputs_root: outputs
+fleet_jsonl: configs/fleet.abilitybench.example.jsonl
+
+quality:
+  min_graph_nodes: 100
+  min_graph_edges: 150
+  max_core_pudo_missing_rate: 0.05
+
+service:
+  num_requests_per_episode: 3
+
+pudo:
+  candidate_radius_m: 120
+
+overpass:
+  endpoint: https://overpass-api.de/api/interpreter
+  timeout_s: 180
+  sleep_s: 8
+
+splits:
+  train:
+    cities: [boston, pittsburgh, vegas, singapore]
+    max_scenarios_per_city: 1000
+  val:
+    cities: [boston, pittsburgh, vegas, singapore]
+    db_dirs: [val]
+    max_scenarios_per_city: 250
+
+cities:
+  boston:
+    db_dirs: [train_boston]
+    map_names: [us-ma-boston]
+    bbox: [42.30, -71.15, 42.42, -70.98]
+    georeference_json: configs/georeference.boston.json
+    osm_source: /data0/senzeyu2/dataset/abilitybench_external/osm/boston_sidewalks.json
+    opensidewalks_source: /data0/senzeyu2/dataset/abilitybench_external/opensidewalks/boston.geojson
+    city_gis_dir: /data0/senzeyu2/dataset/abilitybench_external/city_gis/boston
+    curb_inventory_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_inventory/boston.jsonl
+    curb_regulation_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_regulations/boston.jsonl
+    entrance_source: /data0/senzeyu2/dataset/abilitybench_external/entrances/boston.geojson
+    elevation_source: /data0/senzeyu2/dataset/abilitybench_external/dem/boston.jsonl
+
+  pittsburgh:
+    db_dirs: [train_pittsburgh]
+    map_names: [us-pa-pittsburgh-hazelwood]
+    bbox: [40.38, -80.04, 40.48, -79.88]
+    georeference_json: configs/georeference.pittsburgh.json
+    osm_source: /data0/senzeyu2/dataset/abilitybench_external/osm/pittsburgh_sidewalks.json
+    opensidewalks_source: /data0/senzeyu2/dataset/abilitybench_external/opensidewalks/pittsburgh.geojson
+    city_gis_dir: /data0/senzeyu2/dataset/abilitybench_external/city_gis/pittsburgh
+    curb_inventory_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_inventory/pittsburgh.jsonl
+    curb_regulation_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_regulations/pittsburgh.jsonl
+    entrance_source: /data0/senzeyu2/dataset/abilitybench_external/entrances/pittsburgh.geojson
+    elevation_source: /data0/senzeyu2/dataset/abilitybench_external/dem/pittsburgh.jsonl
+
+  vegas:
+    db_dirs: [train_vegas_2]
+    map_names: [us-nv-las-vegas-strip]
+    bbox: [36.07, -115.23, 36.20, -115.10]
+    georeference_json: configs/georeference.vegas.json
+    osm_source: /data0/senzeyu2/dataset/abilitybench_external/osm/vegas_sidewalks.json
+    opensidewalks_source: /data0/senzeyu2/dataset/abilitybench_external/opensidewalks/vegas.geojson
+    city_gis_dir: /data0/senzeyu2/dataset/abilitybench_external/city_gis/vegas
+    curb_inventory_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_inventory/vegas.jsonl
+    curb_regulation_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_regulations/vegas.jsonl
+    entrance_source: /data0/senzeyu2/dataset/abilitybench_external/entrances/vegas.geojson
+    elevation_source: /data0/senzeyu2/dataset/abilitybench_external/dem/vegas.jsonl
+
+  singapore:
+    db_dirs: [train_singapore]
+    map_names: [sg-one-north]
+    bbox: [1.27, 103.75, 1.33, 103.82]
+    georeference_json: configs/georeference.singapore.json
+    osm_source: /data0/senzeyu2/dataset/abilitybench_external/osm/singapore_sidewalks.json
+    opensidewalks_source: /data0/senzeyu2/dataset/abilitybench_external/opensidewalks/singapore.geojson
+    city_gis_dir: /data0/senzeyu2/dataset/abilitybench_external/city_gis/singapore
+    curb_inventory_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_inventory/singapore.jsonl
+    curb_regulation_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_regulations/singapore.jsonl
+    entrance_source: /data0/senzeyu2/dataset/abilitybench_external/entrances/singapore.geojson
+    elevation_source: /data0/senzeyu2/dataset/abilitybench_external/dem/singapore.jsonl

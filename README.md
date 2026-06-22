@@ -359,53 +359,101 @@ Not yet paper-main-ready without additional integration/data:
 - external baseline planner wrappers/results must be connected;
 - the CASA model is currently a multi-head transition-feature network, not yet a full production heterogeneous graph message-passing implementation.
 
-### AbilityBench-AV main GIS/service construction
+### nuPlan AbilityBench Real-Data Pipeline
 
-For paper-mode data construction, the recommended benchmark decomposition is:
+Use `configs/abilitybench_nuplan_real.yaml` for the server layout:
 
 ```text
-AbilityBench-AV-main = map information + passenger information
-map information = nuPlan scenes + nuPlan HD map + OSM/OpenSidewalks/city sidewalk GIS + curb/PUDO regulation/evidence
-passenger information = calibrated passenger service requests + three-layer capability profiles
+/data0/senzeyu2/dataset/nuplan/data/cache/{train_singapore,train_boston,train_pittsburgh,train_vegas_2,val}
+/data0/senzeyu2/dataset/abilitybench_external/{osm,opensidewalks,city_gis,curb_inventory,curb_regulations,entrances,dem}
 ```
 
-The two groups are stored separately and composed at dataset-build time.  The map layer is strongly coupled internally through common episode IDs, route corridors, local-map coordinates, snapped entrances, pedestrian topology, curb/PUDO candidates, and evidence provenance.  The passenger layer is strongly coupled internally through service requests that reference explicit profile IDs.  A passenger profile is not baked into a map; instead, the executable transition predicates combine one service request/profile with one map scene to test passenger-complete feasibility.
+The multi-city wrapper keeps each city under its own georeference, builds per-city datasets, and then merges them into a canonical train/val dataset.
 
-The GIS fusion builder accepts local prepared records, Overpass/OSM JSON, OpenSidewalks-compatible GeoJSON/JSONL, and city GIS exports.  It requires an explicit georeference when WGS84 GIS layers must be transformed into the nuPlan local map frame:
+Generate Overpass query files:
 
 ```bash
-python scripts/build_accessibility_graphs.py \
-  --scene_dataset_dir outputs/scenes \
-  --georeference_json configs/georeference_boston.json \
-  --osm_source data/osm/overpass_boston.json \
-  --opensidewalks_source data/opensidewalks/boston.geojson \
-  --city_gis_dir data/city_gis/boston \
-  --curb_inventory_source data/curbs/boston_curbs.geojson \
-  --entrance_source data/entrances/boston_entrances.geojson \
-  --elevation_source data/dem/boston_elevation_points.jsonl \
-  --output_graph_dir outputs/accessibility_graphs \
-  --fail_on_synthetic
+python scripts/prepare_abilitybench_external.py \
+  --config configs/abilitybench_nuplan_real.yaml \
+  --split train \
+  --stages queries
 ```
 
-The PUDO evidence generator consumes those graphs plus curb regulation/evidence.  It marks route-corridor curb/curb-ramp nodes as PUDO candidates, snaps them to pedestrian nodes, fuses regulation evidence, and fails closed when no legal-stop regulation matches:
+Optional small-area Overpass download:
 
 ```bash
-python scripts/build_pudo_evidence.py \
-  --scene_dataset_dir outputs/scenes \
-  --accessibility_graph_dir outputs/accessibility_graphs \
-  --curb_regulation_jsonl data/curbs/curb_regulations.jsonl \
-  --curb_inventory_jsonl data/curbs/curb_inventory.jsonl \
-  --output_pudo_evidence_jsonl outputs/pudo_evidence.jsonl \
-  --fail_on_missing_core_evidence
+python scripts/prepare_abilitybench_external.py \
+  --config configs/abilitybench_nuplan_real.yaml \
+  --split train \
+  --stages download
 ```
 
-The service-layer builder can validate existing real/calibrated requests, or sample calibrated OD requests from real entrance nodes.  If no profile file is supplied, it writes the three benchmark profiles: `basic_service_complete`, `mobility_interface_constrained`, and `compound_uncertainty_sensitive`.
+Paper-scale builds should place audited OpenSidewalks/city GIS/curb/DEM files at the paths declared in `configs/abilitybench_nuplan_real.yaml`.  The code reads Overpass JSON/GeoJSON/JSONL locally; dataset building does not call online services.
+
+Recommended training-set construction:
 
 ```bash
-python scripts/build_service_layer.py \
-  --accessibility_graph_dir outputs/accessibility_graphs \
-  --demand_sources_config configs/demand_calibration.yaml \
-  --output_service_requests_jsonl outputs/service_requests.jsonl \
-  --output_capability_profiles_jsonl outputs/capability_profiles.jsonl \
-  --num_requests_per_episode 3
+python scripts/prepare_abilitybench_external.py \
+  --config configs/abilitybench_nuplan_real.yaml \
+  --split train \
+  --stages all
+
+python scripts/validate_dataset.py \
+  --dataset_dir outputs/datasets/abilitybench_av_train \
+  --strict
+
+python scripts/audit_dataset_quality.py \
+  --dataset_dir outputs/datasets/abilitybench_av_train \
+  --paper_mode \
+  --fail_if_not_publication_ready
+```
+
+Recommended validation-set construction:
+
+```bash
+python scripts/prepare_abilitybench_external.py \
+  --config configs/abilitybench_nuplan_real.yaml \
+  --split val \
+  --stages all
+
+python scripts/validate_dataset.py \
+  --dataset_dir outputs/datasets/abilitybench_av_val \
+  --strict
+
+python scripts/audit_dataset_quality.py \
+  --dataset_dir outputs/datasets/abilitybench_av_val \
+  --paper_mode \
+  --fail_if_not_publication_ready
+```
+
+Dry-run the exact commands before spending time on a full build:
+
+```bash
+python scripts/prepare_abilitybench_external.py \
+  --config configs/abilitybench_nuplan_real.yaml \
+  --split train \
+  --stages all \
+  --dry_run
+```
+
+Recommended CASA training input:
+
+```bash
+python scripts/train_casa.py \
+  --paper_mode \
+  --dataset_dir outputs/datasets/abilitybench_av_train \
+  --output_dir outputs/models/casa_paper_hgt \
+  --epochs 20 \
+  --batch_size 64 \
+  --lr 1e-3 \
+  --device auto \
+  --model_type hgt \
+  --phase_supervision \
+  --predict_typed_demand \
+  --predict_uncertainty \
+  --predict_availability \
+  --value_target offline_tsbs \
+  --profile_balanced_sampler \
+  --action_balanced_sampler \
+  --save_calibration_report
 ```

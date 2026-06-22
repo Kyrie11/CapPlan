@@ -1,0 +1,10 @@
+{
+  "description": "Initial Pittsburgh georeference for AbilityBench GIS fusion. Validate against nuPlan map control points before publication-scale experiments.",
+  "validated": false,
+  "origin_lat": 40.4406,
+  "origin_lon": -79.9959,
+  "origin_x": 0.0,
+  "origin_y": 0.0,
+  "origin_heading_deg": 0.0,
+  "wgs84_crs": "EPSG:4326"
+}
