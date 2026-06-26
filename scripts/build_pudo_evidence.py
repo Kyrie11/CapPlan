@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from capplan.data.gis_fusion import distance_to_polyline, nearest_route_side, read_scene_contexts
+from capplan.data.gis_fusion import CoordinateTransformer, distance_to_polyline, nearest_route_side, read_scene_contexts
 from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, AccessibilityNode, edge_from_dict, node_from_dict
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 
@@ -84,28 +84,60 @@ def _bool(v: Any, default: bool = False) -> bool:
     return default
 
 
-def _xy_from_row(row: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+def _row_view(row: Dict[str, Any]) -> Dict[str, Any]:
     props = row.get("properties") if isinstance(row.get("properties"), dict) else {}
-    d = {**props, **{k: v for k, v in row.items() if k not in {"properties", "geometry", "type"}}}
+    return {**props, **{k: v for k, v in row.items() if k not in {"properties", "geometry", "type"}}}
+
+
+def _first_present(row: Dict[str, Any], keys: Iterable[str]) -> Any:
+    d = _row_view(row)
+    for k in keys:
+        if d.get(k) not in (None, "", "unknown", "n/a"):
+            return d.get(k)
+    return None
+
+
+def _looks_like_lonlat(x: float, y: float) -> bool:
+    return -180.0 <= x <= 180.0 and -90.0 <= y <= 90.0
+
+
+def _maybe_to_map(x: float, y: float, row: Dict[str, Any], transformer: Optional[CoordinateTransformer]) -> Tuple[float, float]:
+    if transformer is None:
+        return x, y
+    d = _row_view(row)
+    frame = str(d.get("frame") or d.get("coordinate_frame") or "").lower()
+    if frame in {"map", "local", "nuplan_map"}:
+        return x, y
+    if frame in {"wgs84", "lonlat", "lon_lat", "epsg:4326", "crs84"} or _looks_like_lonlat(x, y):
+        return transformer.wgs84_to_local(x, y)
+    return x, y
+
+
+def _xy_from_row(row: Dict[str, Any], transformer: Optional[CoordinateTransformer] = None) -> Optional[Tuple[float, float]]:
+    d = _row_view(row)
     geom = row.get("geometry")
     if isinstance(geom, dict):
         coords = geom.get("coordinates")
         if isinstance(coords, list) and len(coords) >= 2 and isinstance(coords[0], (int, float)):
-            return float(coords[0]), float(coords[1])
+            return _maybe_to_map(float(coords[0]), float(coords[1]), row, transformer)
         if isinstance(coords, list) and coords and isinstance(coords[0], list):
             p = coords[0]
             if len(p) >= 2:
-                return float(p[0]), float(p[1])
+                return _maybe_to_map(float(p[0]), float(p[1]), row, transformer)
     if isinstance(d.get("curb_pose"), dict):
         return float(d["curb_pose"].get("x", 0.0)), float(d["curb_pose"].get("y", 0.0))
+    if d.get("lon") is not None and d.get("lat") is not None:
+        return _maybe_to_map(float(d["lon"]), float(d["lat"]), row, transformer)
+    if d.get("longitude") is not None and d.get("latitude") is not None:
+        return _maybe_to_map(float(d["longitude"]), float(d["latitude"]), row, transformer)
     if d.get("x") is not None and d.get("y") is not None:
-        return float(d["x"]), float(d["y"])
+        return _maybe_to_map(float(d["x"]), float(d["y"]), row, transformer)
     if d.get("curb_x") is not None and d.get("curb_y") is not None:
-        return float(d["curb_x"]), float(d["curb_y"])
+        return _maybe_to_map(float(d["curb_x"]), float(d["curb_y"]), row, transformer)
     return None
 
 
-def normalize(row: Dict[str, Any], default_source: str) -> Dict[str, Any]:
+def normalize(row: Dict[str, Any], default_source: str, transformer: Optional[CoordinateTransformer] = None) -> Dict[str, Any]:
     props = row.get("properties") if isinstance(row.get("properties"), dict) else {}
     row = {**props, **{k: v for k, v in row.items() if k not in {"properties", "type"}}}
     anchor_id = row.get("anchor_id") or row.get("pudo_id") or row.get("id") or row.get("feature_id")
@@ -116,7 +148,7 @@ def normalize(row: Dict[str, Any], default_source: str) -> Dict[str, Any]:
     source = row.get("source") or row.get("evidence_source") or default_source
     if _source_bad(source):
         raise ValueError(f"PUDO evidence rejects synthetic/proxy source for {anchor_id}: {source}")
-    xy = _xy_from_row(row)
+    xy = _xy_from_row(row, transformer)
     out = dict(row)
     out["anchor_id"] = str(anchor_id)
     out["pudo_id"] = str(anchor_id)
@@ -193,16 +225,58 @@ def _nearest_edge_attrs(x: float, y: float, graph: AccessibilityGraph) -> Dict[s
     return {"sidewalk_width_m": best_e.width_m, "lighting": best_e.lighting, "shelter": best_e.shelter, "surface": best_e.surface, "distance_to_ped_edge_m": best_d}
 
 
-def _regulation_match(x: float, y: float, regs: List[Dict[str, Any]], tolerance: float) -> Optional[Dict[str, Any]]:
+def _regulation_match(x: float, y: float, regs: List[Dict[str, Any]], tolerance: float, transformer: Optional[CoordinateTransformer] = None) -> Optional[Dict[str, Any]]:
     best, best_d = None, float("inf")
     for r in regs:
-        xy = _xy_from_row(r)
+        xy = _xy_from_row(r, transformer)
         if not xy:
             continue
         d = math.hypot(x - xy[0], y - xy[1])
         if d < best_d:
             best, best_d = r, d
     return best if best is not None and best_d <= tolerance else None
+
+
+def _as_inventory_record(row: Dict[str, Any], transformer: Optional[CoordinateTransformer]) -> Optional[Dict[str, Any]]:
+    xy = _xy_from_row(row, transformer)
+    if not xy:
+        return None
+    source = _first_present(row, ["source", "evidence_source", "dataset", "name"]) or "curb_inventory"
+    if _source_bad(source):
+        return None
+    rec: Dict[str, Any] = {
+        "x": xy[0],
+        "y": xy[1],
+        "source": str(source),
+        "confidence": _as_float(_first_present(row, ["confidence", "map_confidence", "score"])) or 0.75,
+        "curb_height_m": _as_float(_first_present(row, ["curb_height_m", "curb_height", "curb:height", "kerb:height", "kerb_height_m"])),
+        "deployment_clearance_m": _as_float(_first_present(row, ["deployment_clearance_m", "clearance_m", "clear_width_m", "landing_width_m", "landing_width", "ramp_clearance_m"])),
+        "sidewalk_width_m": _as_float(_first_present(row, ["sidewalk_width_m", "sidewalk_width", "width_m", "width", "sidewalk:width"])),
+        "side": _first_present(row, ["side", "curb_side", "route_side"]),
+        "surface": _first_present(row, ["surface", "material"]),
+        "curb_ramp": _bool(_first_present(row, ["curb_ramp", "ramp", "has_ramp", "kerb_ramp"]), False),
+    }
+    return rec
+
+
+def _nearest_inventory_match(x: float, y: float, inventory: List[Dict[str, Any]], tolerance: float) -> Optional[Dict[str, Any]]:
+    best, best_d = None, float("inf")
+    for rec in inventory:
+        d = math.hypot(x - float(rec["x"]), y - float(rec["y"]))
+        if d < best_d:
+            best, best_d = rec, d
+    if best is not None and best_d <= tolerance:
+        out = dict(best)
+        out["distance_m"] = best_d
+        return out
+    return None
+
+
+def _coalesce(*values: Any) -> Any:
+    for v in values:
+        if v is not None:
+            return v
+    return None
 
 
 def _blockage_from_agents(x: float, y: float, scene: Dict[str, Any], radius: float = 6.0) -> float:
@@ -238,12 +312,15 @@ def _candidate_nodes(graph: AccessibilityGraph, route: List[List[float]], radius
 
 def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     graph_dir = Path(args.accessibility_graph_dir)
+    transformer = CoordinateTransformer.from_file(args.georeference_json) if args.georeference_json else None
     contexts = read_scene_contexts(args.scene_dataset_dir, [], args.candidate_radius_m)
     scenes = {c.episode_id: c for c in contexts}
     out: List[Dict[str, Any]] = list(normalized_input_rows)
     existing = {(r.get("episode_id"), r.get("anchor_id")) for r in out}
     regs = _read(args.curb_regulation_jsonl) + _read(args.curb_regulation_dir)
-    inventory = [normalize(r, args.source_name) for r in _read(args.curb_inventory_jsonl) if r.get("episode_id")]
+    raw_inventory = _read(args.curb_inventory_jsonl)
+    inventory = [normalize(r, args.source_name, transformer) for r in raw_inventory if r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id"))]
+    global_inventory = [rec for rec in (_as_inventory_record(r, transformer) for r in raw_inventory if not (r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id")))) if rec is not None]
     for r in inventory:
         key = (r.get("episode_id"), r.get("anchor_id"))
         if key not in existing:
@@ -264,12 +341,17 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
             attrs = _nearest_edge_attrs(n.x, n.y, graph)
             meta_attrs = graph.metadata.get("node_attributes", {}) if isinstance(graph.metadata, dict) else {}
             nattrs = meta_attrs.get(n.node_id, {}) if isinstance(meta_attrs, dict) else {}
-            reg = _regulation_match(n.x, n.y, regs, args.regulation_snap_tolerance_m)
+            reg = _regulation_match(n.x, n.y, regs, args.regulation_snap_tolerance_m, transformer)
+            inv = _nearest_inventory_match(n.x, n.y, global_inventory, args.inventory_snap_tolerance_m)
             legal = _bool((reg or {}).get("legal_stop", (reg or {}).get("stopping_allowed", (reg or {}).get("regulation"))), False)
             nearest_ped, _ = _nearest_node(n.x, n.y, graph.nodes, {"sidewalk", "crossing", "entrance"})
             blockage = _blockage_from_agents(n.x, n.y, scene.metadata if scene else {})
-            width = nattrs.get("width_m") or attrs.get("sidewalk_width_m")
-            clearance = nattrs.get("deployment_clearance_m")
+            width = _coalesce(nattrs.get("width_m"), attrs.get("sidewalk_width_m"), (inv or {}).get("sidewalk_width_m"))
+            clearance = _coalesce(nattrs.get("deployment_clearance_m"), (inv or {}).get("deployment_clearance_m"))
+            curb_height = _coalesce(nattrs.get("curb_height_m"), (inv or {}).get("curb_height_m"))
+            confidence_terms = [float(n.confidence), float((reg or {}).get("confidence", 1.0) or 1.0)]
+            if inv:
+                confidence_terms.append(float(inv.get("confidence", 1.0) or 1.0))
             row = {
                 "anchor_id": anchor_id,
                 "pudo_id": anchor_id,
@@ -279,18 +361,20 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "stop_pose": {"x": n.x, "y": n.y, "heading": 0.0, "frame": "map"},
                 "x": n.x,
                 "y": n.y,
-                "side": str(nattrs.get("route_side") or (nearest_route_side([n.x, n.y], route) if route else "unknown")),
+                "side": str(_coalesce(nattrs.get("route_side"), (inv or {}).get("side"), nearest_route_side([n.x, n.y], route) if route else "unknown")),
                 "legal_stop": legal,
                 "legal_stop_source": str((reg or {}).get("source") or (reg or {}).get("regulation_id") or "no_matching_regulation_fail_closed"),
                 "adjacent_ped_node_id": nearest_ped.node_id if nearest_ped else None,
-                "curb_height_m": nattrs.get("curb_height_m"),
+                "curb_height_m": curb_height,
                 "sidewalk_width_m": width,
                 "deployment_clearance_m": clearance,
                 "blockage_risk": blockage,
-                "map_confidence": min(float(n.confidence), float((reg or {}).get("confidence", 1.0) or 1.0)),
+                "map_confidence": min(confidence_terms),
                 "dynamic_confidence": 1.0 - blockage,
                 "lighting": attrs.get("lighting"),
                 "shelter": attrs.get("shelter"),
+                "curb_inventory_source": (inv or {}).get("source"),
+                "curb_inventory_match_distance_m": (inv or {}).get("distance_m"),
                 "source": args.source_name,
                 "evidence_notes": "derived_from_accessibility_graph_and_city_curb_regulation; legal_stop fails closed without matched regulation",
             }
@@ -300,6 +384,7 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
 
 
 def build(args: argparse.Namespace) -> Dict[str, Any]:
+    transformer = CoordinateTransformer.from_file(args.georeference_json) if args.georeference_json else None
     rows = []
     for p in [args.input_pudo_evidence_jsonl, args.curb_inventory_jsonl]:
         rows.extend(_read(p))
@@ -307,7 +392,7 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
     for r in rows:
         # Curated inputs may include global curb inventory; only normalize rows with episode binding here.
         if r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id")):
-            normalized_input.append(normalize(r, args.source_name))
+            normalized_input.append(normalize(r, args.source_name, transformer))
     if args.accessibility_graph_dir:
         out_rows = _build_from_graphs(args, normalized_input)
     else:
@@ -337,9 +422,11 @@ def main() -> None:
     p.add_argument("--input_pudo_evidence_jsonl", default=None)
     p.add_argument("--curb_inventory_jsonl", default=None)
     p.add_argument("--curb_regulation_jsonl", default=None)
+    p.add_argument("--georeference_json", default=None)
     p.add_argument("--output_pudo_evidence_jsonl", required=True)
     p.add_argument("--candidate_radius_m", type=float, default=250.0)
     p.add_argument("--regulation_snap_tolerance_m", type=float, default=12.0)
+    p.add_argument("--inventory_snap_tolerance_m", type=float, default=15.0)
     p.add_argument("--max_route_deviation_m", type=float, default=300.0)
     p.add_argument("--source_name", default="city_curb_regulation+sidewalk_inventory")
     p.add_argument("--fail_on_missing_core_evidence", action="store_true")

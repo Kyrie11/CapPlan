@@ -270,7 +270,11 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             osm_source = _city_source(city, city_cfg, "osm_source", external_root / "osm", f"{city}_sidewalks.json")
             opensidewalks = _city_source(city, city_cfg, "opensidewalks_source", external_root / "opensidewalks", f"{city}.geojson")
             city_gis = _city_source(city, city_cfg, "city_gis_dir", external_root / "city_gis", city)
-            curb_inventory = _city_source(city, city_cfg, "curb_inventory_source", external_root / "curb_inventory", f"{city}.jsonl")
+            # Configs expose curated curb evidence as `curb_inventory_jsonl`.
+            # The old `curb_inventory_source` lookup left the graph builder
+            # blind to real curb attributes, which then propagated as 100%
+            # missing PUDO core fields.
+            curb_inventory = _city_source(city, city_cfg, "curb_inventory_jsonl", external_root / "curb_inventory", f"{city}.jsonl")
             entrances = _city_source(city, city_cfg, "entrance_source", external_root / "entrances", f"{city}.geojson")
             elevation = _city_source(city, city_cfg, "elevation_source", external_root / "dem", f"{city}.jsonl")
             georef = _path(city_cfg["georeference_json"])
@@ -330,6 +334,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(prepared_root / "pudo" / f"{city}.report.json"),
             ]
             missing_pudo_sources: List[str] = []
+            pudo_cmd += ["--georeference_json", str(_path(city_cfg["georeference_json"]))]
             _add_source_arg(pudo_cmd, "--curb_inventory_jsonl", city_curb_inventory, dry_run, required=(source_policy == "paper"), missing=missing_pudo_sources)
             _add_source_arg(pudo_cmd, "--curb_regulation_jsonl", city_curb_reg, dry_run, required=(source_policy == "paper"), missing=missing_pudo_sources)
             if source_policy == "paper":

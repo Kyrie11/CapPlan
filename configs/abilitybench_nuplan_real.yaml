@@ -72,7 +72,11 @@ cities:
     elevation_source: /data0/senzeyu2/dataset/abilitybench_external/dem/pittsburgh.jsonl
 
   vegas:
-    db_dirs: [train_vegas_2]
+    # nuPlan Vegas training shards are split across train_vegas_0/1/2.
+    # Keeping only train_vegas_2 under-samples the city and biases the
+    # benchmark slice; the preparation script skips non-existing DB files at the
+    # glob/adapter layer, so all three should be listed in the canonical config.
+    db_dirs: [train_vegas_0, train_vegas_1, train_vegas_2]
     map_names: [us-nv-las-vegas-strip]
     bbox: [36.07, -115.23, 36.20, -115.10]
     georeference_json: configs/georeference.vegas.json
