@@ -12,6 +12,7 @@ from capplan.evaluation.ablations import ABLATION_FLAGS, ablation_config
 from capplan.evaluation.closed_loop import ClosedLoopRunner
 from capplan.planning.planner import PlannerConfig
 from capplan.utils.serialization import dump_json, load_json
+from scripts.import_nuplan_vehicle_metrics import import_metrics
 
 
 def _fail_paper_if_mock(args: argparse.Namespace) -> None:
@@ -56,9 +57,12 @@ def main() -> None:
     p.add_argument("--nuplan_sim_config", default=None, help="Path to a nuPlan simulation config for paper-mode closed-loop execution.")
     p.add_argument("--vehicle_metrics", default=None, help="Optional output JSON path for vehicle-only metrics copied from aggregate metrics.")
     p.add_argument("--passenger_metrics", default=None, help="Optional output JSON path for passenger-complete metrics copied from aggregate metrics.")
+    p.add_argument("--import_nuplan_metrics_from", default=None, help="Optional nuPlan metrics file/dir to import into dataset_dir/nuplan_vehicle_metrics.jsonl before evaluation.")
     args = p.parse_args()
 
     dataset_dir = Path(args.dataset_dir)
+    if args.import_nuplan_metrics_from:
+        import_metrics(dataset_dir, args.import_nuplan_metrics_from, dataset_dir / "nuplan_vehicle_metrics.jsonl", Path(args.output_dir) / "nuplan_vehicle_metrics_import_report.json")
     _fail_paper_if_mock(args)
     _validate_dataset_manifest(dataset_dir, args.paper_mode)
 

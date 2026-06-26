@@ -132,6 +132,17 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
     if any("synthetic" in str(src) for src in graph_edge_sources):
         issues.append("synthetic_accessibility_edges_used")
 
+    if manifest.get("source_policy") != "paper":
+        issues.append("source_policy_not_paper")
+    if not manifest.get("paper_mode"):
+        issues.append("dataset_not_built_in_paper_mode")
+    preflight = manifest.get("external_source_preflight") if isinstance(manifest.get("external_source_preflight"), dict) else {}
+    missing_external = []
+    if preflight:
+        missing_external = [f"{r.get('city')}:{r.get('key')}" for r in preflight.get("sources", []) if not r.get("exists") and r.get("key") != "georeference_json"]
+        if missing_external:
+            issues.append("missing_real_external_sources")
+
     synthetic_sources = sorted({str(x) for x in list(graph_edge_sources) + [e.get("source") for e in entrances] + [p.get("source") for p in pudos] if _bad_source(x)})
     proxy_sources = sorted({str(x) for x in list(graph_edge_sources) + [e.get("source") for e in entrances] + [p.get("source") for p in pudos] if "proxy" in str(x).lower()})
     unknown_sources = sorted({str(x) for x in list(graph_edge_sources) + [e.get("source") for e in entrances] + [p.get("source") for p in pudos] if str(x) in {"", "None", "unknown"}})
@@ -167,6 +178,9 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
             "num_episodes": manifest.get("num_episodes"),
             "num_contracts": manifest.get("num_contracts"),
             "num_transitions": manifest.get("num_transitions"),
+            "source_policy": manifest.get("source_policy"),
+            "paper_mode": manifest.get("paper_mode"),
+            "publication_ready": manifest.get("publication_ready"),
         },
         "validation": {
             "ok": validation.get("ok"),
@@ -232,6 +246,7 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
             "synthetic_sources": synthetic_sources,
             "proxy_sources": proxy_sources,
             "unknown_sources": unknown_sources,
+            "missing_external_sources": missing_external,
         },
         "graph_quality": {
             "nodes_per_episode": _quantiles([float(x) for x in graph_node_counts]),

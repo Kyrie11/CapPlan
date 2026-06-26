@@ -382,7 +382,11 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             cmd = [
                 sys.executable,
                 "scripts/build_dataset.py",
-                *( ["--paper_mode"] if source_policy == "paper" else [] ),
+                *( ["--paper_mode", "--require_validated_georeference"] if source_policy == "paper" else [] ),
+                "--source_policy",
+                source_policy,
+                "--external_source_preflight_json",
+                str(prepared_root / "external_source_preflight.json"),
                 "--scene_source",
                 "nuplan",
                 "--nuplan_data_root",
@@ -433,6 +437,21 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             if city_map_names:
                 cmd.extend(["--nuplan_map_names", city_map_names])
             _run(cmd, dry_run)
+            if not dry_run:
+                audit_cmd = [
+                    sys.executable,
+                    "scripts/audit_dataset_quality.py",
+                    "--dataset_dir",
+                    str(city_dataset),
+                    *( ["--paper_mode", "--fail_if_not_publication_ready"] if source_policy == "paper" else [] ),
+                    "--min_graph_nodes",
+                    str(min_nodes),
+                    "--min_graph_edges",
+                    str(min_edges),
+                    "--max_core_pudo_missing_rate",
+                    str(max_missing),
+                ]
+                _run(audit_cmd, dry_run)
 
     merged_dataset = outputs_root / "datasets" / f"abilitybench_av_{split_name}"
     if "merge" in stages or "all" in stages:

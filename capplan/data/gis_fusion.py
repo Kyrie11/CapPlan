@@ -32,6 +32,86 @@ from capplan.utils.serialization import load_json, read_jsonl
 EARTH_RADIUS_M = 6_378_137.0
 
 
+def _parse_epsg_utm(crs: Any) -> tuple[int, bool] | None:
+    """Return (zone, northern_hemisphere) for EPSG:326xx/327xx CRS strings.
+
+    pyproj is the preferred backend, but publication-scale dataset builds should
+    not silently fall back to a local tangent plane when pyproj is absent.  This
+    lightweight UTM path covers the nuPlan city configs used by AbilityBench and
+    keeps WGS84<->projected map-frame alignment deterministic in minimal envs.
+    """
+    if crs is None:
+        return None
+    m = re.search(r"epsg\s*:\s*(326|327)(\d{2})", str(crs).lower())
+    if not m:
+        m = re.search(r"\b(326|327)(\d{2})\b", str(crs).lower())
+    if not m:
+        return None
+    zone = int(m.group(2))
+    if not (1 <= zone <= 60):
+        return None
+    return zone, m.group(1) == "326"
+
+
+def _utm_forward(lon_deg: float, lat_deg: float, zone: int, northern: bool) -> tuple[float, float]:
+    """Pure-Python WGS84 -> UTM easting/northing fallback.
+
+    Accuracy is comfortably below centimetres for the city-scale extents used
+    here, which is much smaller than graph snapping/cropping tolerances.
+    """
+    a = 6378137.0
+    f = 1 / 298.257223563
+    k0 = 0.9996
+    e2 = f * (2 - f)
+    ep2 = e2 / (1 - e2)
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    lon0 = math.radians((zone - 1) * 6 - 180 + 3)
+    n = a / math.sqrt(1 - e2 * math.sin(lat) ** 2)
+    t = math.tan(lat) ** 2
+    c = ep2 * math.cos(lat) ** 2
+    A = math.cos(lat) * (lon - lon0)
+    m = a * ((1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256) * lat
+             - (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * math.sin(2 * lat)
+             + (15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024) * math.sin(4 * lat)
+             - (35 * e2 ** 3 / 3072) * math.sin(6 * lat))
+    easting = k0 * n * (A + (1 - t + c) * A ** 3 / 6 + (5 - 18 * t + t ** 2 + 72 * c - 58 * ep2) * A ** 5 / 120) + 500000.0
+    northing = k0 * (m + n * math.tan(lat) * (A ** 2 / 2 + (5 - t + 9 * c + 4 * c ** 2) * A ** 4 / 24 + (61 - 58 * t + t ** 2 + 600 * c - 330 * ep2) * A ** 6 / 720))
+    if not northern:
+        northing += 10000000.0
+    return float(easting), float(northing)
+
+
+def _utm_inverse(easting: float, northing: float, zone: int, northern: bool) -> tuple[float, float]:
+    """Pure-Python UTM easting/northing -> WGS84 fallback."""
+    a = 6378137.0
+    f = 1 / 298.257223563
+    k0 = 0.9996
+    e2 = f * (2 - f)
+    ep2 = e2 / (1 - e2)
+    x = float(easting) - 500000.0
+    y = float(northing)
+    if not northern:
+        y -= 10000000.0
+    lon0 = math.radians((zone - 1) * 6 - 180 + 3)
+    m = y / k0
+    mu = m / (a * (1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256))
+    e1 = (1 - math.sqrt(1 - e2)) / (1 + math.sqrt(1 - e2))
+    j1 = 3 * e1 / 2 - 27 * e1 ** 3 / 32
+    j2 = 21 * e1 ** 2 / 16 - 55 * e1 ** 4 / 32
+    j3 = 151 * e1 ** 3 / 96
+    j4 = 1097 * e1 ** 4 / 512
+    fp = mu + j1 * math.sin(2 * mu) + j2 * math.sin(4 * mu) + j3 * math.sin(6 * mu) + j4 * math.sin(8 * mu)
+    c1 = ep2 * math.cos(fp) ** 2
+    t1 = math.tan(fp) ** 2
+    n1 = a / math.sqrt(1 - e2 * math.sin(fp) ** 2)
+    r1 = a * (1 - e2) / (1 - e2 * math.sin(fp) ** 2) ** 1.5
+    d = x / (n1 * k0)
+    lat = fp - (n1 * math.tan(fp) / r1) * (d ** 2 / 2 - (5 + 3 * t1 + 10 * c1 - 4 * c1 ** 2 - 9 * ep2) * d ** 4 / 24 + (61 + 90 * t1 + 298 * c1 + 45 * t1 ** 2 - 252 * ep2 - 3 * c1 ** 2) * d ** 6 / 720)
+    lon = lon0 + (d - (1 + 2 * t1 + c1) * d ** 3 / 6 + (5 - 2 * c1 + 28 * t1 - 3 * c1 ** 2 + 8 * ep2 + 24 * t1 ** 2) * d ** 5 / 120) / math.cos(fp)
+    return float(math.degrees(lon)), float(math.degrees(lat))
+
+
 @dataclass(frozen=True)
 class SceneContext:
     episode_id: str
@@ -79,16 +159,28 @@ class CoordinateTransformer:
         self.heading = math.radians(float(self.config.get("origin_heading_deg", self.config.get("heading_deg", 0.0)) or 0.0))
         self._to_local = None
         self._to_wgs84 = None
+        self._utm_zone: int | None = None
+        self._utm_northern: bool = True
+        self.transform_backend = "tangent_plane"
         self._projected_origin_x = 0.0
         self._projected_origin_y = 0.0
         local_crs = self.config.get("local_crs") or self.config.get("projected_crs") or self.config.get("target_crs")
         wgs84_crs = self.config.get("wgs84_crs") or self.config.get("source_crs") or "EPSG:4326"
         mode = str(self.config.get("map_frame") or self.config.get("transform_mode") or "").lower()
         self.projected_map_frame = bool(self.config.get("projected_map_frame", False)) or mode in {"projected", "utm", "projected_absolute", "nuplan_projected"}
+        utm = _parse_epsg_utm(local_crs)
         if local_crs and _PyprojTransformer is not None:
             self._to_local = _PyprojTransformer.from_crs(wgs84_crs, local_crs, always_xy=True)
             self._to_wgs84 = _PyprojTransformer.from_crs(local_crs, wgs84_crs, always_xy=True)
-            # pyproj returns coordinates in the projected CRS.  Some nuPlan maps
+            self.transform_backend = "pyproj"
+        elif local_crs and utm is not None:
+            self._utm_zone, self._utm_northern = utm
+            self.transform_backend = "utm_fallback"
+        elif local_crs:
+            raise RuntimeError(f"georeference local_crs={local_crs!r} requires pyproj or a supported EPSG:326xx/327xx UTM CRS; refusing to silently use tangent-plane coordinates")
+
+        if local_crs:
+            # pyproj/UTM returns coordinates in the projected CRS.  Some nuPlan maps
             # store scene poses directly in that projected CRS (Boston looks like
             # UTM 19N: ~330k, ~4.69M).  In that case we must NOT subtract a city
             # origin, otherwise all GIS features become local ENU values around
@@ -104,7 +196,12 @@ class CoordinateTransformer:
                 self._projected_origin_x = float(self.config.get("projected_origin_x") or 0.0)
                 self._projected_origin_y = float(self.config.get("projected_origin_y") or 0.0)
             elif self.config.get("origin_lat") is not None and self.config.get("origin_lon") is not None:
-                ox, oy = self._to_local.transform(self.origin_lon, self.origin_lat)
+                if self._to_local is not None:
+                    ox, oy = self._to_local.transform(self.origin_lon, self.origin_lat)
+                elif self._utm_zone is not None:
+                    ox, oy = _utm_forward(self.origin_lon, self.origin_lat, self._utm_zone, self._utm_northern)
+                else:  # defensive; local_crs branch guarantees a backend
+                    ox, oy = 0.0, 0.0
                 self._projected_origin_x = float(ox)
                 self._projected_origin_y = float(oy)
 
@@ -139,6 +236,9 @@ class CoordinateTransformer:
         if self._to_local is not None:
             px, py = self._to_local.transform(lon, lat)
             return self._projected_to_map(float(px), float(py))
+        if self._utm_zone is not None:
+            px, py = _utm_forward(lon, lat, self._utm_zone, self._utm_northern)
+            return self._projected_to_map(float(px), float(py))
         lat0 = math.radians(self.origin_lat)
         dx = math.radians(lon - self.origin_lon) * EARTH_RADIUS_M * math.cos(lat0)
         dy = math.radians(lat - self.origin_lat) * EARTH_RADIUS_M
@@ -153,6 +253,9 @@ class CoordinateTransformer:
             px, py = self._map_to_projected(x, y)
             lon, lat = self._to_wgs84.transform(px, py)
             return float(lon), float(lat)
+        if self._utm_zone is not None:
+            px, py = self._map_to_projected(x, y)
+            return _utm_inverse(px, py, self._utm_zone, self._utm_northern)
         c, s = math.cos(self.heading), math.sin(self.heading)
         dx = c * (x - self.origin_x) - s * (y - self.origin_y)
         dy = s * (x - self.origin_x) + c * (y - self.origin_y)

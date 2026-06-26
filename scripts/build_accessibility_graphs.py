@@ -204,7 +204,8 @@ def _spatial_diagnostics(scene: Any, features: Sequence[Any], transformer: Coord
         "georeference_description": transformer.config.get("description"),
         "local_crs": transformer.config.get("local_crs") or transformer.config.get("projected_crs") or transformer.config.get("target_crs"),
         "projected_map_frame": bool(getattr(transformer, "projected_map_frame", False)),
-        "hint": "0 cropped features usually means the WGS84->nuPlan map georeference is not aligned, or the Overpass/city-GIS bbox does not cover this nuPlan map/scenario. For nuPlan DB-set maps whose scene poses look like UTM/easting-northing coordinates, set local_crs and projected_map_frame=true.",
+        "transform_backend": getattr(transformer, "transform_backend", "unknown"),
+        "hint": "0 cropped features usually means the WGS84->nuPlan map georeference is not aligned, the transform backend is wrong/missing, or the Overpass/city-GIS bbox does not cover this nuPlan map/scenario. For nuPlan DB-set maps whose scene poses look like UTM/easting-northing coordinates, use local_crs plus projected_map_frame=true and check transform_backend is pyproj or utm_fallback.",
     }
 
 def _build_prepared(args: argparse.Namespace) -> Dict[str, Any]:
@@ -282,6 +283,8 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
             "synthetic_rejected": bool(args.fail_on_synthetic),
             "georeference": args.georeference_json,
             "georeference_validated": bool(transformer.config.get("validated", False)),
+            "transform_backend": getattr(transformer, "transform_backend", "unknown"),
+            "projected_map_frame": bool(getattr(transformer, "projected_map_frame", False)),
         }
     out = Path(args.output_graph_dir)
     dump_json(out / "source_report.json", report)

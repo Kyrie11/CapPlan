@@ -27,7 +27,7 @@ from capplan.data.passenger_service_layer import (
 from capplan.data.schemas import EntranceAnchor, Pose2D, PUDOAnchor, to_dict, transition_label_from_transition
 from capplan.data.validate_dataset import validate_dataset
 from capplan.planning.transition_generator import TransitionGenerator
-from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
+from capplan.utils.serialization import dump_json, load_json, read_jsonl, write_jsonl
 
 
 try:
@@ -89,6 +89,8 @@ def _assert_paper_mode_config(args: argparse.Namespace) -> None:
     synthetic/proxy layers before any dataset rows are written.  Smoke mode keeps
     the old lightweight pipeline for CI and quick debugging.
     """
+    if getattr(args, "source_policy", "bootstrap") == "paper" and not getattr(args, "paper_mode", False):
+        raise RuntimeError("--source_policy paper requires --paper_mode")
     if not getattr(args, "paper_mode", False):
         return
     if args.scene_source != "nuplan":
@@ -112,8 +114,12 @@ def _source_is_synthetic_or_proxy(value: Any) -> bool:
 
 
 def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: Any, origin: EntranceAnchor, destination: EntranceAnchor, pudo: List[PUDOAnchor]) -> None:
+    if getattr(args, "source_policy", "bootstrap") == "paper" and not getattr(args, "paper_mode", False):
+        raise RuntimeError("--source_policy paper requires --paper_mode")
     if not getattr(args, "paper_mode", False):
         return
+    if getattr(args, "require_validated_georeference", False) and graph.metadata.get("georeference_validated") is False:
+        raise RuntimeError(f"paper_mode requires validated georeference for {eid}; graph metadata georeference_validated=false")
     if args.reject_proxy_entrances and (_source_is_synthetic_or_proxy(origin.source) or _source_is_synthetic_or_proxy(destination.source)):
         raise RuntimeError(f"paper_mode rejects proxy/synthetic entrances for {eid}: {origin.source}, {destination.source}")
     if args.reject_synthetic_accessibility:
@@ -346,6 +352,9 @@ def main() -> None:
     p.add_argument("--max_scenarios", type=int, default=4)
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
     p.add_argument("--paper_mode", action="store_true", help="Enable publication-grade data gates: no synthetic/proxy fallbacks, no missing core evidence, and real service/profile/fleet inputs required.")
+    p.add_argument("--source_policy", choices=["bootstrap", "paper"], default="bootstrap", help="Dataset evidence policy recorded in the manifest. paper requires --paper_mode and complete audited evidence.")
+    p.add_argument("--external_source_preflight_json", default=None, help="Optional preflight report from prepare_abilitybench_external.py copied into the dataset manifest for auditability.")
+    p.add_argument("--require_validated_georeference", action="store_true", help="Paper-mode gate: fail if prepared graph metadata says georeference_validated=false.")
     p.add_argument("--service_layer_source", choices=["synthetic_smoke", "real_jsonl", "calibrated_od"], default="synthetic_smoke", help="Passenger-service request source. Paper mode rejects synthetic_smoke.")
     p.add_argument("--service_requests_jsonl", default=None, help="Real/calibrated service requests JSONL with request_id, episode_id, origin/destination entrance IDs, request time, profile, vehicle/fleet fields.")
     p.add_argument("--fleet_jsonl", default=None, help="Fleet vehicle/interface JSONL. Paper mode requires this instead of the fixed smoke vehicle set.")
@@ -568,13 +577,14 @@ def main() -> None:
     write_jsonl(out / "service_requests.jsonl", service_request_records)
     _write_splits(out, [e["episode_id"] for e in episodes])
 
+    preflight = load_json(args.external_source_preflight_json) if args.external_source_preflight_json else None
     manifest = {
         "dataset_name": out.name,
         "version": "0.1.0",
         "scene_source": args.scene_source,
         "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files_requested": resolved_db_files, "db_files_expanded": adapter.db_files if args.scene_source == "nuplan" else [], "map_version": args.nuplan_map_version},
         "accessibility_source": args.accessibility_source, "accessibility_graph_dir": args.accessibility_graph_dir, "pudo_source": args.pudo_source, "pudo_evidence_jsonl": args.pudo_evidence_jsonl,
-        "paper_mode": bool(args.paper_mode), "service_layer_source": args.service_layer_source, "service_requests_jsonl": args.service_requests_jsonl, "capability_profiles_jsonl": args.capability_profiles_jsonl, "fleet_jsonl": args.fleet_jsonl,
+        "paper_mode": bool(args.paper_mode), "source_policy": args.source_policy, "publication_ready": bool(args.paper_mode and args.source_policy == "paper"), "external_source_preflight": preflight, "service_layer_source": args.service_layer_source, "service_requests_jsonl": args.service_requests_jsonl, "capability_profiles_jsonl": args.capability_profiles_jsonl, "fleet_jsonl": args.fleet_jsonl,
         "builder_git_commit": _git_commit(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "strict_mode": bool(args.strict),
