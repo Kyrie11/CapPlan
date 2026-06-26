@@ -23,6 +23,7 @@ import argparse
 import csv
 import json
 import math
+import random
 import sys
 import time
 import urllib.error
@@ -85,6 +86,7 @@ OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.openstreetmap.ru/api/interpreter",
+    "https://overpass.osm.ch/api/interpreter",
 ]
 
 HTTP_HEADERS = {
@@ -232,6 +234,7 @@ def _merge_overpass_payloads(payloads: Iterable[Dict[str, Any]]) -> Dict[str, An
     }
 
 
+
 def _fetch_overpass_payload(city: str, bbox: List[float], endpoint: str, timeout_s: int) -> Dict[str, Any]:
     query = overpass_query(bbox, timeout_s)
     payload = http_post(endpoint, {"data": query}, timeout=max(timeout_s + 30, 300))
@@ -253,62 +256,119 @@ def _validate_existing_json(path: Path, required_key: str | None = None) -> bool
     return required_key is None or (isinstance(obj, dict) and required_key in obj)
 
 
-def download_overpass(city: str, spec: Dict[str, Any], endpoint: str, timeout_s: int, force: bool, retries: int = 3, grid_n: int = 1) -> Path:
+def _unique_endpoints(primary: str | None = None, endpoint_pool: str | None = None) -> List[str]:
+    raw: List[str] = []
+    if primary:
+        raw.append(primary.strip())
+    if endpoint_pool:
+        raw.extend(x.strip() for x in endpoint_pool.replace(";", ",").split(",") if x.strip())
+    raw.extend(OVERPASS_ENDPOINTS)
+    out: List[str] = []
+    seen = set()
+    for ep in raw:
+        ep = ep.rstrip("/") + "/api/interpreter" if ep.rstrip("/").endswith("api") else ep.rstrip("/")
+        if ep and ep not in seen:
+            seen.add(ep)
+            out.append(ep)
+    return out or list(OVERPASS_ENDPOINTS)
+
+
+def _retry_after_seconds(exc: Exception, attempt: int) -> float:
+    if isinstance(exc, urllib.error.HTTPError):
+        val = exc.headers.get("Retry-After") if exc.headers else None
+        if val:
+            try:
+                return max(1.0, min(300.0, float(val)))
+            except Exception:
+                pass
+    return min(180.0, 5.0 * (2 ** attempt)) + random.uniform(0.0, 2.0)
+
+
+def _tile_cache_path(city: str, tile_index: int, grid_n: int) -> Path:
+    return ROOT / "osm" / "tile_cache" / f"{city}_g{int(grid_n)}_tile_{tile_index:03d}.json"
+
+
+def _read_cached_tile(path: Path) -> Dict[str, Any] | None:
+    if not _validate_existing_json(path, "elements"):
+        return None
+    try:
+        return read_json(path)
+    except Exception:
+        return None
+
+
+def download_overpass(
+    city: str,
+    spec: Dict[str, Any],
+    endpoint: str,
+    timeout_s: int,
+    force: bool,
+    retries: int = 3,
+    grid_n: int = 1,
+    endpoint_pool: str | None = None,
+    tile_sleep_s: float = 4.0,
+) -> Path:
+    """Download city Overpass evidence with per-tile cache and endpoint rotation.
+
+    `force` refreshes the merged city output, but successful tile cache files are
+    still reused.  This is deliberate: when a dense city fails on tile 8/9, the
+    next run should resume instead of hammering public Overpass with the first
+    seven requests again.
+    """
     out = ROOT / "osm" / f"{city}_sidewalks.json"
     if out.exists() and not force:
         if _validate_existing_json(out, "elements"):
             log(f"[skip] {out}")
             return out
         log(f"[warn] existing Overpass file is invalid; re-downloading: {out}")
-    endpoints = [endpoint] + [e for e in OVERPASS_ENDPOINTS if e != endpoint]
-    bboxes = split_bbox(spec["bbox"], max(1, int(grid_n)))
-    last_error: Exception | None = None
-    for attempt in range(max(1, retries)):
-        ep = endpoints[attempt % len(endpoints)]
-        try:
-            log(f"[overpass] {city} via {ep}, tiles={len(bboxes)} -> {out}")
-            tile_payloads: List[Dict[str, Any]] = []
-            for ti, tile_bbox in enumerate(bboxes, start=1):
-                if len(bboxes) > 1:
-                    log(f"[overpass] {city} tile {ti}/{len(bboxes)} bbox={tile_bbox}")
-                tile_payloads.append(_fetch_overpass_payload(city, tile_bbox, ep, timeout_s))
-                # Keep public Overpass instances happy. Even within one retry attempt,
-                # tiled queries should be paced.
-                if len(bboxes) > 1 and ti < len(bboxes):
-                    time.sleep(1.5)
-            obj = _merge_overpass_payloads(tile_payloads)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            tmp = out.with_suffix(out.suffix + ".tmp")
-            tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(out)
-            return out
-        except urllib.error.HTTPError as e:
-            last_error = e
-            # 406 is often recoverable by lowering the claimed resource footprint:
-            # retry once in the same attempt with an automatically finer grid.
-            if e.code == 406 and grid_n <= 1:
-                try:
-                    finer = 3
-                    log(f"[warn] Overpass HTTP 406 for {city}; retrying once with {finer}x{finer} tiled bbox on {ep}")
-                    tile_payloads = [_fetch_overpass_payload(city, b, ep, max(60, timeout_s // 2)) for b in split_bbox(spec["bbox"], finer)]
-                    obj = _merge_overpass_payloads(tile_payloads)
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = out.with_suffix(out.suffix + ".tmp")
-                    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
-                    tmp.replace(out)
-                    return out
-                except Exception as e2:  # continue to normal endpoint retry sequence
-                    last_error = e2
-            sleep_s = min(60.0, 5.0 * (2 ** attempt))
-            log(f"[warn] Overpass attempt {attempt + 1}/{retries} failed for {city}: {last_error}; retrying after {sleep_s:.1f}s")
-            time.sleep(sleep_s)
-        except Exception as e:
-            last_error = e
-            sleep_s = min(60.0, 5.0 * (2 ** attempt))
-            log(f"[warn] Overpass attempt {attempt + 1}/{retries} failed for {city}: {e}; retrying after {sleep_s:.1f}s")
-            time.sleep(sleep_s)
-    raise RuntimeError(f"Overpass failed for {city} after {retries} attempts: {last_error}")
 
+    endpoints = _unique_endpoints(endpoint, endpoint_pool)
+    bboxes = split_bbox(spec["bbox"], max(1, int(grid_n)))
+    tile_payloads: List[Dict[str, Any]] = []
+    last_error: Exception | None = None
+
+    for ti, tile_bbox in enumerate(bboxes, start=1):
+        cache = _tile_cache_path(city, ti, max(1, int(grid_n)))
+        cached = _read_cached_tile(cache)
+        if cached is not None:
+            log(f"[overpass] {city} tile {ti}/{len(bboxes)} cache hit: {cache}")
+            tile_payloads.append(cached)
+            continue
+
+        for attempt in range(max(1, retries)):
+            ep = endpoints[(attempt + ti - 1) % len(endpoints)]
+            try:
+                log(f"[overpass] {city} tile {ti}/{len(bboxes)} via {ep} bbox={tile_bbox}")
+                payload = _fetch_overpass_payload(city, tile_bbox, ep, timeout_s)
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache.with_suffix(cache.suffix + ".tmp")
+                tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                tmp.replace(cache)
+                tile_payloads.append(payload)
+                if ti < len(bboxes):
+                    time.sleep(max(0.0, float(tile_sleep_s)))
+                break
+            except urllib.error.HTTPError as e:
+                last_error = e
+                sleep_s = _retry_after_seconds(e, attempt)
+                log(f"[warn] Overpass tile {ti}/{len(bboxes)} attempt {attempt + 1}/{retries} failed for {city}: {e}; retrying after {sleep_s:.1f}s")
+                time.sleep(sleep_s)
+            except Exception as e:
+                last_error = e
+                sleep_s = _retry_after_seconds(e, attempt)
+                log(f"[warn] Overpass tile {ti}/{len(bboxes)} attempt {attempt + 1}/{retries} failed for {city}: {e}; retrying after {sleep_s:.1f}s")
+                time.sleep(sleep_s)
+        else:
+            raise RuntimeError(f"Overpass failed for {city} tile {ti}/{len(bboxes)} after {retries} attempts: {last_error}")
+
+    obj = _merge_overpass_payloads(tile_payloads)
+    if not obj.get("elements"):
+        raise RuntimeError(f"Overpass completed for {city}, but returned zero OSM elements")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(out.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(out)
+    return out
 
 def tags(el: Dict[str, Any]) -> Dict[str, Any]:
     return el.get("tags") if isinstance(el.get("tags"), dict) else {}
@@ -648,7 +708,7 @@ def fetch_city(city: str, args: argparse.Namespace) -> Dict[str, Any]:
         if not osm_path.exists():
             raise FileNotFoundError(f"--skip_overpass requested but {osm_path} does not exist")
     else:
-        osm_path = download_overpass(city, spec, args.overpass_endpoint, args.overpass_timeout_s, args.force, args.overpass_retries, args.overpass_grid_n)
+        osm_path = download_overpass(city, spec, args.overpass_endpoint, args.overpass_timeout_s, args.force, args.overpass_retries, args.overpass_grid_n, args.overpass_endpoint_pool, args.overpass_tile_sleep_s)
         if args.overpass_sleep_s > 0:
             time.sleep(args.overpass_sleep_s)
     osw, curbs, entrances = osm_to_geojson_and_evidence(city, osm_path)
@@ -674,7 +734,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cities", default="boston,pittsburgh,vegas,singapore", help="comma-separated subset")
     p.add_argument("--overpass_endpoint", default="https://overpass-api.de/api/interpreter")
     p.add_argument("--overpass_timeout_s", type=int, default=300)
-    p.add_argument("--overpass_sleep_s", type=float, default=8.0)
+    p.add_argument("--overpass_sleep_s", type=float, default=8.0, help="Pause between cities after each city's outputs are normalized.")
+    p.add_argument("--overpass_tile_sleep_s", type=float, default=4.0, help="Pause between tiled Overpass requests within one city.")
+    p.add_argument("--overpass_endpoint_pool", default=None, help="Comma-separated endpoint pool; the primary endpoint is tried first and unhealthy endpoints are rotated per tile.")
     p.add_argument("--overpass_retries", type=int, default=4)
     p.add_argument("--overpass_grid_n", type=int, default=1, help="split each city bbox into N x N smaller Overpass queries; use 2 or 3 when public instances reject large requests")
     p.add_argument("--skip_overpass", action="store_true", help="reuse existing osm/<city>_sidewalks.json")

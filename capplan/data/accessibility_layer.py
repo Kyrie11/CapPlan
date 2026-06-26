@@ -52,13 +52,29 @@ class PreparedAccessibilityBuilder:
             f"{ep_nodes.name}/{ep_edges.name} or shared nodes.jsonl/edges.jsonl in {self.graph_dir}"
         )
 
+    def _metadata_for(self, episode_id: str) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {}
+        for graph_path in [self.graph_dir / f"{episode_id}.jsonl", self.graph_dir / "shared.jsonl"]:
+            if not graph_path.exists():
+                continue
+            try:
+                rows = read_jsonl(graph_path)
+            except Exception:
+                rows = []
+            if rows and isinstance(rows[0].get("metadata"), dict):
+                meta.update(rows[0]["metadata"])
+                break
+        return meta
+
     def build(self, episode_id: str, **_: Any) -> AccessibilityGraph:
         nodes_path, edges_path = self._paths_for(episode_id)
+        meta = self._metadata_for(episode_id)
+        meta.update({"source": meta.get("source", self.source), "nodes_path": str(nodes_path), "edges_path": str(edges_path)})
         return graph_from_records(
             episode_id,
             read_jsonl(nodes_path),
             read_jsonl(edges_path),
-            {"source": self.source, "nodes_path": str(nodes_path), "edges_path": str(edges_path)},
+            meta,
         )
 
 
@@ -427,9 +443,18 @@ def load_accessibility_graph(dataset_dir: str | Path, episode_id: str) -> Access
     root = Path(dataset_dir) / "accessibility_graphs"
     nodes_path = root / f"{episode_id}.nodes.jsonl"
     edges_path = root / f"{episode_id}.edges.jsonl"
+    combined_path = root / f"{episode_id}.jsonl"
     if nodes_path.exists() and edges_path.exists():
-        return graph_from_records(episode_id, read_jsonl(nodes_path), read_jsonl(edges_path), {"loaded_from": str(root)})
-    combined = read_jsonl(root / f"{episode_id}.jsonl")
+        meta: Dict[str, Any] = {"loaded_from": str(root)}
+        if combined_path.exists():
+            try:
+                combined_rows = read_jsonl(combined_path)
+                if combined_rows and isinstance(combined_rows[0].get("metadata"), dict):
+                    meta.update(combined_rows[0]["metadata"])
+            except Exception:
+                pass
+        return graph_from_records(episode_id, read_jsonl(nodes_path), read_jsonl(edges_path), meta)
+    combined = read_jsonl(combined_path)
     if combined:
         rec = combined[0]
         return graph_from_records(rec.get("episode_id", episode_id), rec.get("nodes", []), rec.get("edges", []), rec.get("metadata", {}))

@@ -1,7 +1,7 @@
 """Independent offline verifier and label oracle."""
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -44,6 +44,26 @@ class IndependentLabelOracle:
         self.automaton = ServiceAutomaton()
         self.max_depth = max_depth
 
+    def _infer_start_anchor(self, transitions: Sequence[CandidateTransition]) -> str:
+        """Infer the concrete OD anchor used by this episode's origin phase.
+
+        Real AbilityBench episodes do not necessarily name their origin entrance
+        literally ``origin``.  Transition generation binds the first access edge
+        to the actual entrance/node id, and the oracle must start there; otherwise
+        valid real episodes can be labeled as having no feasible skeleton.
+        """
+        legal_origin_candidates = [
+            e.from_anchor
+            for e in transitions
+            if e.from_phase == "origin" and self.automaton.legal("origin", e.action, e.to_phase)
+        ]
+        if legal_origin_candidates:
+            return Counter(legal_origin_candidates).most_common(1)[0][0]
+        origin_phase_candidates = [e.from_anchor for e in transitions if e.from_phase == "origin"]
+        if origin_phase_candidates:
+            return Counter(origin_phase_candidates).most_common(1)[0][0]
+        return "origin"
+
     def verify_transition(self, e: CandidateTransition) -> TransitionLabel:
         tests = e.tests
         z = bool(tests.legal_lifecycle and tests.spatially_anchored and tests.topologically_valid and tests.physically_valid and tests.interface_valid and tests.dynamically_available and e.availability > 0.0)
@@ -69,7 +89,8 @@ class IndependentLabelOracle:
         clauses = compiled.clauses
         groups = compiled.groups
         ledger0 = init_ledger({c.resource_name for c in clauses}, self.registry)
-        q = deque([("origin", "origin", ledger0, [], [], 0.0)])
+        start_anchor = self._infer_start_anchor(transitions)
+        q = deque([(start_anchor, "origin", ledger0, [], [], 0.0)])
         visited = set()
         violations: List[ViolationRecord] = []
         outgoing: Dict[Tuple[str, str], List[CandidateTransition]] = {}

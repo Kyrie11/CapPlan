@@ -118,8 +118,13 @@ def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: An
         raise RuntimeError("--source_policy paper requires --paper_mode")
     if not getattr(args, "paper_mode", False):
         return
-    if getattr(args, "require_validated_georeference", False) and graph.metadata.get("georeference_validated") is False:
-        raise RuntimeError(f"paper_mode requires validated georeference for {eid}; graph metadata georeference_validated=false")
+    if getattr(args, "require_validated_georeference", False):
+        georef_ok = graph.metadata.get("georeference_validated") is True
+        if not georef_ok:
+            raise RuntimeError(
+                f"paper_mode requires validated georeference for {eid}; "
+                f"graph metadata georeference_validated={graph.metadata.get('georeference_validated')!r}"
+            )
     if args.reject_proxy_entrances and (_source_is_synthetic_or_proxy(origin.source) or _source_is_synthetic_or_proxy(destination.source)):
         raise RuntimeError(f"paper_mode rejects proxy/synthetic entrances for {eid}: {origin.source}, {destination.source}")
     if args.reject_synthetic_accessibility:

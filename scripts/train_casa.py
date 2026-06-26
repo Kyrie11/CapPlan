@@ -77,6 +77,41 @@ def _metrics_from_predictions(edge_prob, y_edge, value_prob, y_value, phase_prob
     }
 
 
+
+
+def _paper_label_sanity(args, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, split_name: str) -> None:
+    if not args.paper_mode:
+        return
+    n = int(len(y_edge))
+    if n <= 0:
+        raise RuntimeError(f"paper_mode CASA training found no {split_name} samples")
+    pos = int(np.sum(y_edge >= 0.5))
+    neg = int(n - pos)
+    if pos <= 0:
+        raise RuntimeError(
+            f"paper_mode CASA training found no positive passenger edge labels in {split_name}. "
+            "This usually means the offline oracle produced no passenger-complete skeletons; "
+            "check real OD anchors, legal_stop/regulation evidence, PUDO interface evidence, "
+            "accessibility graph routing/georeference, and fail-closed core evidence."
+        )
+    if neg <= 0:
+        raise RuntimeError(
+            f"paper_mode CASA training found no negative passenger edge labels in {split_name}. "
+            "The benchmark is degenerate and cannot validate discrimination or calibration."
+        )
+    if float(np.max(y_value)) <= 0.0:
+        raise RuntimeError(
+            f"paper_mode CASA training found no positive skeleton/value targets in {split_name}. "
+            "The learned value head would only learn failure."
+        )
+    if int(np.sum(demand_mask > 0.0)) <= 0:
+        raise RuntimeError(
+            f"paper_mode CASA training found no typed demand supervision in {split_name}. "
+            "Rebuild labels with passenger contracts and transition evidence enabled."
+        )
+    if not np.isfinite(y_availability).all():
+        raise RuntimeError(f"paper_mode CASA training found non-finite availability targets in {split_name}")
+
 def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device):
     input_dim = x.shape[1]
     mean = x.mean(axis=0)
@@ -242,6 +277,8 @@ def main() -> None:
     x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability = train.arrays_with_availability()
     xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability = val.arrays_with_availability() if val.samples else train.arrays_with_availability()
     device = _device_auto(args.device)
+    _paper_label_sanity(args, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, "train")
+    _paper_label_sanity(args, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, "val")
     pos = float(np.sum(y_edge >= 0.5)); neg = float(len(y_edge) - pos)
     edge_pos_weight = (neg / max(pos, 1.0)) if str(args.edge_pos_weight).lower() == "auto" else max(0.0, float(args.edge_pos_weight))
     if args.model_type == "linear_smoke":

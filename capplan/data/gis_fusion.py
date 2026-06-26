@@ -691,6 +691,13 @@ class AccessibilityFusionBuilder:
             "snap_tolerance_m": self.snap_tolerance_m,
             "pudo_connector_radius_m": pudo_connector_radius_m,
             "node_attributes": node_extra,
+            "features_loaded": len(features),
+            "features_inside_scene_bbox": len(feats),
+            "georeference_validated": bool(self.transformer.config.get("validated", False)),
+            "georeference_description": self.transformer.config.get("description"),
+            "local_crs": self.transformer.config.get("local_crs") or self.transformer.config.get("projected_crs") or self.transformer.config.get("target_crs"),
+            "projected_map_frame": bool(getattr(self.transformer, "projected_map_frame", False)),
+            "transform_backend": getattr(self.transformer, "transform_backend", "unknown"),
         })
         if len(graph.nodes) < min_nodes or len(graph.edges) < min_edges:
             raise RuntimeError(f"accessibility graph too small for {scene.episode_id}: {len(graph.nodes)} nodes/{len(graph.edges)} edges; required {min_nodes}/{min_edges}")

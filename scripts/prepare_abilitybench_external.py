@@ -90,25 +90,40 @@ out skel qt;
     return q
 
 
-def _download_overpass(query_file: Path, output_file: Path, endpoint: str, dry_run: bool) -> None:
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    _run(
-        [
-            "curl",
-            "-L",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/x-www-form-urlencoded",
-            "--data-urlencode",
-            f"data@{query_file}",
-            endpoint,
-            "-o",
-            str(output_file),
-        ],
-        dry_run,
-    )
 
+def _run_external_fetcher(
+    external_root: Path,
+    cities: Iterable[str],
+    overpass_cfg: Dict[str, Any],
+    dry_run: bool,
+) -> None:
+    """Use the robust tiled fetcher rather than a single raw curl request."""
+    selected = ",".join(cities)
+    cmd = [
+        sys.executable,
+        "scripts/fetch_abilitybench_external_four_cities.py",
+        "--external_root",
+        str(external_root),
+        "--cities",
+        selected,
+        "--overpass_endpoint",
+        str(overpass_cfg.get("endpoint", "https://overpass-api.de/api/interpreter")),
+        "--overpass_timeout_s",
+        str(int(overpass_cfg.get("timeout_s", 180))),
+        "--overpass_sleep_s",
+        str(float(overpass_cfg.get("sleep_s", 20.0))),
+        "--overpass_tile_sleep_s",
+        str(float(overpass_cfg.get("tile_sleep_s", 4.0))),
+        "--overpass_retries",
+        str(int(overpass_cfg.get("retries", 6))),
+        "--overpass_grid_n",
+        str(int(overpass_cfg.get("grid_n", 3))),
+    ]
+    if overpass_cfg.get("endpoint_pool"):
+        cmd.extend(["--overpass_endpoint_pool", str(overpass_cfg["endpoint_pool"])])
+    if bool(overpass_cfg.get("force", False)):
+        cmd.append("--force")
+    _run(cmd, dry_run)
 
 def _concat_jsonl(inputs: Iterable[Path], output: Path) -> None:
     rows: List[Dict[str, Any]] = []
@@ -167,23 +182,60 @@ def _paper_required_sources(city: str, city_cfg: Dict[str, Any], external_root: 
     }
 
 
+
+def _nonempty_source(path: Path, key: str) -> bool:
+    if not path or not path.exists():
+        return False
+    if path.is_dir():
+        return any(_nonempty_source(child, key) for child in path.glob("**/*") if child.is_file())
+    if path.stat().st_size <= 0:
+        return False
+    suffix = path.suffix.lower()
+    try:
+        if suffix in {".jsonl", ".ndjson"}:
+            return any(line.strip() for line in path.open("r", encoding="utf-8", errors="ignore"))
+        if suffix in {".json", ".geojson"}:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                if "osm_source" in key:
+                    return bool(payload.get("elements"))
+                for list_key in ["features", "records", "curbs", "regulations", "samples"]:
+                    if isinstance(payload.get(list_key), list):
+                        return len(payload[list_key]) > 0
+                return True
+            if isinstance(payload, list):
+                return len(payload) > 0
+            return False
+        if suffix == ".csv":
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                rows = [next(f, "") for _ in range(2)]
+            return bool(rows and rows[0].strip() and len(rows) > 1 and rows[1].strip())
+    except Exception:
+        return False
+    return True
+
+
 def _write_source_preflight_report(config: Dict[str, Any], cities: Iterable[str], external_root: Path, prepared_root: Path, policy: str, dry_run: bool) -> None:
     rows = []
     missing = []
+    empty_or_placeholder = []
     for city in cities:
         city_cfg = config["cities"][city]
         for key, path in _paper_required_sources(city, city_cfg, external_root).items():
             exists = bool(path and path.exists())
-            rows.append({"city": city, "key": key, "path": str(path), "exists": exists})
+            nonempty = _nonempty_source(path, key) if exists else False
+            rows.append({"city": city, "key": key, "path": str(path), "exists": exists, "nonempty": nonempty})
             if policy == "paper" and not exists:
                 missing.append(f"{city}:{key}={path}")
-    report = {"source_policy": policy, "sources": rows, "missing_required": missing}
+            if policy == "paper" and exists and key in {"curb_inventory_jsonl", "curb_regulation_jsonl", "entrance_source", "elevation_source", "opensidewalks_source", "osm_source"} and not nonempty:
+                empty_or_placeholder.append(f"{city}:{key}={path}")
+    report = {"source_policy": policy, "sources": rows, "missing_required": missing, "empty_or_placeholder_required": empty_or_placeholder}
     if not dry_run:
         prepared_root.mkdir(parents=True, exist_ok=True)
         dump_json(prepared_root / "external_source_preflight.json", report)
-    if missing:
-        raise RuntimeError("paper source policy requires complete real external evidence; missing: " + "; ".join(missing[:20]) + (" ..." if len(missing) > 20 else ""))
-
+    blockers = missing + empty_or_placeholder
+    if blockers:
+        raise RuntimeError("paper source policy requires complete non-empty real external evidence; blockers: " + "; ".join(blockers[:20]) + (" ..." if len(blockers) > 20 else ""))
 
 def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dry_run: bool, disable_tqdm: bool = False, source_policy_override: str | None = None, cities_override: str | None = None, max_scenarios_override: int | None = None) -> None:
     nuplan = config["nuplan"]
@@ -206,8 +258,8 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     min_nodes = int(config.get("quality", {}).get("min_graph_nodes", 100))
     min_edges = int(config.get("quality", {}).get("min_graph_edges", 150))
     max_missing = float(config.get("quality", {}).get("max_core_pudo_missing_rate", 0.05))
-    endpoint = str(config.get("overpass", {}).get("endpoint", "https://overpass-api.de/api/interpreter"))
-    timeout_s = int(config.get("overpass", {}).get("timeout_s", 180))
+    overpass_cfg = dict(config.get("overpass", {}) or {})
+    timeout_s = int(overpass_cfg.get("timeout_s", 180))
     _write_source_preflight_report(config, cities, external_root, prepared_root, source_policy, dry_run)
 
     scene_dirs: Dict[str, Path] = {}
@@ -223,12 +275,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
 
     if "download" in stages or "all" in stages:
         download_cities = list(_progress(cities, f"{split_name}: overpass download", disable_tqdm))
-        for idx, city in enumerate(download_cities):
-            q = external_root / "osm" / "queries" / f"{city}_sidewalks.overpassql"
-            out = external_root / "osm" / f"{city}_sidewalks.json"
-            _download_overpass(q, out, endpoint, dry_run)
-            if not dry_run and idx + 1 < len(download_cities):
-                time.sleep(float(config.get("overpass", {}).get("sleep_s", 8)))
+        _run_external_fetcher(external_root, download_cities, overpass_cfg, dry_run)
 
     for city in _progress(cities, f"{split_name}: extract/graphs/pudo", disable_tqdm):
         city_cfg = config["cities"][city]

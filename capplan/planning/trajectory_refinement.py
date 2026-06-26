@@ -161,7 +161,13 @@ def refine_trajectory(skeleton: PassengerCompleteSkeleton | None, route_length_m
 
 
 class CapPlanNuPlanPlanner:  # pragma: no cover - import wrapper depends on nuPlan
-    """Thin nuPlan planner wrapper stub with clear runtime errors when unavailable."""
+    """Thin nuPlan planner adapter.
+
+    The wrapper keeps the repository importable without nuPlan while allowing a
+    real CapPlan planner implementation to be injected by nuPlan simulation
+    scripts.  It does not silently fabricate ego trajectories: when no planner
+    implementation is provided, it fails with an explicit integration error.
+    """
 
     def __init__(self, capplan_planner: Any | None = None) -> None:
         try:
@@ -177,6 +183,28 @@ class CapPlanNuPlanPlanner:  # pragma: no cover - import wrapper depends on nuPl
         self.map_api = getattr(initialization, "map_api", None)
         self.route_roadblock_ids = getattr(initialization, "route_roadblock_ids", [])
         self.mission_goal = getattr(initialization, "mission_goal", None)
+        if self.capplan_planner is not None and hasattr(self.capplan_planner, "initialize"):
+            self.capplan_planner.initialize(initialization)
 
     def compute_planner_trajectory(self, current_input: Any) -> Any:
-        raise RuntimeError("nuPlan closed-loop trajectory generation must be run inside a configured nuPlan simulation; this smoke environment did not execute it")
+        if self.capplan_planner is None:
+            raise RuntimeError(
+                "CapPlanNuPlanPlanner requires an injected CapPlan planner that returns "
+                "a nuPlan AbstractTrajectory/InterpolatedTrajectory. The repository's "
+                "paper-mode evaluation can import nuPlan vehicle metrics, but direct "
+                "ego-control simulation still needs the concrete planner implementation."
+            )
+        if hasattr(self.capplan_planner, "compute_planner_trajectory"):
+            return self.capplan_planner.compute_planner_trajectory(current_input)
+        if hasattr(self.capplan_planner, "plan"):
+            planned = self.capplan_planner.plan(
+                current_input=current_input,
+                map_api=self.map_api,
+                route_roadblock_ids=self.route_roadblock_ids,
+                mission_goal=self.mission_goal,
+            )
+            return getattr(planned, "trajectory", planned)
+        raise RuntimeError(
+            "Injected CapPlan planner must implement compute_planner_trajectory(current_input) "
+            "or plan(current_input=..., map_api=..., route_roadblock_ids=..., mission_goal=...)."
+        )
