@@ -76,7 +76,7 @@ cities:
     # Keeping only train_vegas_2 under-samples the city and biases the
     # benchmark slice; the preparation script skips non-existing DB files at the
     # glob/adapter layer, so all three should be listed in the canonical config.
-    db_dirs: [train_vegas_2]
+    db_dirs: [train_vegas_0, train_vegas_1, train_vegas_2]
     map_names: [us-nv-las-vegas-strip]
     bbox: [36.07, -115.23, 36.20, -115.10]
     georeference_json: configs/georeference.vegas.json

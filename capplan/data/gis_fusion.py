@@ -12,6 +12,7 @@ import csv
 import json
 import math
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -298,6 +299,10 @@ def _boolish(v: Any) -> Optional[bool]:
     return None
 
 
+def _warn_skip_external(path: Path, reason: str) -> None:
+    print(f"[warn] skipping external GIS source {path}: {reason}", file=sys.stderr)
+
+
 def _read_any(path: str | Path | None) -> List[Dict[str, Any]]:
     if not path:
         return []
@@ -310,17 +315,36 @@ def _read_any(path: str | Path | None) -> List[Dict[str, Any]]:
             if child.suffix.lower() in {".json", ".geojson", ".jsonl", ".yaml", ".yml", ".csv"}:
                 rows.extend(_read_any(child))
         return rows
+    if p.stat().st_size == 0:
+        _warn_skip_external(p, "empty file")
+        return []
     if p.suffix.lower() == ".jsonl":
-        return [dict(x) for x in read_jsonl(p)]
+        try:
+            return [dict(x) for x in read_jsonl(p)]
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            _warn_skip_external(p, f"invalid JSONL ({exc})")
+            return []
     if p.suffix.lower() == ".csv":
         with p.open("r", encoding="utf-8", newline="") as f:
             return [dict(r) for r in csv.DictReader(f)]
     if p.suffix.lower() in {".yaml", ".yml"}:
         if yaml is None:
             raise RuntimeError("pyyaml is required to read YAML files")
-        payload = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        try:
+            payload = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except (UnicodeDecodeError, yaml.YAMLError) as exc:
+            _warn_skip_external(p, f"invalid YAML ({exc})")
+            return []
     else:
-        payload = load_json(p)
+        try:
+            payload = load_json(p)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # Public-data portals sometimes return HTML/403/429 pages or leave
+            # zero-byte placeholders at a .geojson/.json path. These sources are
+            # optional in bootstrap mode, so skip them and let downstream quality
+            # reports expose the missing evidence instead of crashing early.
+            _warn_skip_external(p, f"invalid JSON ({exc})")
+            return []
     if isinstance(payload, dict):
         if payload.get("type") == "FeatureCollection" and isinstance(payload.get("features"), list):
             return [dict(x) for x in payload["features"]]
