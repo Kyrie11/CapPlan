@@ -334,7 +334,8 @@ class NuPlanAdapter:
             except Exception:
                 tl = []
             tls.append({"iteration": it, "statuses": [str(x) for x in (tl or [])]})
-        route_len = self._estimate_route_length(route_ids, map_api)
+        route_polyline = self._extract_route_polyline(route_ids, map_api, pose0, mission_goal)
+        route_len = self._estimate_route_length(route_ids, map_api, route_polyline)
         stable = hashlib.sha1(f"{log_name}:{token}".encode()).hexdigest()[:12]
         eid = f"nuplan_{stable}"
         if not map_name or not token or not log_name:
@@ -354,7 +355,7 @@ class NuPlanAdapter:
             ego_history=ego_hist,
             agent_history=agents,
             traffic_light_history=tls,
-            route_corridor={"roadblock_ids": list(route_ids), "length_m": route_len, "polyline": [[pose0.x, pose0.y], [mission_goal.x, mission_goal.y]] if mission_goal else []},
+            route_corridor={"roadblock_ids": list(route_ids), "length_m": route_len, "polyline": route_polyline, "polyline_source": "nuplan_map_api_baseline" if len(route_polyline) > 2 else "ego_to_mission_goal_fallback"},
             timestamps_s=times,
             metadata={"source": "nuplan", "data_root": self.data_root, "db_files": self.db_files},
         )
@@ -410,19 +411,162 @@ class NuPlanAdapter:
         return objs
 
     @staticmethod
-    def _estimate_route_length(route_ids: List[str], map_api: Any) -> float:
-        # Prefer conservative real map lengths if available, otherwise derive a
-        # nonzero route length from the number of roadblocks without inventing map
-        # geometry.  Missing route IDs are rejected before this method.
+    def _xy_from_any_point(obj: Any) -> tuple[float, float] | None:
+        if obj is None:
+            return None
+        for attr in ["point", "center", "rear_axle"]:
+            if hasattr(obj, attr):
+                obj = getattr(obj, attr)
+                break
+        x = safe_call(obj, ["x"], None)
+        y = safe_call(obj, ["y"], None)
+        if x is None or y is None:
+            return None
+        try:
+            return float(x), float(y)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _points_from_baseline_path(path: Any) -> List[List[float]]:
+        if path is None:
+            return []
+        raw = safe_call(path, ["discrete_path", "get_discrete_path", "points"], None)
+        if callable(raw):
+            try:
+                raw = raw()
+            except Exception:
+                raw = None
+        pts: List[List[float]] = []
+        for p in raw or []:
+            xy = NuPlanAdapter._xy_from_any_point(p)
+            if xy is not None:
+                pts.append([xy[0], xy[1]])
+        if not pts:
+            # Some devkit objects expose a linestring-like geometry.
+            geom = safe_call(path, ["linestring", "geometry"], None)
+            coords = safe_call(geom, ["coords"], None)
+            for p in coords or []:
+                try:
+                    pts.append([float(p[0]), float(p[1])])
+                except Exception:
+                    continue
+        return pts
+
+    @staticmethod
+    def _map_object_candidates(map_api: Any, object_id: str) -> List[Any]:
+        if map_api is None:
+            return []
+        layer_candidates: List[Any] = [None]
+        try:
+            from nuplan.common.maps.maps_datatypes import SemanticMapLayer  # type: ignore
+            for name in ["ROADBLOCK", "ROADBLOCK_CONNECTOR", "LANE", "LANE_CONNECTOR"]:
+                if hasattr(SemanticMapLayer, name):
+                    layer_candidates.append(getattr(SemanticMapLayer, name))
+        except Exception:
+            pass
+        out: List[Any] = []
+        for layer in layer_candidates:
+            try:
+                obj = map_api.get_map_object(object_id, layer)
+            except Exception:
+                try:
+                    obj = map_api.get_map_object(object_id)
+                except Exception:
+                    obj = None
+            if obj is not None and obj not in out:
+                out.append(obj)
+        return out
+
+    @staticmethod
+    def _points_from_map_object(obj: Any) -> List[List[float]]:
+        pts: List[List[float]] = []
+        # Roadblocks usually contain interior lanes; lane objects usually contain a baseline path.
+        children = []
+        for name in ["interior_edges", "interior_edge_ids", "lanes", "lane_connectors"]:
+            val = safe_call(obj, [name], None)
+            if callable(val):
+                try:
+                    val = val()
+                except Exception:
+                    val = None
+            if val:
+                children.extend(list(val))
+        for child in children:
+            bl = safe_call(child, ["baseline_path"], None)
+            pts.extend(NuPlanAdapter._points_from_baseline_path(bl))
+        if pts:
+            return pts
+        bl = safe_call(obj, ["baseline_path"], None)
+        pts.extend(NuPlanAdapter._points_from_baseline_path(bl))
+        if pts:
+            return pts
+        # Last resort: use polygon exterior/centroid for a coarse but map-derived corridor.
+        poly = safe_call(obj, ["polygon", "geometry"], None)
+        exterior = safe_call(poly, ["exterior"], None)
+        coords = safe_call(exterior, ["coords"], None)
+        for p in coords or []:
+            try:
+                pts.append([float(p[0]), float(p[1])])
+            except Exception:
+                continue
+        if not pts:
+            c = NuPlanAdapter._xy_from_any_point(safe_call(poly, ["centroid"], None))
+            if c is not None:
+                pts.append([c[0], c[1]])
+        return pts
+
+    @staticmethod
+    def _dedupe_polyline(points: List[List[float]], eps: float = 0.25) -> List[List[float]]:
+        out: List[List[float]] = []
+        for p in points:
+            if not out or math.hypot(float(p[0]) - out[-1][0], float(p[1]) - out[-1][1]) > eps:
+                out.append([float(p[0]), float(p[1])])
+        return out
+
+    @staticmethod
+    def _extract_route_polyline(route_ids: List[str], map_api: Any, pose0: Pose2D, mission_goal: Pose2D | None) -> List[List[float]]:
+        pts: List[List[float]] = []
+        for rid in route_ids:
+            candidates = NuPlanAdapter._map_object_candidates(map_api, str(rid))
+            obj_pts: List[List[float]] = []
+            for obj in candidates:
+                obj_pts = NuPlanAdapter._points_from_map_object(obj)
+                if len(obj_pts) >= 2:
+                    break
+            if obj_pts:
+                # Keep route order by flipping a new segment if needed.
+                if pts and len(obj_pts) >= 2:
+                    d0 = math.hypot(obj_pts[0][0] - pts[-1][0], obj_pts[0][1] - pts[-1][1])
+                    d1 = math.hypot(obj_pts[-1][0] - pts[-1][0], obj_pts[-1][1] - pts[-1][1])
+                    if d1 < d0:
+                        obj_pts = list(reversed(obj_pts))
+                pts.extend(obj_pts)
+        pts = NuPlanAdapter._dedupe_polyline(pts)
+        if len(pts) >= 2:
+            return pts
+        if mission_goal is not None:
+            return [[pose0.x, pose0.y], [mission_goal.x, mission_goal.y]]
+        return [[pose0.x, pose0.y]]
+
+    @staticmethod
+    def _polyline_length(points: List[List[float]]) -> float:
+        return sum(math.hypot(float(b[0])-float(a[0]), float(b[1])-float(a[1])) for a, b in zip(points[:-1], points[1:]))
+
+    @staticmethod
+    def _estimate_route_length(route_ids: List[str], map_api: Any, route_polyline: List[List[float]] | None = None) -> float:
+        # Prefer real route polyline length; otherwise try baseline path lengths and
+        # finally a conservative nonzero roadblock-count fallback.
+        poly_len = NuPlanAdapter._polyline_length(route_polyline or [])
+        if poly_len > 0:
+            return poly_len
         total = 0.0
         if map_api is not None:
             for rid in route_ids:
-                try:
-                    obj = map_api.get_map_object(rid, None)
+                for obj in NuPlanAdapter._map_object_candidates(map_api, str(rid)):
                     bl = safe_call(obj, ["baseline_path"], None)
                     length = safe_call(bl, ["length"], None)
                     if length:
                         total += float(length)
-                except Exception:
-                    continue
+                        break
         return total if total > 0 else max(100.0, 120.0 * len(route_ids))

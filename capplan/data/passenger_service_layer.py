@@ -106,6 +106,27 @@ def bind_service_request_to_graph(request: Dict[str, Any], graph: AccessibilityG
     return origin, destination
 
 
+
+
+def bind_bootstrap_service_request_to_graph(request: Dict[str, Any], graph: AccessibilityGraph) -> tuple[EntranceAnchor, EntranceAnchor]:
+    """Bind diagnostic OD requests to graph nodes even when they are not entrances.
+
+    This is only for bootstrap/debugging runs with incomplete city entrance data.
+    Paper-mode callers must use ``bind_service_request_to_graph``.
+    """
+    eid = str(request["episode_id"])
+    oid = str(request["origin_entrance_id"])
+    did = str(request["destination_entrance_id"])
+    on = _node_by_id(graph, oid)
+    dn = _node_by_id(graph, did)
+    if on is None or dn is None:
+        missing = [x for x, n in [(oid, on), (did, dn)] if n is None]
+        raise ValueError(f"bootstrap service request {request.get('request_id')} references missing node(s) in graph {graph.episode_id}: {missing}")
+    origin = EntranceAnchor(oid, eid, "origin_entrance", Pose2D(on.x, on.y, on.pose.heading if on.pose else 0.0, on.pose.frame if on.pose else "map"), oid, min(float(on.confidence), float(request.get("origin_confidence", 1.0))), str(on.source or request.get("source")))
+    destination = EntranceAnchor(did, eid, "destination_entrance", Pose2D(dn.x, dn.y, dn.pose.heading if dn.pose else 0.0, dn.pose.frame if dn.pose else "map"), did, min(float(dn.confidence), float(request.get("destination_confidence", 1.0))), str(dn.source or request.get("source")))
+    return origin, destination
+
+
 def load_fleet_interfaces(path: str | Path) -> Dict[str, List[VehicleInterface]]:
     by_ep: Dict[str, List[VehicleInterface]] = {}
     for row in _read_records(path):

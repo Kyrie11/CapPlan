@@ -62,9 +62,12 @@ class CoordinateTransformer:
     Supported config forms:
     - `{origin_lat, origin_lon, origin_heading_deg}` for local ENU tangent plane.
     - `{source_crs, local_crs}` or `{wgs84_crs, local_crs}` when pyproj is installed.
+    - `{local_crs, projected_map_frame: true}` when the nuPlan map frame is already
+      the projected CRS, e.g. Boston scenes stored as UTM easting/northing metres.
 
-    The tangent-plane mode is sufficient for scenario-sized bboxes.  For city-scale
-    production builds, pass a projected CRS such as EPSG:269xx / EPSG:326xx.
+    The tangent-plane mode is sufficient for scenario-sized local ENU bboxes.  For
+    nuPlan DB-set builds, prefer an explicit projected CRS and set
+    `projected_map_frame=true` when scene poses are projected absolute metres.
     """
 
     def __init__(self, config: Dict[str, Any] | None = None) -> None:
@@ -80,14 +83,24 @@ class CoordinateTransformer:
         self._projected_origin_y = 0.0
         local_crs = self.config.get("local_crs") or self.config.get("projected_crs") or self.config.get("target_crs")
         wgs84_crs = self.config.get("wgs84_crs") or self.config.get("source_crs") or "EPSG:4326"
+        mode = str(self.config.get("map_frame") or self.config.get("transform_mode") or "").lower()
+        self.projected_map_frame = bool(self.config.get("projected_map_frame", False)) or mode in {"projected", "utm", "projected_absolute", "nuplan_projected"}
         if local_crs and _PyprojTransformer is not None:
             self._to_local = _PyprojTransformer.from_crs(wgs84_crs, local_crs, always_xy=True)
             self._to_wgs84 = _PyprojTransformer.from_crs(local_crs, wgs84_crs, always_xy=True)
-            # pyproj returns coordinates in the projected CRS, not in the nuPlan
-            # map frame. Honour origin_x/origin_y/heading as an explicit affine
-            # alignment layer, otherwise projected CRS metres are silently mixed
-            # with local nuPlan map metres.
-            if self.config.get("projected_origin_x") is not None and self.config.get("projected_origin_y") is not None:
+            # pyproj returns coordinates in the projected CRS.  Some nuPlan maps
+            # store scene poses directly in that projected CRS (Boston looks like
+            # UTM 19N: ~330k, ~4.69M).  In that case we must NOT subtract a city
+            # origin, otherwise all GIS features become local ENU values around
+            # zero and episode crops become empty.  Use an affine layer only when
+            # the config explicitly describes a local map frame.
+            if self.projected_map_frame:
+                self._projected_origin_x = 0.0
+                self._projected_origin_y = 0.0
+                self.origin_x = 0.0
+                self.origin_y = 0.0
+                self.heading = 0.0
+            elif self.config.get("projected_origin_x") is not None and self.config.get("projected_origin_y") is not None:
                 self._projected_origin_x = float(self.config.get("projected_origin_x") or 0.0)
                 self._projected_origin_y = float(self.config.get("projected_origin_y") or 0.0)
             elif self.config.get("origin_lat") is not None and self.config.get("origin_lon") is not None:

@@ -202,7 +202,9 @@ def _spatial_diagnostics(scene: Any, features: Sequence[Any], transformer: Coord
         "local_bbox_overlaps_scene_bbox": _bbox_overlap(getattr(scene, "bbox", None), local_bbox),
         "georeference_validated": bool(transformer.config.get("validated", False)),
         "georeference_description": transformer.config.get("description"),
-        "hint": "0 cropped features usually means the WGS84->nuPlan map georeference is not aligned, or the Overpass/city-GIS bbox does not cover this nuPlan map/scenario.",
+        "local_crs": transformer.config.get("local_crs") or transformer.config.get("projected_crs") or transformer.config.get("target_crs"),
+        "projected_map_frame": bool(getattr(transformer, "projected_map_frame", False)),
+        "hint": "0 cropped features usually means the WGS84->nuPlan map georeference is not aligned, or the Overpass/city-GIS bbox does not cover this nuPlan map/scenario. For nuPlan DB-set maps whose scene poses look like UTM/easting-northing coordinates, set local_crs and projected_map_frame=true.",
     }
 
 def _build_prepared(args: argparse.Namespace) -> Dict[str, Any]:

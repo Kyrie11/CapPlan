@@ -18,6 +18,7 @@ from capplan.data.label_oracle import IndependentLabelOracle
 from capplan.data.nuplan_adapter import NuPlanAdapter
 from capplan.data.pudo_interface_layer import PUDOGenerator, synthetic_vehicle_interface, vehicle_interface_profiles
 from capplan.data.passenger_service_layer import (
+    bind_bootstrap_service_request_to_graph,
     bind_service_request_to_graph,
     load_fleet_interfaces,
     load_service_requests_by_episode,
@@ -365,7 +366,10 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--strict", action="store_true")
     p.add_argument("--disable_tqdm", action="store_true", help="Disable preprocessing progress bars.")
+    p.add_argument("--allow_bootstrap_service_nodes", action="store_true", help="Bootstrap-only: allow service OD anchors on non-entrance graph nodes. Paper mode always rejects this.")
     args = p.parse_args()
+    if args.paper_mode and args.allow_bootstrap_service_nodes:
+        raise RuntimeError("paper_mode rejects --allow_bootstrap_service_nodes")
     if args.paper_mode:
         # Reject proxy entries by default in paper mode even if the explicit flags were omitted.
         args.reject_proxy_entrances = True
@@ -435,7 +439,12 @@ def main() -> None:
             request = requests[0]
             service_request_records.append(dict(request))
             graph = acc_builder.build(eid, seed=ep.seed)
-            origin, destination = bind_service_request_to_graph(request, graph)
+            try:
+                origin, destination = bind_service_request_to_graph(request, graph)
+            except ValueError:
+                if args.paper_mode or not args.allow_bootstrap_service_nodes:
+                    raise
+                origin, destination = bind_bootstrap_service_request_to_graph(request, graph)
             ep.origin_anchor = origin.anchor_id
             ep.destination_anchor = destination.anchor_id
             ep.request_time_s = float(request.get("request_time_s", ep.request_time_s))

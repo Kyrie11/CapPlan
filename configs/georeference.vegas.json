@@ -1,10 +1,14 @@
 {
-  "description": "Initial Las Vegas georeference for AbilityBench GIS fusion. Validate against nuPlan map control points before publication-scale experiments.",
+  "description": "UTM zone 11N absolute metres for nuPlan Las Vegas map-frame alignment. Validate final paper runs against map/control-point diagnostics.",
   "validated": false,
   "origin_lat": 36.1147,
   "origin_lon": -115.1728,
   "origin_x": 0.0,
   "origin_y": 0.0,
   "origin_heading_deg": 0.0,
-  "wgs84_crs": "EPSG:4326"
+  "wgs84_crs": "EPSG:4326",
+  "local_crs": "EPSG:32611",
+  "projected_map_frame": true,
+  "map_frame": "projected_absolute",
+  "validation_policy": "diagnostic_overlap_required; manual_control_points_recommended_for_publication"
 }

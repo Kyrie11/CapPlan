@@ -18,7 +18,9 @@ def _fail_paper_if_mock(args: argparse.Namespace) -> None:
     if args.paper_mode and args.trajectory_mode != "nuplan_closed_loop":
         raise RuntimeError("paper_mode closed-loop evaluation requires --trajectory_mode nuplan_closed_loop; mock_strict is smoke-only")
     if args.paper_mode and not args.nuplan_sim_config:
-        raise RuntimeError("paper_mode closed-loop evaluation requires --nuplan_sim_config pointing to a configured nuPlan simulation config")
+        dataset_dir = Path(args.dataset_dir)
+        if not (dataset_dir / "nuplan_vehicle_metrics.jsonl").exists():
+            raise RuntimeError("paper_mode closed-loop evaluation requires either --nuplan_sim_config or dataset_dir/nuplan_vehicle_metrics.jsonl exported from a nuPlan simulation run")
     if args.paper_mode and args.casa_mode != "learned":
         raise RuntimeError("paper_mode closed-loop evaluation requires --casa_mode learned with a trained CASA checkpoint")
     if args.paper_mode and not args.casa_checkpoint:

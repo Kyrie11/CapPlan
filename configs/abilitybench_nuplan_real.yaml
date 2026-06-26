@@ -17,6 +17,9 @@ outputs_root: outputs
 fleet_jsonl: configs/fleet.abilitybench.example.jsonl
 
 quality:
+  # bootstrap lets you build a real-data diagnostic dataset with fail-closed missing evidence.
+  # Use --source_policy paper once OpenSidewalks/city GIS/curb/entrance/DEM sources are present.
+  source_policy: bootstrap
   min_graph_nodes: 100
   min_graph_edges: 150
   max_core_pudo_missing_rate: 0.05

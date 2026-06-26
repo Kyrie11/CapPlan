@@ -62,16 +62,54 @@ def _motion_stats(points: List[Tuple[float, float, float]]) -> Dict[str, float]:
     return {"peak_accel_mps2": max(accels or [0.0]), "peak_jerk_mps3": max(jerks or [0.0])}
 
 
+def _normalise_external_vehicle_metrics(metrics: Dict[str, Any], route_length_m: float) -> Dict[str, Any]:
+    """Convert imported nuPlan closed-loop metrics to the trajectory schema.
+
+    This function intentionally does not simulate in-process.  It consumes
+    metrics materialized by a nuPlan simulation/evaluation runner, which keeps
+    CapPlan's passenger-complete evaluation independent from the heavy nuPlan
+    runtime while still preventing paper runs from silently using mock motion.
+    """
+    route_completion = float(metrics.get("route_completion", metrics.get("rc", metrics.get("RC", 0.0))) or 0.0)
+    route_completion = max(0.0, min(1.0, route_completion))
+    collision = bool(metrics.get("collision", metrics.get("collisions", 0)))
+    drivable_area = bool(metrics.get("drivable_area", metrics.get("drivable_area_compliance", True)))
+    rule_violation = bool(metrics.get("rule_violation", metrics.get("traffic_rule_violation", metrics.get("trv", False))))
+    distance = float(metrics.get("distance_m", metrics.get("vehicle_distance_m", route_length_m * route_completion)) or 0.0)
+    travel_time = float(metrics.get("travel_time_s", metrics.get("tt_s", metrics.get("TT", max(1.0, route_length_m / 8.0)))) or 0.0)
+    out = {
+        "available": True,
+        "vehicle_evaluated": True,
+        "external_nuplan_metrics": True,
+        "points": metrics.get("trajectory_points", []),
+        "collision": collision,
+        "drivable_area": drivable_area,
+        "rule_compliance": not rule_violation,
+        "rule_violation": rule_violation,
+        "route_completion": route_completion,
+        "route_completion_baseline": float(metrics.get("route_completion_baseline", route_completion)),
+        "distance_m": distance,
+        "travel_time_s": travel_time,
+    }
+    for k in ["motion_exposure", "peak_accel_mps2", "peak_jerk_mps3"]:
+        if k in metrics:
+            out[k] = float(metrics[k])
+    return out
+
+
 def refine_trajectory(skeleton: PassengerCompleteSkeleton | None, route_length_m: float = 4000.0, mode: str = "mock_strict", scene_context: Dict[str, Any] | None = None) -> Dict[str, Any]:
     scene_context = scene_context or {}
     if mode == "placeholder":
         raise RuntimeError("placeholder trajectory mode cannot be used for paper metrics; use mock_strict or nuplan_closed_loop")
     if mode == "nuplan_closed_loop":
+        metrics = scene_context.get("nuplan_vehicle_metrics") or scene_context.get("external_vehicle_metrics")
+        if isinstance(metrics, dict) and metrics:
+            return _normalise_external_vehicle_metrics(metrics, route_length_m)
         try:
             import nuplan  # type: ignore  # noqa:F401
         except Exception as e:
-            raise RuntimeError("trajectory_mode=nuplan_closed_loop requested, but nuPlan is unavailable; vehicle_evaluated=False") from e
-        raise RuntimeError("nuPlan closed-loop wrapper is present but was not run in this environment; use a configured nuPlan simulation runner")
+            raise RuntimeError("trajectory_mode=nuplan_closed_loop requested, but no imported nuPlan vehicle metrics were found and nuPlan is unavailable; vehicle_evaluated=False") from e
+        raise RuntimeError("trajectory_mode=nuplan_closed_loop requires imported nuPlan vehicle metrics in dataset_dir/nuplan_vehicle_metrics.jsonl or an integrated nuPlan simulation runner")
     if mode != "mock_strict":
         raise ValueError(f"unknown trajectory mode {mode}")
 

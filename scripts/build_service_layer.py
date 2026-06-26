@@ -71,11 +71,15 @@ def _load_nodes(graph_dir: Path, eid: str) -> List[AccessibilityNode]:
     return [node_from_dict(x) for x in read_jsonl(f)]
 
 
-def _entrance_nodes(nodes: Sequence[AccessibilityNode]) -> List[AccessibilityNode]:
+def _entrance_nodes(nodes: Sequence[AccessibilityNode], allow_non_entrance_od: bool = False) -> List[AccessibilityNode]:
     entrances = [n for n in nodes if n.kind in {"entrance", "origin_entrance", "destination_entrance", "transit_stop"}]
-    if len(entrances) < 2:
-        raise RuntimeError("service layer generation requires at least two real entrance/transit_stop nodes per episode")
-    return entrances
+    if len(entrances) >= 2:
+        return entrances
+    if allow_non_entrance_od:
+        fallback = [n for n in nodes if n.kind in {"sidewalk", "crossing", "curb", "curb_ramp", "pudo"}]
+        if len(fallback) >= 2:
+            return fallback
+    raise RuntimeError("service layer generation requires at least two real entrance/transit_stop nodes per episode; use --allow_non_entrance_od only for bootstrap diagnostics, not paper experiments")
 
 
 def _three_layer_profiles(source: str = "calibrated_three_layer_profiles") -> List[Dict[str, Any]]:
@@ -187,7 +191,7 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
     rows: List[Dict[str, Any]] = []
     for eid in episode_ids:
         nodes = _load_nodes(graph_dir, str(eid))
-        entrances = _entrance_nodes(nodes)
+        entrances = _entrance_nodes(nodes, allow_non_entrance_od=args.allow_non_entrance_od)
         for i in range(args.num_requests_per_episode):
             o, d = _choose_od(entrances, rng)
             pid = str(profile_mix[(i + rng.randrange(len(profile_mix))) % len(profile_mix)])
@@ -207,6 +211,7 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
                 "demand_weight": float(cfg.get("default_demand_weight", 1.0)),
                 "modifiers": dict(cfg.get("modifiers", {})),
                 "source": args.source_name,
+                "bootstrap_non_entrance_od": bool(args.allow_non_entrance_od and o.kind not in {"entrance", "origin_entrance", "destination_entrance", "transit_stop"}),
             })
     return rows
 
@@ -278,6 +283,7 @@ def main() -> None:
     p.add_argument("--num_requests_per_episode", type=int, default=3)
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--source_name", default="calibrated_service_layer")
+    p.add_argument("--allow_non_entrance_od", action="store_true", help="Bootstrap-only: sample OD from sidewalk/curb nodes if entrance nodes are absent. Not valid for paper-mode datasets.")
     p.add_argument("--report_json", default=None)
     args = p.parse_args()
     print(json.dumps(build(args), indent=2, sort_keys=True))
