@@ -29,7 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 CITY_SPECS: Dict[str, Dict[str, Any]] = {
     "boston": {
@@ -88,8 +88,11 @@ OVERPASS_ENDPOINTS = [
 ]
 
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 AbilityBenchExternalFetcher/0.2 (+https://openstreetmap.org)",
-    "Accept": "application/geo+json, application/json, text/csv, */*",
+    # Keep the Accept header conservative. Some Overpass instances have returned
+    # HTTP 406 to Python clients when the Accept list asks for formats they do
+    # not negotiate, even though the query itself is valid.
+    "User-Agent": "AbilityBenchExternalFetcher/0.3 (contact: local-research-script; https://www.openstreetmap.org/)",
+    "Accept": "application/json, */*;q=0.8",
 }
 
 
@@ -124,7 +127,8 @@ def http_get(url: str, timeout: int = 180) -> bytes:
 
 def http_post(url: str, data: Dict[str, str], timeout: int = 300) -> bytes:
     encoded = urllib.parse.urlencode(data).encode("utf-8")
-    req = urllib.request.Request(url, data=encoded, headers=HTTP_HEADERS)
+    headers = {**HTTP_HEADERS, "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
+    req = urllib.request.Request(url, data=encoded, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - user-run data fetch utility
         return resp.read()
 
@@ -192,6 +196,53 @@ out skel qt;
 """.strip()
 
 
+def split_bbox(bbox: List[float], grid_n: int) -> List[List[float]]:
+    """Split [south, west, north, east] into grid_n x grid_n sub-bboxes."""
+    if grid_n <= 1:
+        return [bbox]
+    south, west, north, east = [float(x) for x in bbox]
+    out: List[List[float]] = []
+    for iy in range(grid_n):
+        s = south + (north - south) * iy / grid_n
+        n = south + (north - south) * (iy + 1) / grid_n
+        for ix in range(grid_n):
+            w = west + (east - west) * ix / grid_n
+            e = west + (east - west) * (ix + 1) / grid_n
+            out.append([s, w, n, e])
+    return out
+
+
+def _merge_overpass_payloads(payloads: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge tiled Overpass JSON responses while de-duplicating OSM ids."""
+    merged: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+    generators: Set[str] = set()
+    for payload in payloads:
+        if payload.get("generator"):
+            generators.add(str(payload["generator"]))
+        for el in payload.get("elements", []) or []:
+            key = (str(el.get("type")), el.get("id"))
+            # Prefer the richer record when the same way/node appears in adjacent tiles.
+            prev = merged.get(key)
+            if prev is None or len(json.dumps(el, sort_keys=True, default=str)) > len(json.dumps(prev, sort_keys=True, default=str)):
+                merged[key] = dict(el)
+    return {
+        "version": 0.6,
+        "generator": "+".join(sorted(generators)) or "AbilityBenchExternalFetcher tiled Overpass",
+        "elements": list(merged.values()),
+    }
+
+
+def _fetch_overpass_payload(city: str, bbox: List[float], endpoint: str, timeout_s: int) -> Dict[str, Any]:
+    query = overpass_query(bbox, timeout_s)
+    payload = http_post(endpoint, {"data": query}, timeout=max(timeout_s + 30, 300))
+    if _looks_like_html_or_error(payload):
+        raise RuntimeError("Overpass returned empty/HTML/error response")
+    obj = json.loads(payload.decode("utf-8"))
+    if not isinstance(obj, dict) or "elements" not in obj:
+        raise RuntimeError(f"Overpass response for {city} is not an OSM JSON object with elements")
+    return obj
+
+
 def _validate_existing_json(path: Path, required_key: str | None = None) -> bool:
     if not path.exists() or path.stat().st_size == 0:
         return False
@@ -202,31 +253,55 @@ def _validate_existing_json(path: Path, required_key: str | None = None) -> bool
     return required_key is None or (isinstance(obj, dict) and required_key in obj)
 
 
-def download_overpass(city: str, spec: Dict[str, Any], endpoint: str, timeout_s: int, force: bool, retries: int = 3) -> Path:
+def download_overpass(city: str, spec: Dict[str, Any], endpoint: str, timeout_s: int, force: bool, retries: int = 3, grid_n: int = 1) -> Path:
     out = ROOT / "osm" / f"{city}_sidewalks.json"
     if out.exists() and not force:
         if _validate_existing_json(out, "elements"):
             log(f"[skip] {out}")
             return out
         log(f"[warn] existing Overpass file is invalid; re-downloading: {out}")
-    query = overpass_query(spec["bbox"], timeout_s)
     endpoints = [endpoint] + [e for e in OVERPASS_ENDPOINTS if e != endpoint]
+    bboxes = split_bbox(spec["bbox"], max(1, int(grid_n)))
     last_error: Exception | None = None
     for attempt in range(max(1, retries)):
         ep = endpoints[attempt % len(endpoints)]
         try:
-            log(f"[overpass] {city} via {ep} -> {out}")
-            payload = http_post(ep, {"data": query}, timeout=max(timeout_s + 30, 300))
-            if _looks_like_html_or_error(payload):
-                raise RuntimeError("Overpass returned empty/HTML/error response")
-            obj = json.loads(payload.decode("utf-8"))
-            if not isinstance(obj, dict) or "elements" not in obj:
-                raise RuntimeError(f"Overpass response for {city} is not an OSM JSON object with elements")
+            log(f"[overpass] {city} via {ep}, tiles={len(bboxes)} -> {out}")
+            tile_payloads: List[Dict[str, Any]] = []
+            for ti, tile_bbox in enumerate(bboxes, start=1):
+                if len(bboxes) > 1:
+                    log(f"[overpass] {city} tile {ti}/{len(bboxes)} bbox={tile_bbox}")
+                tile_payloads.append(_fetch_overpass_payload(city, tile_bbox, ep, timeout_s))
+                # Keep public Overpass instances happy. Even within one retry attempt,
+                # tiled queries should be paced.
+                if len(bboxes) > 1 and ti < len(bboxes):
+                    time.sleep(1.5)
+            obj = _merge_overpass_payloads(tile_payloads)
             out.parent.mkdir(parents=True, exist_ok=True)
             tmp = out.with_suffix(out.suffix + ".tmp")
-            tmp.write_bytes(payload)
+            tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
             tmp.replace(out)
             return out
+        except urllib.error.HTTPError as e:
+            last_error = e
+            # 406 is often recoverable by lowering the claimed resource footprint:
+            # retry once in the same attempt with an automatically finer grid.
+            if e.code == 406 and grid_n <= 1:
+                try:
+                    finer = 3
+                    log(f"[warn] Overpass HTTP 406 for {city}; retrying once with {finer}x{finer} tiled bbox on {ep}")
+                    tile_payloads = [_fetch_overpass_payload(city, b, ep, max(60, timeout_s // 2)) for b in split_bbox(spec["bbox"], finer)]
+                    obj = _merge_overpass_payloads(tile_payloads)
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = out.with_suffix(out.suffix + ".tmp")
+                    tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+                    tmp.replace(out)
+                    return out
+                except Exception as e2:  # continue to normal endpoint retry sequence
+                    last_error = e2
+            sleep_s = min(60.0, 5.0 * (2 ** attempt))
+            log(f"[warn] Overpass attempt {attempt + 1}/{retries} failed for {city}: {last_error}; retrying after {sleep_s:.1f}s")
+            time.sleep(sleep_s)
         except Exception as e:
             last_error = e
             sleep_s = min(60.0, 5.0 * (2 ** attempt))
@@ -573,7 +648,7 @@ def fetch_city(city: str, args: argparse.Namespace) -> Dict[str, Any]:
         if not osm_path.exists():
             raise FileNotFoundError(f"--skip_overpass requested but {osm_path} does not exist")
     else:
-        osm_path = download_overpass(city, spec, args.overpass_endpoint, args.overpass_timeout_s, args.force, args.overpass_retries)
+        osm_path = download_overpass(city, spec, args.overpass_endpoint, args.overpass_timeout_s, args.force, args.overpass_retries, args.overpass_grid_n)
         if args.overpass_sleep_s > 0:
             time.sleep(args.overpass_sleep_s)
     osw, curbs, entrances = osm_to_geojson_and_evidence(city, osm_path)
@@ -601,6 +676,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overpass_timeout_s", type=int, default=300)
     p.add_argument("--overpass_sleep_s", type=float, default=8.0)
     p.add_argument("--overpass_retries", type=int, default=4)
+    p.add_argument("--overpass_grid_n", type=int, default=1, help="split each city bbox into N x N smaller Overpass queries; use 2 or 3 when public instances reject large requests")
     p.add_argument("--skip_overpass", action="store_true", help="reuse existing osm/<city>_sidewalks.json")
     p.add_argument("--skip_municipal", action="store_true", help="download only OSM-derived sources")
     p.add_argument("--force", action="store_true")
