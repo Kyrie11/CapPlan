@@ -25,6 +25,7 @@ class CASASample:
     y_phase: int
     y_demand: List[float]
     demand_mask: List[float]
+    y_availability: float = 1.0
 
 
 class CASADataset:
@@ -71,7 +72,7 @@ class CASADataset:
                 y_value = max(0.0, min(1.0, t.completion_value))
                 y_phase = self.vocab.phases.index(t.to_phase) if t.to_phase in self.vocab.phases else 0
                 yd, ym = self._demand_target(t)
-                self.samples.append(CASASample(t.transition_id, t.episode_id, "__transition_only__", encode_transition_with_capability(t, [], self.vocab), y_edge, y_value, y_phase, yd, ym))
+                self.samples.append(CASASample(t.transition_id, t.episode_id, "__transition_only__", encode_transition_with_capability(t, [], self.vocab), y_edge, y_value, y_phase, yd, ym, max(0.0, min(1.0, float(t.availability)))))
                 continue
             for contract in contracts:
                 compiled = self.compiler.compile(contract, trip_context=contract.metadata.get("trip_modifiers", {}))
@@ -90,7 +91,7 @@ class CASADataset:
                     y_value = 0.0
                 y_phase = self.vocab.phases.index(t.to_phase) if t.to_phase in self.vocab.phases else 0
                 yd, ym = self._demand_target(t)
-                self.samples.append(CASASample(t.transition_id, t.episode_id, contract.passenger_id, encode_transition_with_capability(t, compiled.tokens, self.vocab), y_edge, y_value, y_phase, yd, ym))
+                self.samples.append(CASASample(t.transition_id, t.episode_id, contract.passenger_id, encode_transition_with_capability(t, compiled.tokens, self.vocab), y_edge, y_value, y_phase, yd, ym, max(0.0, min(1.0, float(t.availability)))))
 
     def _read_split(self, split: str) -> set[str]:
         p = self.dataset_dir / "splits" / f"{split}_episodes.txt"
@@ -126,3 +127,8 @@ class CASADataset:
         y_demand = np.array([s.y_demand for s in self.samples], dtype=np.float32)
         demand_mask = np.array([s.demand_mask for s in self.samples], dtype=np.float32)
         return x, y_edge, y_value, y_phase, y_demand, demand_mask
+
+    def arrays_with_availability(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        x, y_edge, y_value, y_phase, y_demand, demand_mask = self.arrays_full()
+        y_availability = np.array([s.y_availability for s in self.samples], dtype=np.float32)
+        return x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability

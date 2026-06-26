@@ -76,11 +76,24 @@ class CoordinateTransformer:
         self.heading = math.radians(float(self.config.get("origin_heading_deg", self.config.get("heading_deg", 0.0)) or 0.0))
         self._to_local = None
         self._to_wgs84 = None
+        self._projected_origin_x = 0.0
+        self._projected_origin_y = 0.0
         local_crs = self.config.get("local_crs") or self.config.get("projected_crs") or self.config.get("target_crs")
         wgs84_crs = self.config.get("wgs84_crs") or self.config.get("source_crs") or "EPSG:4326"
         if local_crs and _PyprojTransformer is not None:
             self._to_local = _PyprojTransformer.from_crs(wgs84_crs, local_crs, always_xy=True)
             self._to_wgs84 = _PyprojTransformer.from_crs(local_crs, wgs84_crs, always_xy=True)
+            # pyproj returns coordinates in the projected CRS, not in the nuPlan
+            # map frame. Honour origin_x/origin_y/heading as an explicit affine
+            # alignment layer, otherwise projected CRS metres are silently mixed
+            # with local nuPlan map metres.
+            if self.config.get("projected_origin_x") is not None and self.config.get("projected_origin_y") is not None:
+                self._projected_origin_x = float(self.config.get("projected_origin_x") or 0.0)
+                self._projected_origin_y = float(self.config.get("projected_origin_y") or 0.0)
+            elif self.config.get("origin_lat") is not None and self.config.get("origin_lon") is not None:
+                ox, oy = self._to_local.transform(self.origin_lon, self.origin_lat)
+                self._projected_origin_x = float(ox)
+                self._projected_origin_y = float(oy)
 
     @classmethod
     def from_file(cls, path: str | Path | None) -> "CoordinateTransformer":
@@ -97,10 +110,22 @@ class CoordinateTransformer:
             data = json.loads(p.read_text(encoding="utf-8"))
         return cls(data)
 
+    def _projected_to_map(self, px: float, py: float) -> Tuple[float, float]:
+        c, s = math.cos(self.heading), math.sin(self.heading)
+        dx = float(px) - self._projected_origin_x
+        dy = float(py) - self._projected_origin_y
+        return self.origin_x + c * dx + s * dy, self.origin_y - s * dx + c * dy
+
+    def _map_to_projected(self, x: float, y: float) -> Tuple[float, float]:
+        c, s = math.cos(self.heading), math.sin(self.heading)
+        dx = c * (float(x) - self.origin_x) - s * (float(y) - self.origin_y)
+        dy = s * (float(x) - self.origin_x) + c * (float(y) - self.origin_y)
+        return self._projected_origin_x + dx, self._projected_origin_y + dy
+
     def wgs84_to_local(self, lon: float, lat: float) -> Tuple[float, float]:
         if self._to_local is not None:
-            x, y = self._to_local.transform(lon, lat)
-            return float(x), float(y)
+            px, py = self._to_local.transform(lon, lat)
+            return self._projected_to_map(float(px), float(py))
         lat0 = math.radians(self.origin_lat)
         dx = math.radians(lon - self.origin_lon) * EARTH_RADIUS_M * math.cos(lat0)
         dy = math.radians(lat - self.origin_lat) * EARTH_RADIUS_M
@@ -112,7 +137,8 @@ class CoordinateTransformer:
 
     def local_to_wgs84(self, x: float, y: float) -> Tuple[float, float]:
         if self._to_wgs84 is not None:
-            lon, lat = self._to_wgs84.transform(x, y)
+            px, py = self._map_to_projected(x, y)
+            lon, lat = self._to_wgs84.transform(px, py)
             return float(lon), float(lat)
         c, s = math.cos(self.heading), math.sin(self.heading)
         dx = c * (x - self.origin_x) - s * (y - self.origin_y)
@@ -224,12 +250,22 @@ def _feature_tags(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _looks_wgs84(points: Sequence[Sequence[float]], tags: Dict[str, Any]) -> bool:
-    frame = str(tags.get("frame") or tags.get("crs") or "").lower()
-    if "wgs" in frame or "epsg:4326" in frame:
+    frame = str(tags.get("frame") or tags.get("crs") or tags.get("coordinate_frame") or "").lower()
+    if "wgs" in frame or "epsg:4326" in frame or frame in {"lonlat", "longlat", "latlon"}:
         return True
+    if frame in {"map", "local", "nuplan", "projected", "utm"} or frame.startswith("epsg:"):
+        return False
     if not points:
         return False
-    return all(abs(float(p[0])) <= 180 and abs(float(p[1])) <= 90 for p in points[:5]) and bool(tags.get("lon") or tags.get("lat") or tags.get("longitude") or tags.get("latitude"))
+    lonlat_like = all(abs(float(p[0])) <= 180 and abs(float(p[1])) <= 90 for p in points[:5])
+    if not lonlat_like:
+        return False
+    if bool(tags.get("lon") or tags.get("lat") or tags.get("longitude") or tags.get("latitude")):
+        return True
+    # OpenSidewalks / municipal JSON exports often provide raw coordinate lists
+    # without per-feature CRS tags. Treat real-world lon/lat-looking values as
+    # WGS84 unless the feature explicitly declares a local/projected frame.
+    return any(abs(float(p[0])) > 30 or abs(float(p[1])) > 30 for p in points[:5])
 
 
 def _classify_kind(tags: Dict[str, Any], geometry: List[List[float]]) -> str:

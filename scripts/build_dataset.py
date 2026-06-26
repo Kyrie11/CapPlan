@@ -193,6 +193,21 @@ def _apply_pudo_evidence_overrides(anchors: List[PUDOAnchor], evidence: Dict[tup
     return updated
 
 
+def _as_bool_field(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in {"true", "1", "yes", "y", "t", "legal", "allowed"}:
+        return True
+    if s in {"false", "0", "no", "n", "f", "illegal", "not_allowed", "disallowed", "none"}:
+        return False
+    return default
+
+
 def _pose_from_evidence_row(row: Dict[str, Any], prefix: str = "curb") -> Pose2D:
     """Parse a curb/stop pose from an audited PUDO evidence row.
 
@@ -243,7 +258,7 @@ def _pudo_anchors_from_evidence_rows(evidence: Dict[tuple[str | None, str], Dict
             curb_pose=curb_pose,
             stop_pose=stop_pose,
             side=str(row.get("side", "unknown")),
-            legal_stop=bool(row.get("legal_stop", row.get("vehicle_stop_feasible", False))),
+            legal_stop=_as_bool_field(row.get("legal_stop", row.get("vehicle_stop_feasible", False)), default=False),
             legal_stop_source=str(row.get("legal_stop_source") or row.get("regulation_id") or row.get("curb_regulation_source") or source),
             roadblock_id=row.get("roadblock_id"),
             lane_id=row.get("lane_id"),

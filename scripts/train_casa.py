@@ -47,7 +47,7 @@ def _save_checkpoint(path: Path, payload: Dict[str, Any]) -> None:
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
-def _metrics_from_predictions(edge_prob, y_edge, value_prob, y_value, phase_prob, y_phase, demand_pred, y_demand, demand_mask, edge_pos_weight: float, mode: str, device: str, num_val: int, uncertainty_pred=None) -> Dict[str, Any]:
+def _metrics_from_predictions(edge_prob, y_edge, value_prob, y_value, phase_prob, y_phase, demand_pred, y_demand, demand_mask, edge_pos_weight: float, mode: str, device: str, num_val: int, uncertainty_pred=None, availability_pred=None, availability_target=None) -> Dict[str, Any]:
     losses = casa_loss(edge_prob, y_edge, value_prob, y_value, uncertainty=uncertainty_pred if uncertainty_pred is not None else np.ones_like(edge_prob) * 0.1, phase_pred=phase_prob, phase_target=y_phase, demand_pred=demand_pred, demand_target=y_demand, demand_mask=demand_mask)
     pred_edge_binary = edge_prob >= 0.5
     true_edge_binary = y_edge >= 0.5
@@ -59,6 +59,8 @@ def _metrics_from_predictions(edge_prob, y_edge, value_prob, y_value, phase_prob
     recall = tp / max(tp + fn, 1)
     specificity = tn / max(tn + fp, 1)
     f1 = (2 * precision * recall / max(precision + recall, 1e-9))
+    if availability_pred is not None and availability_target is not None:
+        losses["L_availability"] = float(np.mean((availability_pred - availability_target) ** 2))
     return {
         **losses,
         "edge_accuracy": float(np.mean(pred_edge_binary == true_edge_binary)),
@@ -75,7 +77,7 @@ def _metrics_from_predictions(edge_prob, y_edge, value_prob, y_value, phase_prob
     }
 
 
-def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, edge_pos_weight, vocab, out, device):
+def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device):
     input_dim = x.shape[1]
     mean = x.mean(axis=0)
     std = x.std(axis=0) + 1e-6
@@ -87,6 +89,7 @@ def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, y
     W_value = np.zeros(input_dim, dtype=np.float32); b_value = np.float32(0.0)
     W_phase = np.zeros((input_dim, n_phase), dtype=np.float32); b_phase = np.zeros(n_phase, dtype=np.float32)
     W_demand = np.zeros((input_dim, n_res), dtype=np.float32); b_demand = np.zeros(n_res, dtype=np.float32)
+    W_availability = np.zeros(input_dim, dtype=np.float32); b_availability = np.float32(0.0)
     metrics_rows = []
     for epoch in range(1, args.epochs + 1):
         idx = np.arange(len(xn)); np.random.shuffle(idx)
@@ -94,9 +97,10 @@ def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, y
             batch = idx[start:start + max(1, args.batch_size)]
             xb = xn[batch]
             ye = y_edge[batch]; yv = y_value[batch]; yp = y_phase[batch]
-            yd = y_demand[batch]; m = demand_mask[batch]
+            yd = y_demand[batch]; m = demand_mask[batch]; ya = y_availability[batch]
             pe = _sigmoid(xb @ W_edge + b_edge)
             pv = _sigmoid(xb @ W_value + b_value)
+            pa = _sigmoid(xb @ W_availability + b_availability)
             pp = _softmax(xb @ W_phase + b_phase)
             pd = xb @ W_demand + b_demand
             edge_w = np.where(ye >= 0.5, edge_pos_weight, 1.0).astype(np.float32)
@@ -107,28 +111,33 @@ def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, y
             gp /= len(batch)
             denom = max(float(np.sum(m)), 1.0)
             gd = 2.0 * (pd - yd) * m / denom
+            ga = (pa - ya) / len(batch)
             W_edge -= args.lr * (xb.T @ ge); b_edge -= args.lr * ge.sum()
             W_value -= args.lr * (xb.T @ gv); b_value -= args.lr * gv.sum()
+            W_availability -= args.lr * (xb.T @ ga); b_availability -= args.lr * ga.sum()
             W_phase -= args.lr * (xb.T @ gp); b_phase -= args.lr * gp.sum(axis=0)
             W_demand -= args.lr * (xb.T @ gd); b_demand -= args.lr * gd.sum(axis=0)
-        metrics_rows.append({"epoch": epoch, **casa_loss(_sigmoid(xn @ W_edge + b_edge), y_edge, _sigmoid(xn @ W_value + b_value), y_value, phase_pred=_softmax(xn @ W_phase + b_phase), phase_target=y_phase, demand_pred=xn @ W_demand + b_demand, demand_target=y_demand, demand_mask=demand_mask)})
+        epoch_losses = casa_loss(_sigmoid(xn @ W_edge + b_edge), y_edge, _sigmoid(xn @ W_value + b_value), y_value, phase_pred=_softmax(xn @ W_phase + b_phase), phase_target=y_phase, demand_pred=xn @ W_demand + b_demand, demand_target=y_demand, demand_mask=demand_mask)
+        epoch_losses["L_availability"] = float(np.mean((_sigmoid(xn @ W_availability + b_availability) - y_availability) ** 2))
+        metrics_rows.append({"epoch": epoch, **epoch_losses})
     val_edge = _sigmoid(xvn @ W_edge + b_edge)
     val_value = _sigmoid(xvn @ W_value + b_value)
     val_phase = _softmax(xvn @ W_phase + b_phase)
     val_demand = xvn @ W_demand + b_demand
+    val_availability = _sigmoid(xvn @ W_availability + b_availability)
     val_uncertainty = np.ones_like(val_edge) * 0.1
-    val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv), uncertainty_pred=val_uncertainty)
+    val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv), uncertainty_pred=val_uncertainty, availability_pred=val_availability, availability_target=yv_availability)
     checkpoint = {
         "mode": args.casa_mode,
         "model_type": "linear_smoke" if args.model_type == "linear_smoke" else f"{args.model_type}_numpy_surrogate",
-        "weights": {"W_edge": W_edge.tolist(), "b_edge": float(b_edge), "W_value": W_value.tolist(), "b_value": float(b_value), "W_phase": W_phase.tolist(), "b_phase": b_phase.tolist(), "W_demand": W_demand.tolist(), "b_demand": b_demand.tolist(), "mean": mean.tolist(), "std": std.tolist()},
+        "weights": {"W_edge": W_edge.tolist(), "b_edge": float(b_edge), "W_value": W_value.tolist(), "b_value": float(b_value), "W_phase": W_phase.tolist(), "b_phase": b_phase.tolist(), "W_demand": W_demand.tolist(), "b_demand": b_demand.tolist(), "W_availability": W_availability.tolist(), "b_availability": float(b_availability), "mean": mean.tolist(), "std": std.tolist()},
         "input_dim": int(input_dim), "vocab": vocab.to_dict(), "config": {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight)},
     }
     _save_checkpoint(out / "checkpoint.pt", checkpoint)
     return metrics_rows, val_metrics, checkpoint
 
 
-def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, edge_pos_weight, vocab, out, device):
+def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device):
     import torch
     import torch.nn.functional as F
     from capplan.models.casa_torch import CASAHetGraphNet
@@ -143,6 +152,7 @@ def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, y
     Yp = torch.tensor(y_phase, dtype=torch.long, device=device)
     Yd = torch.tensor(y_demand, dtype=torch.float32, device=device)
     M = torch.tensor(demand_mask, dtype=torch.float32, device=device)
+    Ya = torch.tensor(y_availability, dtype=torch.float32, device=device)
     metrics_rows = []
     pos_weight = torch.tensor(float(edge_pos_weight), dtype=torch.float32, device=device)
     for epoch in range(1, args.epochs + 1):
@@ -154,13 +164,16 @@ def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, y
             value_loss = F.mse_loss(outp["value"], Yv[b])
             phase_loss = F.cross_entropy(outp["phase_logits"], Yp[b])
             demand_loss = (((outp["typed_demand"] - Yd[b]) ** 2) * M[b]).sum() / torch.clamp(M[b].sum(), min=1.0)
+            availability_loss = F.mse_loss(outp["availability"], Ya[b])
             sigma_edge = outp["uncertainty"].mean(dim=1)
             cal_loss = torch.relu(torch.abs(torch.sigmoid(outp["edge_logits"]) - Ye[b]) - sigma_edge).mean() + 0.001 * sigma_edge.mean()
-            loss = phase_loss + edge_loss + demand_loss + cal_loss + value_loss
+            loss = phase_loss + edge_loss + demand_loss + cal_loss + value_loss + availability_loss
             opt.zero_grad(); loss.backward(); opt.step()
         with torch.no_grad():
             pred = model(X)
-            metrics_rows.append({"epoch": epoch, **casa_loss(torch.sigmoid(pred["edge_logits"]).cpu().numpy(), y_edge, pred["value"].cpu().numpy(), y_value, uncertainty=pred["uncertainty"].mean(dim=1).cpu().numpy(), phase_pred=torch.softmax(pred["phase_logits"], dim=1).cpu().numpy(), phase_target=y_phase, demand_pred=pred["typed_demand"].cpu().numpy(), demand_target=y_demand, demand_mask=demand_mask)})
+            epoch_losses = casa_loss(torch.sigmoid(pred["edge_logits"]).cpu().numpy(), y_edge, pred["value"].cpu().numpy(), y_value, uncertainty=pred["uncertainty"].mean(dim=1).cpu().numpy(), phase_pred=torch.softmax(pred["phase_logits"], dim=1).cpu().numpy(), phase_target=y_phase, demand_pred=pred["typed_demand"].cpu().numpy(), demand_target=y_demand, demand_mask=demand_mask)
+            epoch_losses["L_availability"] = float(F.mse_loss(pred["availability"], Ya).detach().cpu())
+            metrics_rows.append({"epoch": epoch, **epoch_losses})
     with torch.no_grad():
         XV = torch.tensor(xvn, dtype=torch.float32, device=device)
         predv = model(XV)
@@ -168,8 +181,9 @@ def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, y
         val_value = predv["value"].cpu().numpy()
         val_phase = torch.softmax(predv["phase_logits"], dim=1).cpu().numpy()
         val_demand = predv["typed_demand"].cpu().numpy()
+        val_availability = predv["availability"].cpu().numpy()
     val_uncertainty = predv["uncertainty"].mean(dim=1).cpu().numpy()
-    val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv), uncertainty_pred=val_uncertainty)
+    val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv), uncertainty_pred=val_uncertainty, availability_pred=val_availability, availability_target=yv_availability)
     checkpoint = {
         "mode": args.casa_mode,
         "model_type": f"casa_{args.model_type}_multihead",
@@ -225,15 +239,15 @@ def main() -> None:
     val = CASADataset(args.dataset_dir, "val", vocab)
     if not train.samples:
         raise RuntimeError(f"no CASA training samples found in {args.dataset_dir}")
-    x, y_edge, y_value, y_phase, y_demand, demand_mask = train.arrays_full()
-    xv, yv_edge, yv_value, yv_phase, yv_demand, vmask = val.arrays_full() if val.samples else train.arrays_full()
+    x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability = train.arrays_with_availability()
+    xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability = val.arrays_with_availability() if val.samples else train.arrays_with_availability()
     device = _device_auto(args.device)
     pos = float(np.sum(y_edge >= 0.5)); neg = float(len(y_edge) - pos)
     edge_pos_weight = (neg / max(pos, 1.0)) if str(args.edge_pos_weight).lower() == "auto" else max(0.0, float(args.edge_pos_weight))
     if args.model_type == "linear_smoke":
-        metrics_rows, val_metrics, checkpoint = _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, edge_pos_weight, vocab, out, device)
+        metrics_rows, val_metrics, checkpoint = _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device)
     else:
-        metrics_rows, val_metrics, checkpoint = _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, edge_pos_weight, vocab, out, device)
+        metrics_rows, val_metrics, checkpoint = _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device)
     if args.paper_mode and (val_metrics.get("L_phase", 0.0) <= 0.0 or val_metrics.get("L_demand", 0.0) <= 0.0):
         raise RuntimeError(f"paper_mode requires non-zero L_phase and L_demand; got L_phase={val_metrics.get('L_phase')} L_demand={val_metrics.get('L_demand')}")
     dump_json(out / "vocab.json", vocab.to_dict())

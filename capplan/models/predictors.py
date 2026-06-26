@@ -109,7 +109,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             return [(xi - float(mu)) / max(float(si), 1e-6) for xi, mu, si in zip(x, mean, std)]
         return x
 
-    def _predict_heads(self, transition: CandidateTransition, context: Dict[str, Any] | None = None) -> tuple[float | None, float | None, Dict[str, float] | None, Dict[str, float] | None]:
+    def _predict_heads(self, transition: CandidateTransition, context: Dict[str, Any] | None = None) -> tuple[float | None, float | None, float | None, Dict[str, float] | None, Dict[str, float] | None]:
         x = self._normalized_features(transition, context)
         if self._torch_model is not None:
             try:  # pragma: no cover - depends on torch
@@ -118,20 +118,25 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                     pred = self._torch_model(torch.tensor([x], dtype=torch.float32))
                     edge_prob = float(torch.sigmoid(pred["edge_logits"])[0].cpu())
                     value_prob = float(pred["value"][0].cpu())
+                    availability_prob = float(pred.get("availability", torch.ones_like(pred["value"]))[0].cpu())
                     demand = {r: float(pred["typed_demand"][0, i].cpu()) for i, r in enumerate(self.vocab.resources[: pred["typed_demand"].shape[1]])}
                     unc = {r: float(pred["uncertainty"][0, i].cpu()) for i, r in enumerate(self.vocab.resources[: pred["uncertainty"].shape[1]])}
-                    return edge_prob, value_prob, demand, unc
+                    return edge_prob, value_prob, max(0.0, min(1.0, availability_prob)), demand, unc
             except Exception:
                 pass
         edge_logit = self._dot(self.weights.get("W_edge"), x)
         value_logit = self._dot(self.weights.get("W_value"), x)
+        availability_logit = self._dot(self.weights.get("W_availability"), x)
         if edge_logit is not None:
             edge_logit += float(self.weights.get("b_edge", 0.0))
         if value_logit is not None:
             value_logit += float(self.weights.get("b_value", 0.0))
+        if availability_logit is not None:
+            availability_logit += float(self.weights.get("b_availability", 0.0))
         edge_prob = self._sigmoid(edge_logit) if edge_logit is not None else None
         value_prob = self._sigmoid(value_logit) if value_logit is not None else None
-        return edge_prob, value_prob, None, None
+        availability_prob = self._sigmoid(availability_logit) if availability_logit is not None else None
+        return edge_prob, value_prob, availability_prob, None, None
 
     def predict(self, transitions: List[CandidateTransition], context: Dict[str, Any] | None = None) -> Dict[str, TransitionPrediction]:
         out: Dict[str, TransitionPrediction] = {}
@@ -147,7 +152,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                 e.tests.interface_valid,
                 e.tests.dynamically_available,
             ])
-            edge_prob, value_prob, demand_pred, unc_pred = self._predict_heads(e, context)
+            edge_prob, value_prob, availability_prob, demand_pred, unc_pred = self._predict_heads(e, context)
             typed_evidence = e.resource_evidence
             if demand_pred:
                 # Replace numeric evidence values with learned demand predictions
@@ -158,11 +163,14 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                 edge_prob = 1.0 if test_ok else 0.05
             if value_prob is None:
                 value_prob = e.completion_value
-            # Learned edge validity is a soft availability prior.  Symbolic tests
-            # remain hard gates in the searcher, so the model cannot make an
-            # invalid edge valid, but it can deprioritize/close a low-probability
-            # edge when a checkpoint is actually supplied.
-            availability = e.availability * max(0.0, min(1.0, float(edge_prob))) if test_ok else min(e.availability, 0.1)
+            if availability_prob is None:
+                availability_prob = 1.0
+            # Learned edge validity and learned dynamic availability are both
+            # soft priors. Symbolic tests remain hard gates in the searcher, so
+            # a checkpoint cannot make an invalid edge valid, but it can
+            # deprioritize low-probability or currently unavailable transitions.
+            soft_prior = min(max(0.0, min(1.0, float(edge_prob))), max(0.0, min(1.0, float(availability_prob))))
+            availability = e.availability * soft_prior if test_ok else min(e.availability, 0.1)
             value = max(1e-4, min(1.0, float(value_prob)))
             out[e.transition_id] = TransitionPrediction(
                 transition_id=e.transition_id,

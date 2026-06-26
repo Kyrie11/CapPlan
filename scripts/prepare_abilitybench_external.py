@@ -15,6 +15,12 @@ try:
 except Exception:  # pragma: no cover - dependency is installed via requirements.txt
     yaml = None
 
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover - tqdm is optional in bare environments
+    def tqdm(iterable=None, **kwargs):  # type: ignore
+        return iterable if iterable is not None else []
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from capplan.utils.serialization import read_jsonl, write_jsonl
@@ -50,6 +56,11 @@ def _run(cmd: List[str], dry_run: bool) -> None:
     print(rendered)
     if not dry_run:
         subprocess.check_call(cmd, cwd=PROJECT_ROOT)
+
+
+def _progress(items: Iterable[str], desc: str, disable: bool = False):
+    seq = list(items)
+    return seq if disable else tqdm(seq, desc=desc, unit="city")
 
 
 def _write_overpass_query(city: str, city_cfg: Dict[str, Any], out_dir: Path, timeout_s: int) -> Path:
@@ -122,7 +133,7 @@ def _add_source_arg(cmd: List[str], flag: str, path: Path, dry_run: bool, requir
         print(f"skip missing optional source {flag}={path}")
 
 
-def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dry_run: bool) -> None:
+def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dry_run: bool, disable_tqdm: bool = False) -> None:
     nuplan = config["nuplan"]
     external_root = _path(config.get("external_root", "/data0/senzeyu2/dataset/abilitybench_external"))
     outputs_root = _path(config.get("outputs_root", "outputs"))
@@ -146,19 +157,20 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
 
     if "queries" in stages or "all" in stages or "download" in stages:
         qdir = external_root / "osm" / "queries"
-        for city in cities:
+        for city in _progress(cities, f"{split_name}: overpass queries", disable_tqdm):
             q = _write_overpass_query(city, config["cities"][city], qdir, timeout_s)
             print(f"wrote {q}")
 
     if "download" in stages or "all" in stages:
-        for idx, city in enumerate(cities):
+        download_cities = list(_progress(cities, f"{split_name}: overpass download", disable_tqdm))
+        for idx, city in enumerate(download_cities):
             q = external_root / "osm" / "queries" / f"{city}_sidewalks.overpassql"
             out = external_root / "osm" / f"{city}_sidewalks.json"
             _download_overpass(q, out, endpoint, dry_run)
-            if not dry_run and idx + 1 < len(cities):
+            if not dry_run and idx + 1 < len(download_cities):
                 time.sleep(float(config.get("overpass", {}).get("sleep_s", 8)))
 
-    for city in cities:
+    for city in _progress(cities, f"{split_name}: extract/graphs/pudo", disable_tqdm):
         city_cfg = config["cities"][city]
         scene_dir = prepared_root / "scene_contexts" / city
         scene_dirs[city] = scene_dir
@@ -218,7 +230,11 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--source_name",
                 f"{city}_osm_opensidewalks_citygis_dem",
                 "--fail_on_synthetic",
+                "--diagnostic_report_json",
+                str(prepared_root / "graph_spatial_diagnostics.json"),
             ]
+            if disable_tqdm:
+                cmd.append("--disable_tqdm")
             _add_source_arg(cmd, "--osm_source", osm_source, dry_run, required=True)
             _add_source_arg(cmd, "--opensidewalks_source", opensidewalks, dry_run)
             _add_source_arg(cmd, "--city_gis_dir", city_gis, dry_run)
@@ -290,7 +306,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             dry_run,
         )
 
-    for city in cities:
+    for city in _progress(cities, f"{split_name}: dataset build", disable_tqdm):
         city_cfg = config["cities"][city]
         city_db_dirs = split_cfg.get("db_dirs") or city_cfg.get("db_dirs")
         city_map_names = _split_csv(city_cfg.get("map_names"))
@@ -346,8 +362,9 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--output_dir",
                 str(city_dataset),
                 "--strict",
-                "--disable_tqdm",
             ]
+            if disable_tqdm:
+                cmd.append("--disable_tqdm")
             if city_map_names:
                 cmd.extend(["--nuplan_map_names", city_map_names])
             _run(cmd, dry_run)
@@ -374,9 +391,10 @@ def main() -> None:
     p.add_argument("--split", choices=["train", "val"], default="train")
     p.add_argument("--stages", default="all", help="Comma list: queries,download,extract,graphs,pudo,service,dataset,merge,all")
     p.add_argument("--dry_run", action="store_true", help="Print commands without executing them.")
+    p.add_argument("--disable_tqdm", action="store_true", help="Disable city/stage and dataset progress bars.")
     args = p.parse_args()
     stages = {x.strip() for x in args.stages.split(",") if x.strip()}
-    build_pipeline(_load_config(args.config), args.split, stages, args.dry_run)
+    build_pipeline(_load_config(args.config), args.split, stages, args.dry_run, args.disable_tqdm)
 
 
 if __name__ == "__main__":
