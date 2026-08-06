@@ -1,109 +1,125 @@
-# Real-data AbilityBench-AV preparation config.
-# Paths are set for the server layout described in the user request.
-# The georeference files are intentionally explicit and should be validated with
-# nuPlan map control points before reporting final paper numbers.
+# AbilityBench-AV real-data preparation config.
+# Every downloaded/derived artifact is rooted under /home/senzeyu2/code/CapPlan/data
+# when the repository is located at /home/senzeyu2/code/CapPlan.
 
 seed: 13
 num_workers: 0
 
 nuplan:
-  data_root: /data0/senzeyu2/dataset/nuplan/data/cache
-  db_root: /data0/senzeyu2/dataset/nuplan/data/cache
-  map_root: /data0/senzeyu2/dataset/nuplan/maps
+  # Official nuPlan layout:
+  # data/nuplan/nuplan-v1.1/splits/{mini,trainval,test,...}/*.db
+  # data/nuplan/maps/nuplan-maps-v1.0/<map-name>/*.gpkg
+  data_root: "{project_root}/data/nuplan"
+  db_root: "{project_root}/data/nuplan/nuplan-v1.1/splits"
+  map_root: "{project_root}/data/nuplan/maps"
   map_version: nuplan-maps-v1.0
 
-external_root: /data0/senzeyu2/dataset/abilitybench_external
-outputs_root: outputs
-fleet_jsonl: configs/fleet.abilitybench.example.jsonl
+external_root: "{project_root}/data/external"
+outputs_root: "{project_root}/data/outputs"
+# Replace this with measured/verified vehicle interfaces for paper results.
+fleet_jsonl: "{project_root}/data/external/normalized/fleet/vehicle_interfaces.jsonl"
 
 quality:
-  # bootstrap lets you build a real-data diagnostic dataset with fail-closed missing evidence.
-  # Use --source_policy paper once OpenSidewalks/city GIS/curb/entrance/DEM sources are present.
+  # bootstrap: real nuPlan + at least one pedestrian topology source; missing
+  # attributes remain unknown/fail-closed.  Not valid for main paper results.
+  # paper: validated CRS + physical curb inventory + curb legality + entrances
+  # + slope/elevation + authoritative/audited evidence + provenance manifests.
   source_policy: bootstrap
   min_graph_nodes: 100
   min_graph_edges: 150
   max_core_pudo_missing_rate: 0.05
 
 service:
-  num_requests_per_episode: 3
+  # Counterfactual profiles should be increased for final experiments.
+  num_requests_per_episode: 6
 
 pudo:
   candidate_radius_m: 120
 
 overpass:
+  # Explicit `download` stage only; `all` never triggers online scraping.
   endpoint: https://overpass-api.de/api/interpreter
-  # The fetcher rotates endpoints per tile and caches successful tiles. This is
-  # important for Singapore / other dense regions where public Overpass instances
-  # may return 429 or TLS/proxy errors mid-city.
-  endpoint_pool: https://overpass-api.de/api/interpreter,https://overpass.kumi.systems/api/interpreter,https://overpass.openstreetmap.ru/api/interpreter,https://overpass.osm.ch/api/interpreter
   timeout_s: 180
-  sleep_s: 20
-  tile_sleep_s: 6
-  retries: 6
-  grid_n: 3
+  sleep_s: 12
 
 splits:
   train:
     cities: [boston, pittsburgh, vegas, singapore]
+    db_dirs: [trainval]
     max_scenarios_per_city: 1000
   val:
+    # Do not treat a second run over the same DB set as an independent split.
+    # build_dataset.py now creates non-overlapping log-grouped train/val/test
+    # files within each built dataset.  Use explicit nuplan_log_names here only
+    # when you maintain an external frozen split manifest.
     cities: [boston, pittsburgh, vegas, singapore]
-    db_dirs: [val]
+    db_dirs: [trainval]
     max_scenarios_per_city: 250
 
 cities:
   boston:
-    db_dirs: [train_boston]
     map_names: [us-ma-boston]
     bbox: [42.30, -71.15, 42.42, -70.98]
-    georeference_json: configs/georeference.boston.json
-    osm_source: /data0/senzeyu2/dataset/abilitybench_external/osm/boston_sidewalks.json
-    opensidewalks_source: /data0/senzeyu2/dataset/abilitybench_external/opensidewalks/boston.geojson
-    city_gis_dir: /data0/senzeyu2/dataset/abilitybench_external/city_gis/boston
-    curb_inventory_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_inventory/boston.jsonl
-    curb_regulation_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_regulations/boston.jsonl
-    entrance_source: /data0/senzeyu2/dataset/abilitybench_external/entrances/boston.geojson
-    elevation_source: /data0/senzeyu2/dataset/abilitybench_external/dem/boston.jsonl
+    georeference_json: "{project_root}/data/external/georeference/boston.json"
+    osm_source: "{project_root}/data/external/normalized/osm/boston_sidewalks.geojson"
+    opensidewalks_source: "{project_root}/data/external/normalized/opensidewalks/boston.geojson"
+    city_gis_dir: "{project_root}/data/external/normalized/city_gis/boston"
+    city_gis_authoritative: true
+    city_gis_has_pedestrian_topology: true
+    curb_inventory_jsonl: "{project_root}/data/external/normalized/curb_inventory/boston.jsonl"
+    curb_regulation_jsonl: "{project_root}/data/external/normalized/curb_regulations/boston.jsonl"
+    entrance_source: "{project_root}/data/external/normalized/entrances/boston.geojson"
+    elevation_source: "{project_root}/data/external/normalized/dem/boston.jsonl"
+    manual_audit_manifest: "{project_root}/data/external/audits/boston/manual_audit_manifest.jsonl"
+    provenance_manifest: "{project_root}/data/external/manifests/boston.json"
 
   pittsburgh:
-    db_dirs: [train_pittsburgh]
     map_names: [us-pa-pittsburgh-hazelwood]
     bbox: [40.38, -80.04, 40.48, -79.88]
-    georeference_json: configs/georeference.pittsburgh.json
-    osm_source: /data0/senzeyu2/dataset/abilitybench_external/osm/pittsburgh_sidewalks.json
-    opensidewalks_source: /data0/senzeyu2/dataset/abilitybench_external/opensidewalks/pittsburgh.geojson
-    city_gis_dir: /data0/senzeyu2/dataset/abilitybench_external/city_gis/pittsburgh
-    curb_inventory_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_inventory/pittsburgh.jsonl
-    curb_regulation_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_regulations/pittsburgh.jsonl
-    entrance_source: /data0/senzeyu2/dataset/abilitybench_external/entrances/pittsburgh.geojson
-    elevation_source: /data0/senzeyu2/dataset/abilitybench_external/dem/pittsburgh.jsonl
+    georeference_json: "{project_root}/data/external/georeference/pittsburgh.json"
+    osm_source: "{project_root}/data/external/normalized/osm/pittsburgh_sidewalks.geojson"
+    opensidewalks_source: "{project_root}/data/external/normalized/opensidewalks/pittsburgh.geojson"
+    city_gis_dir: "{project_root}/data/external/normalized/city_gis/pittsburgh"
+    # Fail closed by default. Set true only after the directory contains official WPRDC/City layers or add a manual audit manifest.
+    city_gis_authoritative: false
+    city_gis_has_pedestrian_topology: false
+    curb_inventory_jsonl: "{project_root}/data/external/normalized/curb_inventory/pittsburgh.jsonl"
+    curb_regulation_jsonl: "{project_root}/data/external/normalized/curb_regulations/pittsburgh.jsonl"
+    entrance_source: "{project_root}/data/external/normalized/entrances/pittsburgh.geojson"
+    elevation_source: "{project_root}/data/external/normalized/dem/pittsburgh.jsonl"
+    manual_audit_manifest: "{project_root}/data/external/audits/pittsburgh/manual_audit_manifest.jsonl"
+    provenance_manifest: "{project_root}/data/external/manifests/pittsburgh.json"
 
   vegas:
-    # nuPlan Vegas training shards are split across train_vegas_0/1/2.
-    # Keeping only train_vegas_2 under-samples the city and biases the
-    # benchmark slice; the preparation script skips non-existing DB files at the
-    # glob/adapter layer, so all three should be listed in the canonical config.
-    db_dirs: [train_vegas_0, train_vegas_1, train_vegas_2]
     map_names: [us-nv-las-vegas-strip]
     bbox: [36.07, -115.23, 36.20, -115.10]
-    georeference_json: configs/georeference.vegas.json
-    osm_source: /data0/senzeyu2/dataset/abilitybench_external/osm/vegas_sidewalks.json
-    opensidewalks_source: /data0/senzeyu2/dataset/abilitybench_external/opensidewalks/vegas.geojson
-    city_gis_dir: /data0/senzeyu2/dataset/abilitybench_external/city_gis/vegas
-    curb_inventory_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_inventory/vegas.jsonl
-    curb_regulation_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_regulations/vegas.jsonl
-    entrance_source: /data0/senzeyu2/dataset/abilitybench_external/entrances/vegas.geojson
-    elevation_source: /data0/senzeyu2/dataset/abilitybench_external/dem/vegas.jsonl
+    georeference_json: "{project_root}/data/external/georeference/vegas.json"
+    osm_source: "{project_root}/data/external/normalized/osm/vegas_sidewalks.geojson"
+    opensidewalks_source: "{project_root}/data/external/normalized/opensidewalks/vegas.geojson"
+    city_gis_dir: "{project_root}/data/external/normalized/city_gis/vegas"
+    # Las Vegas official layers are authoritative for the attributes they actually contain; leave false until curated/mapped.
+    city_gis_authoritative: false
+    city_gis_has_pedestrian_topology: false
+    curb_inventory_jsonl: "{project_root}/data/external/normalized/curb_inventory/vegas.jsonl"
+    curb_regulation_jsonl: "{project_root}/data/external/normalized/curb_regulations/vegas.jsonl"
+    entrance_source: "{project_root}/data/external/normalized/entrances/vegas.geojson"
+    elevation_source: "{project_root}/data/external/normalized/dem/vegas.jsonl"
+    manual_audit_manifest: "{project_root}/data/external/audits/vegas/manual_audit_manifest.jsonl"
+    provenance_manifest: "{project_root}/data/external/manifests/vegas.json"
 
   singapore:
-    db_dirs: [train_singapore]
     map_names: [sg-one-north]
     bbox: [1.27, 103.75, 1.33, 103.82]
-    georeference_json: configs/georeference.singapore.json
-    osm_source: /data0/senzeyu2/dataset/abilitybench_external/osm/singapore_sidewalks.json
-    opensidewalks_source: /data0/senzeyu2/dataset/abilitybench_external/opensidewalks/singapore.geojson
-    city_gis_dir: /data0/senzeyu2/dataset/abilitybench_external/city_gis/singapore
-    curb_inventory_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_inventory/singapore.jsonl
-    curb_regulation_jsonl: /data0/senzeyu2/dataset/abilitybench_external/curb_regulations/singapore.jsonl
-    entrance_source: /data0/senzeyu2/dataset/abilitybench_external/entrances/singapore.geojson
-    elevation_source: /data0/senzeyu2/dataset/abilitybench_external/dem/singapore.jsonl
+    georeference_json: "{project_root}/data/external/georeference/singapore.json"
+    osm_source: "{project_root}/data/external/normalized/osm/singapore_sidewalks.geojson"
+    opensidewalks_source: "{project_root}/data/external/normalized/opensidewalks/singapore.geojson"
+    city_gis_dir: "{project_root}/data/external/normalized/city_gis/singapore"
+    # OneMap/LTA layers must be curated and field-mapped before they count as authoritative accessibility evidence.
+    city_gis_authoritative: false
+    city_gis_has_pedestrian_topology: false
+    curb_inventory_jsonl: "{project_root}/data/external/normalized/curb_inventory/singapore.jsonl"
+    curb_regulation_jsonl: "{project_root}/data/external/normalized/curb_regulations/singapore.jsonl"
+    entrance_source: "{project_root}/data/external/normalized/entrances/singapore.geojson"
+    elevation_source: "{project_root}/data/external/normalized/dem/singapore.jsonl"
+    manual_audit_manifest: "{project_root}/data/external/audits/singapore/manual_audit_manifest.jsonl"
+    provenance_manifest: "{project_root}/data/external/manifests/singapore.json"

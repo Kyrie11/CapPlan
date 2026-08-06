@@ -311,14 +311,14 @@ def _read_any(path: str | Path | None) -> List[Dict[str, Any]]:
         raise FileNotFoundError(p)
     if p.is_dir():
         rows: List[Dict[str, Any]] = []
-        for child in sorted(p.glob("*")):
-            if child.suffix.lower() in {".json", ".geojson", ".jsonl", ".yaml", ".yml", ".csv"}:
+        for child in sorted(p.rglob("*")):
+            if child.is_file() and child.suffix.lower() in {".json", ".geojson", ".jsonl", ".ndjson", ".geojsonl", ".yaml", ".yml", ".csv"}:
                 rows.extend(_read_any(child))
         return rows
     if p.stat().st_size == 0:
         _warn_skip_external(p, "empty file")
         return []
-    if p.suffix.lower() == ".jsonl":
+    if p.suffix.lower() in {".jsonl", ".ndjson", ".geojsonl"}:
         try:
             return [dict(x) for x in read_jsonl(p)]
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -691,13 +691,6 @@ class AccessibilityFusionBuilder:
             "snap_tolerance_m": self.snap_tolerance_m,
             "pudo_connector_radius_m": pudo_connector_radius_m,
             "node_attributes": node_extra,
-            "features_loaded": len(features),
-            "features_inside_scene_bbox": len(feats),
-            "georeference_validated": bool(self.transformer.config.get("validated", False)),
-            "georeference_description": self.transformer.config.get("description"),
-            "local_crs": self.transformer.config.get("local_crs") or self.transformer.config.get("projected_crs") or self.transformer.config.get("target_crs"),
-            "projected_map_frame": bool(getattr(self.transformer, "projected_map_frame", False)),
-            "transform_backend": getattr(self.transformer, "transform_backend", "unknown"),
         })
         if len(graph.nodes) < min_nodes or len(graph.edges) < min_edges:
             raise RuntimeError(f"accessibility graph too small for {scene.episode_id}: {len(graph.nodes)} nodes/{len(graph.edges)} edges; required {min_nodes}/{min_edges}")

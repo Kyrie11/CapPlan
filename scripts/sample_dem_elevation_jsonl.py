@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """Sample point elevations and write AbilityBench DEM JSONL evidence.
 
-This utility fills ``<external_root>/dem/<city>.jsonl`` with observed elevation
-samples at WGS84 points extracted from the already downloaded pedestrian GIS
-layers.  It does not fabricate slope: downstream graph construction computes
-edge slope only when two neighboring nodes have sampled elevations.
+This bootstrap utility fills ``<external_root>/dem/<city>.jsonl`` by calling
+point-query web APIs. It is intentionally retained only for small diagnostics.
+For publication-scale preparation, download local GeoTIFF/COG DEM tiles and run
+``scripts/sample_raster_dem.py`` instead. Neither method measures curb-ramp
+running slope, cross-slope, landing slope, or curb reveal.
 
 Supported providers:
   - epqs: USGS Elevation Point Query Service, suitable for US cities.
@@ -14,7 +15,7 @@ Supported providers:
 
 Example:
   python scripts/sample_dem_elevation_jsonl.py \
-    --external_root /data0/senzeyu2/dataset/abilitybench_external \
+    --external_root /home/senzeyu2/code/CapPlan/data/external/normalized \
     --city boston --provider epqs --max_points 20000 --force
 """
 from __future__ import annotations

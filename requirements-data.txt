@@ -1,0 +1,3 @@
+# Optional, isolated data-preparation dependencies. Install in the same environment
+# only after the nuPlan/CapPlan core environment is working.
+rasterio>=1.3

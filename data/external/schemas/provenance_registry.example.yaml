@@ -1,0 +1,25 @@
+schema_version: "1.0"
+cities:
+  boston:
+    sources:
+      - role: osm_topology
+        path: "{project_root}/data/external/normalized/osm/boston_sidewalks.geojson"
+        source_url: "https://download.geofabrik.de/north-america/us/massachusetts.html"
+        license: "ODbL-1.0"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: B_community_mapped
+        authoritative: false
+      - role: city_sidewalk_inventory
+        path: "{project_root}/data/external/normalized/city_gis/boston/sidewalk_inventory.geojson"
+        source_url: "https://gisportal.boston.gov/arcgis/rest/services/Infrastructure/OpenData/MapServer/0"
+        license: "REVIEW_AND_RECORD_PORTAL_TERMS"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_authoritative_city_gis
+        authoritative: true
+      - role: manual_pudo_audit
+        path: "{project_root}/data/external/audits/boston/manual_audit_manifest.jsonl"
+        source_url: "local://abilitybench/manual-audit/boston"
+        license: "research-consent-and-data-management-plan"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_manual_audit
+        authoritative: true

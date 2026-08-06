@@ -287,8 +287,10 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
             "projected_map_frame": bool(getattr(transformer, "projected_map_frame", False)),
         }
     out = Path(args.output_graph_dir)
-    dump_json(out / "source_report.json", report)
-    dump_json(out / "quality_report.json", {"min_nodes_per_episode": args.min_nodes_per_episode, "min_edges_per_episode": args.min_edges_per_episode, **report})
+    source_report = Path(args.source_report_json) if args.source_report_json else out / "source_report.json"
+    quality_report = Path(args.quality_report_json) if args.quality_report_json else out / "quality_report.json"
+    dump_json(source_report, report)
+    dump_json(quality_report, {"min_nodes_per_episode": args.min_nodes_per_episode, "min_edges_per_episode": args.min_edges_per_episode, **report})
     return report
 
 
@@ -321,6 +323,8 @@ def main() -> None:
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--disable_tqdm", action="store_true", help="Disable per-episode progress bars.")
     p.add_argument("--diagnostic_report_json", default=None, help="Optional path for spatial/georeference diagnostics on failure.")
+    p.add_argument("--source_report_json", default=None, help="Optional per-city source report path; avoids overwriting reports when several cities share an output graph directory.")
+    p.add_argument("--quality_report_json", default=None, help="Optional per-city graph quality report path.")
     args = p.parse_args()
     print(json.dumps(build_graphs(args), indent=2, sort_keys=True))
 

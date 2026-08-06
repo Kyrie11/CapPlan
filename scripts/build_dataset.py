@@ -6,6 +6,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 import argparse
+import hashlib
 import subprocess
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -118,13 +119,8 @@ def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: An
         raise RuntimeError("--source_policy paper requires --paper_mode")
     if not getattr(args, "paper_mode", False):
         return
-    if getattr(args, "require_validated_georeference", False):
-        georef_ok = graph.metadata.get("georeference_validated") is True
-        if not georef_ok:
-            raise RuntimeError(
-                f"paper_mode requires validated georeference for {eid}; "
-                f"graph metadata georeference_validated={graph.metadata.get('georeference_validated')!r}"
-            )
+    if getattr(args, "require_validated_georeference", False) and graph.metadata.get("georeference_validated") is False:
+        raise RuntimeError(f"paper_mode requires validated georeference for {eid}; graph metadata georeference_validated=false")
     if args.reject_proxy_entrances and (_source_is_synthetic_or_proxy(origin.source) or _source_is_synthetic_or_proxy(destination.source)):
         raise RuntimeError(f"paper_mode rejects proxy/synthetic entrances for {eid}: {origin.source}, {destination.source}")
     if args.reject_synthetic_accessibility:
@@ -296,22 +292,54 @@ def _git_commit() -> str | None:
         return None
 
 
-def _write_splits(out: Path, episode_ids: List[str]) -> None:
+def _write_splits(out: Path, episode_rows: List[Dict[str, Any]]) -> None:
+    """Write leakage-resistant splits grouped by original nuPlan log.
+
+    All capability counterfactuals already share an episode_id; grouping episodes
+    by log_name additionally prevents nearby scenarios from the same drive/log
+    leaking across train/validation/test.  Unlike the previous implementation,
+    tiny datasets are never duplicated across splits.
+    """
     split_dir = out / "splits"
     split_dir.mkdir(parents=True, exist_ok=True)
-    n = len(episode_ids)
+    groups: Dict[str, List[str]] = {}
+    for row in episode_rows:
+        eid = str(row.get("episode_id"))
+        group = str(row.get("log_name") or row.get("scenario_id") or eid)
+        groups.setdefault(group, []).append(eid)
+    # Stable hash order avoids dependence on DB traversal order while remaining
+    # reproducible across machines.
+    ordered_groups = sorted(groups, key=lambda x: hashlib.sha1(x.encode("utf-8")).hexdigest())
+    n = len(ordered_groups)
     if n == 0:
-        train, val, test = [], [], []
+        group_splits = {"train": [], "val": [], "test": []}
     elif n == 1:
-        train, val, test = episode_ids, episode_ids, episode_ids
+        group_splits = {"train": ordered_groups, "val": [], "test": []}
+    elif n == 2:
+        group_splits = {"train": ordered_groups[:1], "val": [], "test": ordered_groups[1:]}
     else:
-        n_train = max(1, int(0.7 * n))
-        n_val = max(1, int(0.15 * n)) if n >= 3 else 1
-        train = episode_ids[:n_train]
-        val = episode_ids[n_train:n_train + n_val] or episode_ids[:1]
-        test = episode_ids[n_train + n_val:] or episode_ids[-1:]
-    for name, ids in [("train", train), ("val", val), ("test", test)]:
+        n_train = max(1, int(0.70 * n))
+        n_val = max(1, int(0.15 * n))
+        if n_train + n_val >= n:
+            n_train = max(1, n - 2)
+            n_val = 1
+        group_splits = {
+            "train": ordered_groups[:n_train],
+            "val": ordered_groups[n_train:n_train + n_val],
+            "test": ordered_groups[n_train + n_val:],
+        }
+    manifest = {"group_key": "log_name", "groups": {}, "episode_counts": {}}
+    seen: set[str] = set()
+    for name in ("train", "val", "test"):
+        ids = [eid for group in group_splits[name] for eid in groups[group]]
+        overlap = seen.intersection(ids)
+        if overlap:
+            raise RuntimeError(f"split leakage detected for {name}: {sorted(overlap)[:5]}")
+        seen.update(ids)
         (split_dir / f"{name}_episodes.txt").write_text("\n".join(ids) + ("\n" if ids else ""), encoding="utf-8")
+        manifest["groups"][name] = group_splits[name]
+        manifest["episode_counts"][name] = len(ids)
+    dump_json(split_dir / "split_manifest.json", manifest)
 
 
 
@@ -580,7 +608,7 @@ def main() -> None:
     write_jsonl(out / "certificate_labels.jsonl", certificate_labels)
     write_jsonl(out / "counterfactual_pairs.jsonl", counterfactual_pairs)
     write_jsonl(out / "service_requests.jsonl", service_request_records)
-    _write_splits(out, [e["episode_id"] for e in episodes])
+    _write_splits(out, episodes)
 
     preflight = load_json(args.external_source_preflight_json) if args.external_source_preflight_json else None
     manifest = {
@@ -589,7 +617,7 @@ def main() -> None:
         "scene_source": args.scene_source,
         "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files_requested": resolved_db_files, "db_files_expanded": adapter.db_files if args.scene_source == "nuplan" else [], "map_version": args.nuplan_map_version},
         "accessibility_source": args.accessibility_source, "accessibility_graph_dir": args.accessibility_graph_dir, "pudo_source": args.pudo_source, "pudo_evidence_jsonl": args.pudo_evidence_jsonl,
-        "paper_mode": bool(args.paper_mode), "source_policy": args.source_policy, "publication_ready": bool(args.paper_mode and args.source_policy == "paper"), "external_source_preflight": preflight, "service_layer_source": args.service_layer_source, "service_requests_jsonl": args.service_requests_jsonl, "capability_profiles_jsonl": args.capability_profiles_jsonl, "fleet_jsonl": args.fleet_jsonl,
+        "paper_mode": bool(args.paper_mode), "source_policy": args.source_policy, "publication_ready": bool(args.paper_mode and args.source_policy == "paper" and (preflight or {}).get("publication_ready", False)), "external_source_preflight": preflight, "service_layer_source": args.service_layer_source, "service_requests_jsonl": args.service_requests_jsonl, "capability_profiles_jsonl": args.capability_profiles_jsonl, "fleet_jsonl": args.fleet_jsonl,
         "builder_git_commit": _git_commit(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "strict_mode": bool(args.strict),

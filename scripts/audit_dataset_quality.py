@@ -139,7 +139,13 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
     preflight = manifest.get("external_source_preflight") if isinstance(manifest.get("external_source_preflight"), dict) else {}
     missing_external = []
     if preflight:
-        missing_external = [f"{r.get('city')}:{r.get('key')}" for r in preflight.get("sources", []) if not r.get("exists") and r.get("key") != "georeference_json"]
+        if isinstance(preflight.get("cities"), list):
+            missing_external = list(preflight.get("blockers", []))
+            if not preflight.get("publication_ready", False):
+                issues.append("external_sources_not_publication_ready")
+        else:
+            # Backward compatibility with v1 existence-only preflight reports.
+            missing_external = [f"{r.get('city')}:{r.get('key')}" for r in preflight.get("sources", []) if not r.get("exists") and r.get("key") != "georeference_json"]
         if missing_external:
             issues.append("missing_real_external_sources")
 

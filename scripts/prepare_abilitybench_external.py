@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -23,6 +24,7 @@ except Exception:  # pragma: no cover - tqdm is optional in bare environments
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from capplan.data.external_validation import inspect_source, validate_external_config
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 
 
@@ -39,7 +41,7 @@ def _load_config(path: str | Path) -> Dict[str, Any]:
 def _path(value: str | None, base: Path = PROJECT_ROOT) -> Path | None:
     if value in (None, ""):
         return None
-    p = Path(str(value).format(project_root=str(PROJECT_ROOT))).expanduser()
+    p = Path(os.path.expandvars(str(value).format(project_root=str(PROJECT_ROOT)))).expanduser()
     return p if p.is_absolute() else base / p
 
 
@@ -90,40 +92,45 @@ out skel qt;
     return q
 
 
+def _download_overpass(query_file: Path, output_file: Path, endpoint: str, dry_run: bool, timeout_s: int) -> None:
+    """Download atomically and reject HTTP/HTML/empty error payloads.
 
-def _run_external_fetcher(
-    external_root: Path,
-    cities: Iterable[str],
-    overpass_cfg: Dict[str, Any],
-    dry_run: bool,
-) -> None:
-    """Use the robust tiled fetcher rather than a single raw curl request."""
-    selected = ",".join(cities)
-    cmd = [
-        sys.executable,
-        "scripts/fetch_abilitybench_external_four_cities.py",
-        "--external_root",
-        str(external_root),
-        "--cities",
-        selected,
-        "--overpass_endpoint",
-        str(overpass_cfg.get("endpoint", "https://overpass-api.de/api/interpreter")),
-        "--overpass_timeout_s",
-        str(int(overpass_cfg.get("timeout_s", 180))),
-        "--overpass_sleep_s",
-        str(float(overpass_cfg.get("sleep_s", 20.0))),
-        "--overpass_tile_sleep_s",
-        str(float(overpass_cfg.get("tile_sleep_s", 4.0))),
-        "--overpass_retries",
-        str(int(overpass_cfg.get("retries", 6))),
-        "--overpass_grid_n",
-        str(int(overpass_cfg.get("grid_n", 3))),
-    ]
-    if overpass_cfg.get("endpoint_pool"):
-        cmd.extend(["--overpass_endpoint_pool", str(overpass_cfg["endpoint_pool"])])
-    if bool(overpass_cfg.get("force", False)):
-        cmd.append("--force")
-    _run(cmd, dry_run)
+    This remains a small-area bootstrap convenience.  Publication-scale runs
+    should use a local PBF plus scripts/prepare_osm_from_pbf.py.
+    """
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    part = output_file.with_suffix(output_file.suffix + ".part")
+    _run(
+        [
+            "curl",
+            "--fail-with-body",
+            "--retry",
+            "4",
+            "--retry-all-errors",
+            "--connect-timeout",
+            "30",
+            "--max-time",
+            str(max(timeout_s + 60, 120)),
+            "-L",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/x-www-form-urlencoded",
+            "--data-urlencode",
+            f"data@{query_file}",
+            endpoint,
+            "-o",
+            str(part),
+        ],
+        dry_run,
+    )
+    if not dry_run:
+        report = inspect_source(part, role="osm")
+        if not report.valid:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(f"Overpass returned unusable data for {output_file}: {report.errors}")
+        part.replace(output_file)
+
 
 def _concat_jsonl(inputs: Iterable[Path], output: Path) -> None:
     rows: List[Dict[str, Any]] = []
@@ -169,78 +176,42 @@ def _source_policy(config: Dict[str, Any], override: str | None = None) -> str:
     return pol
 
 
-def _paper_required_sources(city: str, city_cfg: Dict[str, Any], external_root: Path) -> Dict[str, Path]:
-    return {
-        "osm_source": _city_source(city, city_cfg, "osm_source", external_root / "osm", f"{city}_sidewalks.json"),
-        "opensidewalks_source": _city_source(city, city_cfg, "opensidewalks_source", external_root / "opensidewalks", f"{city}.geojson"),
-        "city_gis_dir": _city_source(city, city_cfg, "city_gis_dir", external_root / "city_gis", city),
-        "curb_inventory_jsonl": _city_source(city, city_cfg, "curb_inventory_jsonl", external_root / "curb_inventory", f"{city}.jsonl"),
-        "curb_regulation_jsonl": _city_source(city, city_cfg, "curb_regulation_jsonl", external_root / "curb_regulations", f"{city}.jsonl"),
-        "entrance_source": _city_source(city, city_cfg, "entrance_source", external_root / "entrances", f"{city}.geojson"),
-        "elevation_source": _city_source(city, city_cfg, "elevation_source", external_root / "dem", f"{city}.jsonl"),
-        "georeference_json": _path(city_cfg.get("georeference_json")) or Path(""),
-    }
-
-
-
-def _nonempty_source(path: Path, key: str) -> bool:
-    if not path or not path.exists():
-        return False
-    if path.is_dir():
-        return any(_nonempty_source(child, key) for child in path.glob("**/*") if child.is_file())
-    if path.stat().st_size <= 0:
-        return False
-    suffix = path.suffix.lower()
-    try:
-        if suffix in {".jsonl", ".ndjson"}:
-            return any(line.strip() for line in path.open("r", encoding="utf-8", errors="ignore"))
-        if suffix in {".json", ".geojson"}:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                if "osm_source" in key:
-                    return bool(payload.get("elements"))
-                for list_key in ["features", "records", "curbs", "regulations", "samples"]:
-                    if isinstance(payload.get(list_key), list):
-                        return len(payload[list_key]) > 0
-                return True
-            if isinstance(payload, list):
-                return len(payload) > 0
-            return False
-        if suffix == ".csv":
-            with path.open("r", encoding="utf-8", errors="ignore") as f:
-                rows = [next(f, "") for _ in range(2)]
-            return bool(rows and rows[0].strip() and len(rows) > 1 and rows[1].strip())
-    except Exception:
-        return False
-    return True
-
-
-def _write_source_preflight_report(config: Dict[str, Any], cities: Iterable[str], external_root: Path, prepared_root: Path, policy: str, dry_run: bool) -> None:
-    rows = []
-    missing = []
-    empty_or_placeholder = []
-    for city in cities:
-        city_cfg = config["cities"][city]
-        for key, path in _paper_required_sources(city, city_cfg, external_root).items():
-            exists = bool(path and path.exists())
-            nonempty = _nonempty_source(path, key) if exists else False
-            rows.append({"city": city, "key": key, "path": str(path), "exists": exists, "nonempty": nonempty})
-            if policy == "paper" and not exists:
-                missing.append(f"{city}:{key}={path}")
-            if policy == "paper" and exists and key in {"curb_inventory_jsonl", "curb_regulation_jsonl", "entrance_source", "elevation_source", "opensidewalks_source", "osm_source"} and not nonempty:
-                empty_or_placeholder.append(f"{city}:{key}={path}")
-    report = {"source_policy": policy, "sources": rows, "missing_required": missing, "empty_or_placeholder_required": empty_or_placeholder}
+def _write_source_preflight_report(
+    config: Dict[str, Any],
+    cities: Iterable[str],
+    prepared_root: Path,
+    policy: str,
+    dry_run: bool,
+) -> Dict[str, Any]:
+    report = validate_external_config(
+        config,
+        list(cities),
+        policy=policy,
+        project_root=PROJECT_ROOT,
+    )
     if not dry_run:
         prepared_root.mkdir(parents=True, exist_ok=True)
         dump_json(prepared_root / "external_source_preflight.json", report)
-    blockers = missing + empty_or_placeholder
-    if blockers:
-        raise RuntimeError("paper source policy requires complete non-empty real external evidence; blockers: " + "; ".join(blockers[:20]) + (" ..." if len(blockers) > 20 else ""))
+    if report.get("blockers") and not dry_run:
+        raise RuntimeError(
+            f"{policy} source preflight failed; fix these evidence categories before continuing: "
+            + "; ".join(report["blockers"][:30])
+        )
+    return report
+
+
+def _require_artifact(path: Path, label: str, dry_run: bool) -> None:
+    if dry_run:
+        return
+    report = inspect_source(path)
+    if not report.valid:
+        raise RuntimeError(f"{label} is missing or invalid: {path}; errors={report.errors}")
+
 
 def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dry_run: bool, disable_tqdm: bool = False, source_policy_override: str | None = None, cities_override: str | None = None, max_scenarios_override: int | None = None) -> None:
     nuplan = config["nuplan"]
-    external_root = _path(config.get("external_root", "/data0/senzeyu2/dataset/abilitybench_external"))
-    outputs_root = _path(config.get("outputs_root", "outputs"))
+    external_root = _path(config.get("external_root", "{project_root}/data/external"))
+    outputs_root = _path(config.get("outputs_root", "{project_root}/data/outputs"))
     assert external_root is not None and outputs_root is not None
     prepared_root = outputs_root / "prepared" / split_name
     split_cfg = config["splits"][split_name]
@@ -258,24 +229,66 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     min_nodes = int(config.get("quality", {}).get("min_graph_nodes", 100))
     min_edges = int(config.get("quality", {}).get("min_graph_edges", 150))
     max_missing = float(config.get("quality", {}).get("max_core_pudo_missing_rate", 0.05))
-    overpass_cfg = dict(config.get("overpass", {}) or {})
-    timeout_s = int(overpass_cfg.get("timeout_s", 180))
-    _write_source_preflight_report(config, cities, external_root, prepared_root, source_policy, dry_run)
+    endpoint = str(config.get("overpass", {}).get("endpoint", "https://overpass-api.de/api/interpreter"))
+    timeout_s = int(config.get("overpass", {}).get("timeout_s", 180))
 
     scene_dirs: Dict[str, Path] = {}
     graph_dir = prepared_root / "accessibility_graphs"
     pudo_city_files: List[Path] = []
     dataset_city_dirs: List[Path] = []
 
-    if "queries" in stages or "all" in stages or "download" in stages:
-        qdir = external_root / "osm" / "queries"
+    if "queries" in stages or "download" in stages:
+        qdir = external_root / "raw" / "osm_overpass" / "queries"
         for city in _progress(cities, f"{split_name}: overpass queries", disable_tqdm):
             q = _write_overpass_query(city, config["cities"][city], qdir, timeout_s)
             print(f"wrote {q}")
 
-    if "download" in stages or "all" in stages:
+    if "download" in stages:
         download_cities = list(_progress(cities, f"{split_name}: overpass download", disable_tqdm))
-        _run_external_fetcher(external_root, download_cities, overpass_cfg, dry_run)
+        for idx, city in enumerate(download_cities):
+            q = external_root / "raw" / "osm_overpass" / "queries" / f"{city}_sidewalks.overpassql"
+            raw_out = external_root / "raw" / "osm_overpass" / f"{city}_sidewalks.json"
+            normalized_out = external_root / "normalized" / "osm" / f"{city}_sidewalks.geojson"
+            _download_overpass(q, raw_out, endpoint, dry_run, timeout_s)
+            _run(
+                [
+                    sys.executable,
+                    "scripts/normalize_overpass_json.py",
+                    "--input_json",
+                    str(raw_out),
+                    "--output_geojson",
+                    str(normalized_out),
+                    "--source_url",
+                    endpoint,
+                ],
+                dry_run,
+            )
+            if not dry_run:
+                normalized_report = inspect_source(normalized_out, role="osm")
+                if not normalized_report.valid:
+                    raise RuntimeError(f"normalized OSM GeoJSON is unusable for {city}: {normalized_report.errors}")
+            if not dry_run and idx + 1 < len(download_cities):
+                time.sleep(float(config.get("overpass", {}).get("sleep_s", 8)))
+
+    if "map_crs" in stages or "all" in stages:
+        _run(
+            [
+                sys.executable,
+                "scripts/inspect_nuplan_map_crs.py",
+                "--config",
+                str(config.get("_config_path", "configs/abilitybench_nuplan_real.yaml")),
+                "--cities",
+                "+".join(cities),
+                "--output_dir",
+                str(external_root / "georeference"),
+            ],
+            dry_run,
+        )
+
+    if stages.intersection({"preflight", "graphs", "pudo", "dataset", "all"}):
+        _write_source_preflight_report(config, cities, prepared_root, source_policy, dry_run)
+    if stages == {"preflight"}:
+        return
 
     for city in _progress(cities, f"{split_name}: extract/graphs/pudo", disable_tqdm):
         city_cfg = config["cities"][city]
@@ -314,16 +327,17 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             _run(cmd, dry_run)
 
         if "graphs" in stages or "all" in stages:
-            osm_source = _city_source(city, city_cfg, "osm_source", external_root / "osm", f"{city}_sidewalks.json")
-            opensidewalks = _city_source(city, city_cfg, "opensidewalks_source", external_root / "opensidewalks", f"{city}.geojson")
-            city_gis = _city_source(city, city_cfg, "city_gis_dir", external_root / "city_gis", city)
+            _require_artifact(scene_dir / "scenes.jsonl", f"nuPlan scene contexts for {city}", dry_run)
+            osm_source = _city_source(city, city_cfg, "osm_source", external_root / "normalized" / "osm", f"{city}_sidewalks.geojson")
+            opensidewalks = _city_source(city, city_cfg, "opensidewalks_source", external_root / "normalized" / "opensidewalks", f"{city}.geojson")
+            city_gis = _city_source(city, city_cfg, "city_gis_dir", external_root / "normalized" / "city_gis", city)
             # Configs expose curated curb evidence as `curb_inventory_jsonl`.
             # The old `curb_inventory_source` lookup left the graph builder
             # blind to real curb attributes, which then propagated as 100%
             # missing PUDO core fields.
-            curb_inventory = _city_source(city, city_cfg, "curb_inventory_jsonl", external_root / "curb_inventory", f"{city}.jsonl")
-            entrances = _city_source(city, city_cfg, "entrance_source", external_root / "entrances", f"{city}.geojson")
-            elevation = _city_source(city, city_cfg, "elevation_source", external_root / "dem", f"{city}.jsonl")
+            curb_inventory = _city_source(city, city_cfg, "curb_inventory_jsonl", external_root / "normalized" / "curb_inventory", f"{city}.jsonl")
+            entrances = _city_source(city, city_cfg, "entrance_source", external_root / "normalized" / "entrances", f"{city}.geojson")
+            elevation = _city_source(city, city_cfg, "elevation_source", external_root / "normalized" / "dem", f"{city}.jsonl")
             georef = _path(city_cfg["georeference_json"])
             cmd = [
                 sys.executable,
@@ -339,29 +353,35 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--min_edges_per_episode",
                 str(min_edges),
                 "--source_name",
-                f"{city}_osm_opensidewalks_citygis_dem",
+                f"{city}_fused_external_accessibility",
                 "--fail_on_synthetic",
                 "--diagnostic_report_json",
-                str(prepared_root / "graph_spatial_diagnostics.json"),
+                str(prepared_root / "reports" / f"graph_spatial_diagnostics.{city}.json"),
+                "--source_report_json",
+                str(prepared_root / "reports" / f"graph_source.{city}.json"),
+                "--quality_report_json",
+                str(prepared_root / "reports" / f"graph_quality.{city}.json"),
             ]
             if disable_tqdm:
                 cmd.append("--disable_tqdm")
             missing_graph_sources: List[str] = []
-            _add_source_arg(cmd, "--osm_source", osm_source, dry_run, required=True, missing=missing_graph_sources)
-            _add_source_arg(cmd, "--opensidewalks_source", opensidewalks, dry_run, required=(source_policy == "paper"), missing=missing_graph_sources)
-            _add_source_arg(cmd, "--city_gis_dir", city_gis, dry_run, required=(source_policy == "paper"), missing=missing_graph_sources)
+            _add_source_arg(cmd, "--osm_source", osm_source, dry_run, required=False, missing=missing_graph_sources)
+            _add_source_arg(cmd, "--opensidewalks_source", opensidewalks, dry_run, required=False, missing=missing_graph_sources)
+            _add_source_arg(cmd, "--city_gis_dir", city_gis, dry_run, required=False, missing=missing_graph_sources)
             _add_source_arg(cmd, "--curb_inventory_source", curb_inventory, dry_run, required=False, missing=missing_graph_sources)
-            _add_source_arg(cmd, "--entrance_source", entrances, dry_run, required=(source_policy == "paper"), missing=missing_graph_sources)
-            _add_source_arg(cmd, "--elevation_source", elevation, dry_run, required=(source_policy == "paper"), missing=missing_graph_sources)
+            _add_source_arg(cmd, "--entrance_source", entrances, dry_run, required=False, missing=missing_graph_sources)
+            _add_source_arg(cmd, "--elevation_source", elevation, dry_run, required=False, missing=missing_graph_sources)
             if missing_graph_sources:
                 raise RuntimeError("missing graph sources: " + "; ".join(missing_graph_sources))
             _run(cmd, dry_run)
 
         if "pudo" in stages or "all" in stages:
+            _require_artifact(scene_dir / "scenes.jsonl", f"nuPlan scene contexts for {city}", dry_run)
+            _require_artifact(graph_dir, "accessibility graphs", dry_run)
             city_pudo = prepared_root / "pudo" / f"{city}.jsonl"
             pudo_city_files.append(city_pudo)
-            city_curb_reg = _city_source(city, city_cfg, "curb_regulation_jsonl", external_root / "curb_regulations", f"{city}.jsonl")
-            city_curb_inventory = _city_source(city, city_cfg, "curb_inventory_jsonl", external_root / "curb_inventory", f"{city}.jsonl")
+            city_curb_reg = _city_source(city, city_cfg, "curb_regulation_jsonl", external_root / "normalized" / "curb_regulations", f"{city}.jsonl")
+            city_curb_inventory = _city_source(city, city_cfg, "curb_inventory_jsonl", external_root / "normalized" / "curb_inventory", f"{city}.jsonl")
             pudo_cmd = [
                 sys.executable,
                 "scripts/build_pudo_evidence.py",
@@ -399,6 +419,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     capability_profiles = prepared_root / "capability_profiles.generated.jsonl"
     fleet_jsonl = _path(config["fleet_jsonl"])
     if "service" in stages or "all" in stages:
+        _require_artifact(graph_dir, "accessibility graphs", dry_run)
         _run(
             [
                 sys.executable,
@@ -431,6 +452,10 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
         city_dataset = outputs_root / "datasets" / f"abilitybench_av_{split_name}_{city}"
         dataset_city_dirs.append(city_dataset)
         if "dataset" in stages or "all" in stages:
+            _require_artifact(graph_dir, "accessibility graphs", dry_run)
+            _require_artifact(combined_pudo, "combined PUDO evidence", dry_run)
+            _require_artifact(service_requests, "service requests", dry_run)
+            _require_artifact(capability_profiles, "capability profiles", dry_run)
             cmd = [
                 sys.executable,
                 "scripts/build_dataset.py",
@@ -507,6 +532,8 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
 
     merged_dataset = outputs_root / "datasets" / f"abilitybench_av_{split_name}"
     if "merge" in stages or "all" in stages:
+        for city_dataset in dataset_city_dirs:
+            _require_artifact(city_dataset / "dataset_manifest.json", f"city dataset manifest {city_dataset.name}", dry_run)
         _run(
             [
                 sys.executable,
@@ -525,15 +552,17 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Prepare OSM/OpenSidewalks/city-GIS/curb/DEM inputs and build nuPlan-based AbilityBench datasets.")
     p.add_argument("--config", default="configs/abilitybench_nuplan_real.yaml")
     p.add_argument("--split", choices=["train", "val"], default="train")
-    p.add_argument("--stages", default="all", help="Comma list: queries,download,extract,graphs,pudo,service,dataset,merge,all")
+    p.add_argument("--stages", default="all", help="Comma list: queries,download,map_crs,preflight,extract,graphs,pudo,service,dataset,merge,all. Online download is never implied by all.")
     p.add_argument("--dry_run", action="store_true", help="Print commands without executing them.")
     p.add_argument("--disable_tqdm", action="store_true", help="Disable city/stage and dataset progress bars.")
-    p.add_argument("--source_policy", choices=["bootstrap", "paper"], default=None, help="bootstrap builds a real-data diagnostic dataset with fail-closed missing evidence; paper requires complete OSM/OpenSidewalks/city-GIS/curb/entrance/DEM sources.")
+    p.add_argument("--source_policy", choices=["bootstrap", "paper"], default=None, help="bootstrap builds a real-data diagnostic dataset with fail-closed missing evidence; paper requires complete evidence categories; OSM and OpenSidewalks are alternatives, not both mandatory.")
     p.add_argument("--cities", default=None, help="Optional comma/plus-separated city subset for fast diagnostics, e.g. boston or boston+vegas.")
     p.add_argument("--max_scenarios_per_city", type=int, default=None, help="Override config split max_scenarios_per_city for quick partial runs.")
     args = p.parse_args()
     stages = {x.strip() for x in args.stages.split(",") if x.strip()}
-    build_pipeline(_load_config(args.config), args.split, stages, args.dry_run, args.disable_tqdm, args.source_policy, args.cities, args.max_scenarios_per_city)
+    config = _load_config(args.config)
+    config["_config_path"] = args.config
+    build_pipeline(config, args.split, stages, args.dry_run, args.disable_tqdm, args.source_policy, args.cities, args.max_scenarios_per_city)
 
 
 if __name__ == "__main__":
