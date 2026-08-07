@@ -17,6 +17,37 @@ from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 CORE = ["curb_height_m", "deployment_clearance_m", "sidewalk_width_m"]
 
 
+def _paper_evidence_flags(row: Dict[str, Any]) -> Tuple[bool, bool, str]:
+    core_complete = all(row.get(k) is not None for k in CORE)
+    has_ped_binding = bool(row.get("adjacent_ped_node_id"))
+    legality_source = str(row.get("legal_stop_source") or "").lower()
+    has_legality_evidence = bool(legality_source) and legality_source not in {"unknown", "none"} and "no_matching_regulation" not in legality_source and "heuristic" not in legality_source and "no_legality_evidence" not in legality_source
+    source = str(row.get("source") or "").lower()
+    interface_source = str(row.get("curb_inventory_source") or row.get("interface_evidence_source") or "").lower()
+    trustworthy_source = not (source.startswith("synthetic") or source in {"toy", "mock", "unknown", ""})
+    has_interface_evidence = bool(interface_source) and not (interface_source.startswith("synthetic") or "proxy" in interface_source or interface_source in {"toy", "mock", "unknown"})
+    evidence_complete = core_complete and has_ped_binding and has_legality_evidence and trustworthy_source and has_interface_evidence
+    eligible = evidence_complete and bool(row.get("legal_stop"))
+    missing = [k for k in CORE if row.get(k) is None]
+    reasons = []
+    if missing: reasons.append("missing:" + ",".join(missing))
+    if not has_ped_binding: reasons.append("no_pedestrian_binding")
+    if not has_legality_evidence: reasons.append("no_independent_legality_evidence")
+    if not trustworthy_source: reasons.append("non_auditable_candidate_source")
+    if not has_interface_evidence: reasons.append("no_auditable_interface_evidence")
+    if evidence_complete and not bool(row.get("legal_stop")): reasons.append("legality_negative")
+    return evidence_complete, eligible, "paper_ready" if eligible else ("evidence_complete_negative" if evidence_complete else ";".join(reasons) or "candidate_uncertain")
+
+
+def _annotate_paper_flags(row: Dict[str, Any]) -> Dict[str, Any]:
+    complete, eligible, status = _paper_evidence_flags(row)
+    row = dict(row)
+    row["paper_evidence_complete"] = complete
+    row["paper_eligible"] = eligible
+    row["evidence_status"] = status
+    return row
+
+
 def _read(path: str | None) -> List[Dict[str, Any]]:
     if not path:
         return []
@@ -26,6 +57,9 @@ def _read(path: str | None) -> List[Dict[str, Any]]:
     if p.is_dir():
         rows: List[Dict[str, Any]] = []
         for child in sorted(p.glob("*")):
+            name = child.name.lower()
+            if name.endswith((".report.json", ".provenance.json", ".manifest.json")):
+                continue
             if child.suffix.lower() in {".json", ".jsonl", ".geojson", ".csv"}:
                 rows.extend(_read(str(child)))
         return rows
@@ -160,6 +194,8 @@ def normalize(row: Dict[str, Any], default_source: str, transformer: Optional[Co
         out.setdefault("x", xy[0])
         out.setdefault("y", xy[1])
     out.setdefault("legal_stop", _bool(row.get("legal_stop", row.get("vehicle_stop_feasible", row.get("regulation", None))), False))
+    if any(out.get(k) is not None for k in CORE):
+        out.setdefault("curb_inventory_source", str(source))
     out.setdefault("legal_stop_source", row.get("legal_stop_source") or row.get("regulation_id") or row.get("curb_regulation_source") or source)
     out.setdefault("side", row.get("side", "unknown"))
     if "availability" in row and "dynamic_confidence" not in out:
@@ -172,7 +208,7 @@ def normalize(row: Dict[str, Any], default_source: str, transformer: Optional[Co
     for k in ["curb_height_m", "deployment_clearance_m", "sidewalk_width_m", "blockage_risk", "map_confidence", "dynamic_confidence"]:
         if out.get(k) is not None:
             out[k] = float(out[k])
-    return out
+    return _annotate_paper_flags(out)
 
 
 def _load_graph(graph_dir: Path, episode_id: str) -> AccessibilityGraph:
@@ -319,6 +355,9 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
     existing = {(r.get("episode_id"), r.get("anchor_id")) for r in out}
     regs = _read(args.curb_regulation_jsonl) + _read(args.curb_regulation_dir)
     raw_inventory = _read(args.curb_inventory_jsonl)
+    external_candidates: List[Dict[str, Any]] = []
+    for candidate_path in (args.pudo_candidate_source or []):
+        external_candidates.extend(_read(candidate_path))
     inventory = [normalize(r, args.source_name, transformer) for r in raw_inventory if r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id"))]
     global_inventory = [rec for rec in (_as_inventory_record(r, transformer) for r in raw_inventory if not (r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id")))) if rec is not None]
     for r in inventory:
@@ -334,6 +373,57 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
         graph = _load_graph(graph_dir, eid)
         scene = scenes.get(eid)
         route = scene.route_polyline if scene else []
+        # Official/public curbside layers (parking payment points, taxi zones,
+        # taxi stands) may propose candidate locations, but NEVER confer stopping
+        # legality or interface feasibility by themselves. Each candidate is
+        # independently matched to regulation and physical curb evidence.
+        for cidx, candidate in enumerate(external_candidates):
+            xy = _xy_from_row(candidate, transformer)
+            if not xy:
+                continue
+            x, y = xy
+            if route and distance_to_polyline([x, y], route) > args.candidate_radius_m:
+                continue
+            nearest_ped, ped_dist = _nearest_node(x, y, graph.nodes, {"sidewalk", "crossing", "entrance"})
+            ped_id = nearest_ped.node_id if nearest_ped is not None and ped_dist <= args.pedestrian_snap_tolerance_m else None
+            attrs = _nearest_edge_attrs(x, y, graph) if ped_id else {}
+            reg = _regulation_match(x, y, regs, args.regulation_snap_tolerance_m, transformer)
+            inv = _nearest_inventory_match(x, y, global_inventory, args.inventory_snap_tolerance_m)
+            legal = _bool((reg or {}).get("legal_stop", (reg or {}).get("stopping_allowed", (reg or {}).get("regulation"))), False)
+            blockage = _blockage_from_agents(x, y, scene.metadata if scene else {})
+            candidate_view = _row_view(candidate)
+            candidate_source = str(candidate_view.get("source") or args.source_name)
+            candidate_id = str(candidate_view.get("regulation_id") or candidate_view.get("anchor_id") or candidate_view.get("id") or f"external_{cidx:05d}")
+            width = _coalesce((inv or {}).get("sidewalk_width_m"), attrs.get("sidewalk_width_m"))
+            row = {
+                "anchor_id": f"{eid}:candidate:{candidate_id}",
+                "pudo_id": f"{eid}:candidate:{candidate_id}",
+                "episode_id": eid, "kind": "pickup_dropoff",
+                "curb_pose": {"x": x, "y": y, "heading": 0.0, "frame": "map"},
+                "stop_pose": {"x": x, "y": y, "heading": 0.0, "frame": "map"},
+                "x": x, "y": y,
+                "side": str(_coalesce(candidate_view.get("side"), (inv or {}).get("side"), nearest_route_side([x, y], route) if route else "unknown")),
+                "legal_stop": legal,
+                "legal_stop_source": str((reg or {}).get("source") or (reg or {}).get("regulation_id") or "no_matching_regulation_fail_closed"),
+                "adjacent_ped_node_id": ped_id,
+                "curb_height_m": (inv or {}).get("curb_height_m"),
+                "sidewalk_width_m": width,
+                "deployment_clearance_m": (inv or {}).get("deployment_clearance_m"),
+                "blockage_risk": blockage,
+                "map_confidence": min(float(candidate_view.get("confidence", 0.6) or 0.6), float((inv or {}).get("confidence", 1.0) or 1.0), float((reg or {}).get("confidence", 1.0) or 1.0)),
+                "dynamic_confidence": 1.0 - blockage,
+                "lighting": attrs.get("lighting"), "shelter": attrs.get("shelter"),
+                "candidate_source": candidate_source,
+                "candidate_only": True,
+                "curb_inventory_source": (inv or {}).get("source"),
+                "curb_inventory_match_distance_m": (inv or {}).get("distance_m"),
+                "source": candidate_source,
+                "evidence_notes": "external_candidate_only; legality and board/alight interface require independent matched evidence",
+            }
+            key = (eid, row["anchor_id"])
+            if key not in existing:
+                out.append(_annotate_paper_flags(row)); existing.add(key)
+
         for idx, n in enumerate(_candidate_nodes(graph, route, args.candidate_radius_m)):
             anchor_id = f"{eid}:pudo_{idx:04d}"
             if (eid, anchor_id) in existing:
@@ -378,7 +468,7 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "source": args.source_name,
                 "evidence_notes": "derived_from_accessibility_graph_and_city_curb_regulation; legal_stop fails closed without matched regulation",
             }
-            out.append(row)
+            out.append(_annotate_paper_flags(row))
             existing.add((eid, anchor_id))
     return out
 
@@ -399,6 +489,7 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
         if not normalized_input:
             raise RuntimeError("PUDO evidence build requires real curb/PUDO evidence or --accessibility_graph_dir to generate candidates; no synthetic fallback is available")
         out_rows = normalized_input
+    out_rows = [_annotate_paper_flags(r) for r in out_rows]
     total = max(1, len(out_rows))
     missing = {k: sum(1 for r in out_rows if r.get(k) is None) for k in CORE}
     if args.fail_on_missing_core_evidence:
@@ -406,7 +497,21 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
         if bad:
             raise RuntimeError(f"core PUDO evidence missing rate too high: {bad}; threshold={args.max_core_missing_rate}")
     write_jsonl(args.output_pudo_evidence_jsonl, out_rows)
-    report = {"rows": len(out_rows), "missing_core_counts": missing, "missing_core_rates": {k: v / total for k, v in missing.items()}, "source": args.source_name, "mode": "pudo_generator" if args.accessibility_graph_dir else "pudo_validator"}
+    by_episode: Dict[str, Dict[str, int]] = {}
+    for r in out_rows:
+        e = by_episode.setdefault(str(r.get("episode_id") or "unknown"), {"total": 0, "evidence_complete": 0, "paper_eligible": 0})
+        e["total"] += 1
+        e["evidence_complete"] += int(bool(r.get("paper_evidence_complete")))
+        e["paper_eligible"] += int(bool(r.get("paper_eligible")))
+    report = {
+        "status": "PASS", "rows": len(out_rows), "missing_core_counts": missing,
+        "missing_core_rates": {k: v / total for k, v in missing.items()},
+        "paper_evidence_complete": sum(int(bool(r.get("paper_evidence_complete"))) for r in out_rows),
+        "paper_eligible": sum(int(bool(r.get("paper_eligible"))) for r in out_rows),
+        "episodes": by_episode, "source": args.source_name,
+        "mode": "pudo_generator" if args.accessibility_graph_dir else "pudo_validator",
+        "interpretation": "Unknown candidates are retained. paper_eligible requires independent legality, pedestrian binding, and all three core interface fields.",
+    }
     if args.report_json:
         dump_json(args.report_json, report)
     return report
@@ -422,11 +527,13 @@ def main() -> None:
     p.add_argument("--input_pudo_evidence_jsonl", default=None)
     p.add_argument("--curb_inventory_jsonl", default=None)
     p.add_argument("--curb_regulation_jsonl", default=None)
+    p.add_argument("--pudo_candidate_source", action="append", default=[], help="Optional normalized public PUDO candidate layer; repeatable. Candidate layers never confer legality or interface feasibility.")
     p.add_argument("--georeference_json", default=None)
     p.add_argument("--output_pudo_evidence_jsonl", required=True)
     p.add_argument("--candidate_radius_m", type=float, default=250.0)
     p.add_argument("--regulation_snap_tolerance_m", type=float, default=12.0)
     p.add_argument("--inventory_snap_tolerance_m", type=float, default=15.0)
+    p.add_argument("--pedestrian_snap_tolerance_m", type=float, default=25.0)
     p.add_argument("--max_route_deviation_m", type=float, default=300.0)
     p.add_argument("--source_name", default="city_curb_regulation+sidewalk_inventory")
     p.add_argument("--fail_on_missing_core_evidence", action="store_true")

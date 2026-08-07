@@ -218,6 +218,12 @@ class PUDOAnchor:
     shelter: bool | None = False
     timestamp_s: float | None = None
     source: str = "synthetic_local"
+    # Dataset-construction audit flags. They distinguish a retained uncertain
+    # candidate from a main-result-ready interface without deleting uncertainty.
+    paper_evidence_complete: bool = False
+    paper_eligible: bool = False
+    evidence_status: str = "candidate_uncertain"
+    evidence_notes: str | None = None
 
     @property
     def x(self) -> float:

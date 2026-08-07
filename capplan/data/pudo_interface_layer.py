@@ -348,12 +348,14 @@ def nuplan_route_pudo_anchors(
         # supports a width estimate.
         if sidewalk_width is not None:
             sidewalk_width = round(max(0.1, float(sidewalk_width)), 3)
-        deployment_clearance = round(min(float(sidewalk_width), 1.20), 3) if sidewalk_width is not None else None
+        # Polygon/sidewalk width is not the same as usable vehicle ramp/lift
+        # deployment clearance. Keep the interface field unknown until audited.
+        deployment_clearance = None
         risk, dyn_conf = _dynamic_blockage_risk(stop, agent_history or [])
         lane_id = str(_safe_attr(obj, ["id"], "")) or None
         rb_id = _safe_attr(obj, ["get_roadblock_id", "roadblock_id"], None)
         map_conf = 0.80 if sidewalk_width is not None else (0.68 if near_walkway else 0.55)
-        source = "nuplan_route_map_walkway_width_proxy" if sidewalk_width is not None else ("nuplan_route_map_walkway_unmeasured" if near_walkway else "nuplan_route_map_no_walkway")
+        source = "nuplan_route_map_walkway_width_proxy_candidate" if sidewalk_width is not None else ("nuplan_route_map_walkway_unmeasured" if near_walkway else "nuplan_route_map_no_walkway")
         anchors.append(PUDOAnchor(
             anchor_id=f"nuplan_{kind}_{idx}",
             episode_id=episode_id,
@@ -361,8 +363,8 @@ def nuplan_route_pudo_anchors(
             curb_pose=curb,
             stop_pose=stop,
             side=side,
-            legal_stop=True,
-            legal_stop_source="nuplan_route_lane_heuristic",
+            legal_stop=False,
+            legal_stop_source="nuplan_route_geometry_candidate_no_legality_evidence",
             roadblock_id=str(rb_id) if rb_id is not None else None,
             lane_id=lane_id,
             lane_connector_id=None,

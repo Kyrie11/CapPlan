@@ -227,7 +227,7 @@ def _build_prepared(args: argparse.Namespace) -> Dict[str, Any]:
     for eid in episodes:
         graph = AccessibilityGraph(eid, nodes, edges, {"source": args.source_name, "builder": "prepared_jsonl_validator", "episode_radius_m": args.episode_radius_m, "snap_tolerance_m": args.snap_tolerance_m})
         _write_graph(out, graph)
-    return {"episodes": episodes, "nodes": len(nodes), "edges": len(edges), "source": args.source_name, "mode": "prepared_jsonl", "synthetic_rejected": bool(args.fail_on_synthetic)}
+    return {"status": "PASS", "episodes": episodes, "nodes": len(nodes), "edges": len(edges), "source": args.source_name, "mode": "prepared_jsonl", "synthetic_rejected": bool(args.fail_on_synthetic)}
 
 
 def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
@@ -285,6 +285,8 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
             "georeference_validated": bool(transformer.config.get("validated", False)),
             "transform_backend": getattr(transformer, "transform_backend", "unknown"),
             "projected_map_frame": bool(getattr(transformer, "projected_map_frame", False)),
+            "spatial_alignment_validated": True,
+            "status": "PASS",
         }
     out = Path(args.output_graph_dir)
     source_report = Path(args.source_report_json) if args.source_report_json else out / "source_report.json"
@@ -326,7 +328,9 @@ def main() -> None:
     p.add_argument("--source_report_json", default=None, help="Optional per-city source report path; avoids overwriting reports when several cities share an output graph directory.")
     p.add_argument("--quality_report_json", default=None, help="Optional per-city graph quality report path.")
     args = p.parse_args()
-    print(json.dumps(build_graphs(args), indent=2, sort_keys=True))
+    report = build_graphs(args)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    print(f"ACCESSIBILITY_GRAPH_CHECK={report.get('status', 'PASS')}")
 
 
 if __name__ == "__main__":

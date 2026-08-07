@@ -312,6 +312,9 @@ def _read_any(path: str | Path | None) -> List[Dict[str, Any]]:
     if p.is_dir():
         rows: List[Dict[str, Any]] = []
         for child in sorted(p.rglob("*")):
+            name = child.name.lower()
+            if name.endswith((".report.json", ".provenance.json", ".manifest.json")):
+                continue
             if child.is_file() and child.suffix.lower() in {".json", ".geojson", ".jsonl", ".ndjson", ".geojsonl", ".yaml", ".yml", ".csv"}:
                 rows.extend(_read_any(child))
         return rows
@@ -418,11 +421,16 @@ def _classify_kind(tags: Dict[str, Any], geometry: List[List[float]]) -> str:
         return "curb_ramp"
     if t.get("barrier") == "kerb" or t.get("kerb") in {"raised", "regular", "yes"}:
         return "curb"
-    if t.get("highway") in {"footway", "path", "pedestrian", "steps"} or t.get("footway") == "sidewalk" or t.get("sidewalk") in {"yes", "both", "left", "right"}:
+    if t.get("highway") in {"footway", "path", "pedestrian", "steps"} or t.get("footway") == "sidewalk":
         return "sidewalk"
+    # OSM sidewalk=* on a carriageway is only an attribute saying a sidewalk
+    # exists alongside the road. It does not make the road centerline a
+    # pedestrian edge. Preserve it as non-routable evidence.
+    if t.get("sidewalk") in {"yes", "both", "left", "right", "separate"}:
+        return "road_with_sidewalk_tag"
     if t.get("osw:node:type") or t.get("osw:edge:type"):
         return t.get("osw:node:type") or t.get("osw:edge:type") or "sidewalk"
-    return "sidewalk" if len(geometry) > 1 else "poi"
+    return "unknown_linear" if len(geometry) > 1 else "poi"
 
 
 def _normalize_feature(row: Dict[str, Any], transformer: CoordinateTransformer, default_source: str) -> List[GISFeature]:
@@ -498,8 +506,6 @@ def _overpass_features(payload: Dict[str, Any], transformer: CoordinateTransform
             continue
         local = [list(transformer.wgs84_to_local(lon, lat)) for lon, lat in wgs]
         kind = _classify_kind(tags, local)
-        if kind == "poi" and len(local) > 1:
-            kind = "sidewalk"
         out.append(GISFeature(fid, kind, local, tags, str(tags.get("source") or default_source), float(tags.get("confidence", 0.85) or 0.85), wgs))
     return out
 
@@ -611,7 +617,7 @@ def _edge_attrs_from_feature(f: GISFeature) -> Dict[str, Any]:
         "cross_slope": a["cross_slope"],
         "surface": a["surface"],
         "curb_ramp": a["curb_ramp"] if a["curb_ramp"] is not None else (f.kind == "curb_ramp"),
-        "step_free": a["step_free"] if a["step_free"] is not None else (False if str(t.get("highway", "")).lower() == "steps" else None),
+        "step_free": a["step_free"] if a["step_free"] is not None else (False if f.kind == "steps" or str(t.get("highway", "")).lower() == "steps" else None),
         "obstacle": bool(_boolish(t.get("obstacle") or t.get("blocked")) or str(t.get("obstacle_state", "")).lower() == "blocked"),
         "lighting": a["lighting"],
         "shelter": a["shelter"],
@@ -655,11 +661,19 @@ class AccessibilityFusionBuilder:
                 node_extra[nid].update({k: v for k, v in (attrs or {}).items() if v is not None})
             return nid
 
+        routable_linear_kinds = {"sidewalk", "crossing", "path", "steps"}
+        point_kinds = {"entrance", "entrance_proxy", "curb", "curb_ramp", "transit_stop", "poi"}
+        skipped_linear_kinds: Dict[str, int] = {}
         for f in feats:
             attrs = _node_attrs_from_feature(f)
             if f.is_point:
-                x, y = f.geometry[0]
-                add_node(x, y, f.kind, f.source, f.confidence, f.feature_id, attrs)
+                # Entrance proxies are deliberately kept distinct from verified entrances.
+                # They may be useful as candidate OD anchors but are not promoted to
+                # authoritative entrance evidence by the graph builder.
+                add_node(f.geometry[0][0], f.geometry[0][1], f.kind, f.source, f.confidence, f.feature_id, attrs)
+                continue
+            if f.kind not in routable_linear_kinds:
+                skipped_linear_kinds[f.kind] = skipped_linear_kinds.get(f.kind, 0) + 1
                 continue
             previous: Optional[str] = None
             for i, (x, y) in enumerate(f.geometry):
@@ -691,6 +705,7 @@ class AccessibilityFusionBuilder:
             "snap_tolerance_m": self.snap_tolerance_m,
             "pudo_connector_radius_m": pudo_connector_radius_m,
             "node_attributes": node_extra,
+            "skipped_non_routable_linear_features": skipped_linear_kinds,
         })
         if len(graph.nodes) < min_nodes or len(graph.edges) < min_edges:
             raise RuntimeError(f"accessibility graph too small for {scene.episode_id}: {len(graph.nodes)} nodes/{len(graph.edges)} edges; required {min_nodes}/{min_edges}")

@@ -103,7 +103,18 @@ def main() -> None:
         inventory.append(inv); regulations.append(reg)
         entrance_id = (row.get("entrance_id") or "").strip()
         if entrance_id:
-            entrances.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [lon, lat]}, "properties": {
+            # An entrance is a different physical anchor from the curb/PUDO.
+            # Never silently copy curb coordinates into an entrance label.
+            entrance_lon = optional_float(row.get("entrance_lon"))
+            entrance_lat = optional_float(row.get("entrance_lat"))
+            if entrance_lon is None or entrance_lat is None:
+                raise RuntimeError(
+                    f"line {line_no}: entrance_id={entrance_id!r} requires independent entrance_lon/entrance_lat; "
+                    "leave entrance_id blank when the entrance has not been audited"
+                )
+            if not (-180 <= entrance_lon <= 180 and -90 <= entrance_lat <= 90):
+                raise RuntimeError(f"line {line_no}: invalid entrance WGS84 coordinate")
+            entrances.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [entrance_lon, entrance_lat]}, "properties": {
                 "entrance_id": entrance_id, "kind": "entrance", "source": source, "authoritative": True,
                 "audited": True, "confidence": 1.0, "observed_at": observed_at,
             }})

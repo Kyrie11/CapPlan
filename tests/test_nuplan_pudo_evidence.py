@@ -39,12 +39,41 @@ def test_route_pudo_does_not_fabricate_clearance_from_walkway_presence(monkeypat
     assert anchors[0].source == "nuplan_route_map_walkway_unmeasured"
 
 
-def test_route_pudo_uses_polygon_width_as_conservative_clearance_proxy(monkeypatch):
+def test_route_pudo_keeps_polygon_width_but_does_not_infer_deployment_clearance(monkeypatch):
     monkeypatch.setattr(pil, "_collect_route_lane_objects", lambda *args, **kwargs: [_FakeLane()])
     monkeypatch.setattr(pil, "_walkway_context", lambda *args, **kwargs: (True, 1.8, 0.0))
 
     anchors = pil.nuplan_route_pudo_anchors("nuplan_test", object(), ["rb0"], _graph(), n=1)
 
     assert anchors[0].sidewalk_width_m == 1.8
-    assert anchors[0].deployment_clearance_m == 1.2
-    assert anchors[0].source == "nuplan_route_map_walkway_width_proxy"
+    assert anchors[0].deployment_clearance_m is None
+    assert anchors[0].legal_stop is False
+    assert anchors[0].legal_stop_source == "nuplan_route_geometry_candidate_no_legality_evidence"
+    assert anchors[0].source == "nuplan_route_map_walkway_width_proxy_candidate"
+
+
+def test_paper_evidence_requires_independent_interface_inventory():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("build_pudo_evidence", Path("scripts/build_pudo_evidence.py"))
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    base = {
+        "source": "official_candidate",
+        "legal_stop": True,
+        "legal_stop_source": "manual_posted_sign_audit",
+        "adjacent_ped_node_id": "ped0",
+        "curb_height_m": 0.02,
+        "sidewalk_width_m": 1.8,
+        "deployment_clearance_m": 1.4,
+    }
+    complete, eligible, status = mod._paper_evidence_flags(base)
+    assert not complete and not eligible
+    assert "no_auditable_interface_evidence" in status
+
+    audited = dict(base, curb_inventory_source="manual_interface_audit")
+    complete, eligible, status = mod._paper_evidence_flags(audited)
+    assert complete and eligible and status == "paper_ready"

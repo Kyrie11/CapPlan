@@ -9,6 +9,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+try:
+    from pyproj import CRS  # type: ignore
+except Exception:  # pragma: no cover
+    CRS = None  # type: ignore
+
 SUPPORTED_SUFFIXES = {".json", ".geojson", ".jsonl", ".ndjson", ".geojsonl", ".csv", ".yaml", ".yml"}
 HTML_PREFIXES = (b"<!doctype html", b"<html", b"<?xml")
 ERROR_PREFIXES = (b"too many requests", b"rate limit", b"access denied", b"forbidden", b"service unavailable")
@@ -144,7 +149,42 @@ def _semantic_role_check(role: Optional[str], rows: Sequence[Mapping[str, Any]],
     out.role_stats["sampled_records"] = len(rows)
     out.role_stats["sampled_fields"] = sorted(str(k) for k in keys)[:200]
 
-    if role == "elevation":
+    if role == "osm":
+        pedestrian_lines = 0
+        carriageway_sidewalk_mislabels = 0
+        for r in rows:
+            geom = r.get("geometry") if isinstance(r.get("geometry"), dict) else {}
+            gtype = str(geom.get("type") or "")
+            kind = str(r.get("kind") or "").lower()
+            highway = str(r.get("highway") or "").lower()
+            footway = str(r.get("footway") or "").lower()
+            sidewalk = str(r.get("sidewalk") or "").lower()
+            # Accept both our normalized ``kind`` and raw/filtered OSM tags.
+            # A carriageway carrying only ``sidewalk=*`` is deliberately NOT
+            # counted as pedestrian geometry; separate footway/path geometry is.
+            osm_pedestrian = (
+                highway in {"footway", "path", "pedestrian", "steps"}
+                or footway in {"sidewalk", "crossing", "access_aisle"}
+            )
+            if gtype in {"LineString", "MultiLineString"} and (
+                kind in {"sidewalk", "crossing", "path", "steps"} or osm_pedestrian
+            ):
+                pedestrian_lines += 1
+            if (
+                gtype in {"LineString", "MultiLineString"}
+                and kind == "sidewalk"
+                and sidewalk in {"yes", "both", "left", "right", "separate"}
+                and highway not in {"footway", "path", "pedestrian", "steps"}
+                and footway not in {"sidewalk", "crossing", "access_aisle"}
+            ):
+                carriageway_sidewalk_mislabels += 1
+        out.role_stats["routable_pedestrian_lines"] = pedestrian_lines
+        out.role_stats["carriageway_sidewalk_mislabels"] = carriageway_sidewalk_mislabels
+        if pedestrian_lines <= 0:
+            out.errors.append("osm_has_no_routable_pedestrian_line_geometry")
+        if carriageway_sidewalk_mislabels > 0:
+            out.errors.append("osm_carriageway_centerline_mislabeled_as_sidewalk")
+    elif role == "elevation":
         usable = sum(
             1 for r in rows
             if any(_is_number(r.get(k)) for k in ("elevation_m", "elevation", "z", "height_m", "running_slope", "slope"))
@@ -179,9 +219,15 @@ def _semantic_role_check(role: Optional[str], rows: Sequence[Mapping[str, Any]],
                 or (_is_number(r.get("longitude")) and _is_number(r.get("latitude")))
             )
         usable = sum(1 for r in rows if is_point(r))
+        verified = sum(1 for r in rows if is_point(r) and not bool(r.get("is_proxy")) and str(r.get("kind") or "").lower() != "entrance_proxy")
+        proxies = sum(1 for r in rows if is_point(r) and (bool(r.get("is_proxy")) or str(r.get("kind") or "").lower() == "entrance_proxy"))
         out.role_stats["usable_entrance_points"] = usable
+        out.role_stats["verified_nonproxy_entrance_points"] = verified
+        out.role_stats["proxy_entrance_points"] = proxies
         if usable <= 0:
             out.errors.append("entrance_source_has_no_point_entrances")
+        elif verified <= 0:
+            out.errors.append("entrance_source_contains_only_proxy_points")
     elif role == "manual_audit":
         usable = sum(1 for r in rows if r.get("audit_id") and r.get("observed_at") and r.get("auditor_id"))
         out.role_stats["usable_audit_records"] = usable
@@ -210,7 +256,12 @@ def inspect_source(path: str | Path | None, *, role: Optional[str] = None) -> So
         out.errors.append("missing")
         return out
     if p.is_dir():
-        children = sorted(x for x in p.rglob("*") if x.is_file() and x.suffix.lower() in SUPPORTED_SUFFIXES)
+        children = sorted(
+            x for x in p.rglob("*")
+            if x.is_file()
+            and x.suffix.lower() in SUPPORTED_SUFFIXES
+            and not x.name.lower().endswith((".report.json", ".provenance.json", ".manifest.json"))
+        )
         if not children:
             out.errors.append("directory_contains_no_supported_data_files")
             return out
@@ -340,8 +391,20 @@ def validate_georeference(path: str | Path | None) -> SourceInspection:
         report.errors.append("georeference_missing_local_crs_or_origin_control_point")
     if not bool(payload.get("validated", False)):
         report.warnings.append("georeference_not_marked_validated")
-    if payload.get("local_crs") and not str(payload["local_crs"]).upper().startswith("EPSG:"):
-        report.warnings.append("local_crs_is_not_normalized_epsg_string")
+    if payload.get("local_crs"):
+        if not str(payload["local_crs"]).upper().startswith("EPSG:"):
+            report.warnings.append("local_crs_is_not_normalized_epsg_string")
+        if CRS is not None:
+            try:
+                parsed = CRS.from_user_input(payload["local_crs"])
+                if not parsed.is_projected:
+                    report.valid = False
+                    report.errors.append("local_crs_is_not_projected")
+            except Exception as exc:
+                report.valid = False
+                report.errors.append(f"local_crs_parse_error:{type(exc).__name__}")
+    if bool(payload.get("crs_metadata_validated")) and not bool(payload.get("spatial_alignment_validated")):
+        report.warnings.append("crs_metadata_validated_but_spatial_overlap_not_yet_validated")
     return report
 
 

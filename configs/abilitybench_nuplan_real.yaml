@@ -20,14 +20,16 @@ outputs_root: "{project_root}/data/outputs"
 fleet_jsonl: "{project_root}/data/external/normalized/fleet/vehicle_interfaces.jsonl"
 
 quality:
-  # bootstrap: real nuPlan + at least one pedestrian topology source; missing
-  # attributes remain unknown/fail-closed.  Not valid for main paper results.
-  # paper: validated CRS + physical curb inventory + curb legality + entrances
-  # + slope/elevation + authoritative/audited evidence + provenance manifests.
+  # bootstrap: real nuPlan + pedestrian topology; missing attributes remain
+  # unknown/fail-closed.  Useful for pipeline bring-up, not main results.
+  # paper: keeps uncertain candidates instead of fabricating fields, but requires
+  # a minimum set of evidence-complete PUDO anchors per episode for main-result
+  # evaluation. This matches the paper's uncertainty semantics.
   source_policy: bootstrap
   min_graph_nodes: 100
   min_graph_edges: 150
-  max_core_pudo_missing_rate: 0.05
+  min_paper_eligible_pudos_per_episode: 2
+  min_episode_pudo_coverage_rate: 0.80
 
 service:
   # Counterfactual profiles should be increased for final experiments.
@@ -45,15 +47,18 @@ overpass:
 splits:
   train:
     cities: [boston, pittsburgh, vegas, singapore]
-    db_dirs: [trainval]
+    db_dirs: [train_boston, train_pittsburgh, train_vegas, train_singapore]
     max_scenarios_per_city: 1000
   val:
-    # Do not treat a second run over the same DB set as an independent split.
-    # build_dataset.py now creates non-overlapping log-grouped train/val/test
-    # files within each built dataset.  Use explicit nuplan_log_names here only
-    # when you maintain an external frozen split manifest.
+    # The official val DB directory may contain logs from multiple maps/cities.
+    # City separation is done by nuPlan ScenarioFilter(map_names=...), not by
+    # copying/moving DB files.
     cities: [boston, pittsburgh, vegas, singapore]
-    db_dirs: [trainval]
+    db_dirs: [val]
+    max_scenarios_per_city: 250
+  test:
+    cities: [boston, pittsburgh, vegas, singapore]
+    db_dirs: [test]
     max_scenarios_per_city: 250
 
 cities:
@@ -82,7 +87,11 @@ cities:
     city_gis_dir: "{project_root}/data/external/normalized/city_gis/pittsburgh"
     # Fail closed by default. Set true only after the directory contains official WPRDC/City layers or add a manual audit manifest.
     city_gis_authoritative: false
-    city_gis_has_pedestrian_topology: false
+    # WPRDC Sidewalks and Steps supplies real pedestrian geometry, but not the
+    # physical width/slope ground truth required for boarding feasibility.
+    city_gis_has_pedestrian_topology: true
+    pudo_candidate_sources:
+      - "{project_root}/data/external/normalized/candidates/pittsburgh/payment_points_current.jsonl"
     curb_inventory_jsonl: "{project_root}/data/external/normalized/curb_inventory/pittsburgh.jsonl"
     curb_regulation_jsonl: "{project_root}/data/external/normalized/curb_regulations/pittsburgh.jsonl"
     entrance_source: "{project_root}/data/external/normalized/entrances/pittsburgh.geojson"
@@ -100,6 +109,8 @@ cities:
     # Las Vegas official layers are authoritative for the attributes they actually contain; leave false until curated/mapped.
     city_gis_authoritative: false
     city_gis_has_pedestrian_topology: false
+    pudo_candidate_sources:
+      - "{project_root}/data/external/normalized/candidates/vegas/taxi_zones.jsonl"
     curb_inventory_jsonl: "{project_root}/data/external/normalized/curb_inventory/vegas.jsonl"
     curb_regulation_jsonl: "{project_root}/data/external/normalized/curb_regulations/vegas.jsonl"
     entrance_source: "{project_root}/data/external/normalized/entrances/vegas.geojson"
@@ -116,7 +127,11 @@ cities:
     city_gis_dir: "{project_root}/data/external/normalized/city_gis/singapore"
     # OneMap/LTA layers must be curated and field-mapped before they count as authoritative accessibility evidence.
     city_gis_authoritative: false
-    city_gis_has_pedestrian_topology: false
+    # Official LTA Footpath can provide pedestrian topology when downloaded.
+    city_gis_has_pedestrian_topology: true
+    pudo_candidate_sources:
+      - "{project_root}/data/external/normalized/candidates/singapore/passenger_pickup_bay.jsonl"
+      - "{project_root}/data/external/normalized/candidates/singapore/taxi_stand.jsonl"
     curb_inventory_jsonl: "{project_root}/data/external/normalized/curb_inventory/singapore.jsonl"
     curb_regulation_jsonl: "{project_root}/data/external/normalized/curb_regulations/singapore.jsonl"
     entrance_source: "{project_root}/data/external/normalized/entrances/singapore.geojson"

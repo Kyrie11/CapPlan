@@ -181,7 +181,6 @@ def overpass_query(bbox: List[float], timeout_s: int) -> str:
 (
   way["highway"~"footway|path|pedestrian|steps"]({bb});
   way["footway"~"sidewalk|crossing|access_aisle"]({bb});
-  way["sidewalk"~"yes|both|left|right|separate"]({bb});
   way["highway"="crossing"]({bb});
   node["kerb"]({bb});
   node["curb"]({bb});
@@ -330,7 +329,7 @@ def feature_kind(el: Dict[str, Any]) -> Optional[str]:
     if el.get("type") == "way":
         if t.get("highway") == "crossing" or t.get("footway") == "crossing":
             return "crossing"
-        if t.get("highway") in {"footway", "path", "pedestrian", "steps"} or t.get("sidewalk") or t.get("footway"):
+        if t.get("highway") in {"footway", "path", "pedestrian", "steps"} or t.get("footway") in {"sidewalk", "access_aisle"}:
             return "sidewalk"
     return None
 

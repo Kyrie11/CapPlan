@@ -17,7 +17,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from sample_dem_elevation_jsonl import collect_points
 
 
-def _sample(points: Sequence[Tuple[float, float]], rasters: Sequence[Path], nodata_tolerance: float = 1e-9) -> Tuple[List[Optional[float]], List[Optional[str]], List[Optional[float]]]:
+def _sample(
+    points: Sequence[Tuple[float, float]],
+    rasters: Sequence[Path],
+    nodata_tolerance: float = 1e-9,
+) -> Tuple[List[Optional[float]], List[Optional[str]], List[Optional[float]], List[Optional[str]]] :
     try:
         import rasterio  # type: ignore
         from rasterio.warp import transform  # type: ignore
@@ -27,6 +31,7 @@ def _sample(points: Sequence[Tuple[float, float]], rasters: Sequence[Path], noda
     values: List[Optional[float]] = [None] * len(points)
     source_tiles: List[Optional[str]] = [None] * len(points)
     resolutions: List[Optional[float]] = [None] * len(points)
+    resolution_units: List[Optional[str]] = [None] * len(points)
     remaining = set(range(len(points)))
     for raster_path in rasters:
         if not remaining:
@@ -48,6 +53,10 @@ def _sample(points: Sequence[Tuple[float, float]], rasters: Sequence[Path], noda
                 continue
             samples = ds.sample(xy, indexes=1, masked=True)
             resolution = float(max(abs(ds.res[0]), abs(ds.res[1])))
+            if bool(getattr(ds.crs, "is_geographic", False)):
+                resolution_unit = "degree"
+            else:
+                resolution_unit = str(getattr(ds.crs, "linear_units", None) or "projected_crs_unit")
             for i, sample in zip(inside_ids, samples):
                 if getattr(sample, "mask", False) is True or len(sample) == 0:
                     continue
@@ -65,8 +74,9 @@ def _sample(points: Sequence[Tuple[float, float]], rasters: Sequence[Path], noda
                 values[i] = z
                 source_tiles[i] = str(raster_path)
                 resolutions[i] = resolution
+                resolution_units[i] = resolution_unit
                 remaining.discard(i)
-    return values, source_tiles, resolutions
+    return values, source_tiles, resolutions, resolution_units
 
 
 def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> int:
@@ -92,6 +102,8 @@ def main() -> None:
     p.add_argument("--output", default=None)
     p.add_argument("--vertical_datum", default="unknown", help="Record the source vertical datum, e.g. NAVD88 or EGM2008.")
     p.add_argument("--source_name", default="local_raster_dem")
+    p.add_argument("--nominal_resolution_m", type=float, default=None,
+                   help="Optional product-level nominal ground resolution in metres (e.g. 1 for USGS 1m, 30 for COP-DEM GLO-30).")
     p.add_argument("--max_points", type=int, default=0, help="0 means all unique vertices.")
     p.add_argument("--stride_m", type=float, default=0.0, help="Use 0 for exact graph vertices; positive values thin dense input.")
     p.add_argument("--precision", type=int, default=7)
@@ -115,10 +127,10 @@ def main() -> None:
     )
     if not points:
         raise RuntimeError("no WGS84 points were found in normalized OSM/OSW/entrance/curb layers")
-    values, tiles, resolutions = _sample(points, rasters)
+    values, tiles, resolutions, resolution_units = _sample(points, rasters)
     rows: List[Dict[str, Any]] = []
     missing_count = 0
-    for i, ((lon, lat), z, tile, resolution) in enumerate(zip(points, values, tiles, resolutions)):
+    for i, ((lon, lat), z, tile, resolution, resolution_unit) in enumerate(zip(points, values, tiles, resolutions, resolution_units)):
         if z is None:
             missing_count += 1
             continue
@@ -131,6 +143,8 @@ def main() -> None:
             "source": args.source_name,
             "source_tile": tile,
             "source_resolution": resolution,
+            "source_resolution_unit": resolution_unit,
+            "nominal_resolution_m": args.nominal_resolution_m,
             "vertical_datum": args.vertical_datum,
             "evidence_tier": "C_derived_terrain_prior",
             "authoritative": False,
@@ -150,8 +164,11 @@ def main() -> None:
         "coverage": coverage,
         "rasters": [str(x) for x in rasters],
         "vertical_datum": args.vertical_datum,
+        "nominal_resolution_m": args.nominal_resolution_m,
+        "resolution_units": sorted({u for u in resolution_units if u}),
         "output": str(out),
         "publication_note": "terrain elevation is auxiliary; critical PUDO slopes still require authoritative data or manual audit",
+        "status": "PASS" if coverage >= 0.99 or args.allow_partial_coverage else "FAIL",
     }
     report_path = external_root / "reports" / f"local_dem_sampling_{args.city}.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)

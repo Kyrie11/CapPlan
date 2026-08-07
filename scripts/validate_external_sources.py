@@ -49,6 +49,8 @@ def main() -> None:
         output = PROJECT_ROOT / output
     dump_json(output, report)
     print(json.dumps(report, indent=2, sort_keys=True))
+    status = "PASS" if not report["blockers"] else "FAIL"
+    print(f"EXTERNAL_SOURCE_CHECK={status}")
     print(f"wrote {output}")
     if report["blockers"] and not args.no_fail:
         raise SystemExit("external source preflight failed: " + "; ".join(report["blockers"]))

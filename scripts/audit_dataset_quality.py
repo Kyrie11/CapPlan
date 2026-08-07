@@ -53,7 +53,7 @@ def _rate(count: int, total: int) -> float:
     return float(count) / max(1, int(total))
 
 
-def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_nodes: int = 100, min_graph_edges: int = 150, max_core_pudo_missing_rate: float = 0.05, min_edge_positive_rate: float = 0.10, min_skeleton_positive_rate: float = 0.10) -> Dict[str, Any]:
+def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_nodes: int = 100, min_graph_edges: int = 150, max_core_pudo_missing_rate: float = 1.0, min_edge_positive_rate: float = 0.10, min_skeleton_positive_rate: float = 0.10, min_paper_eligible_pudos_per_episode: int = 2, min_episode_pudo_coverage_rate: float = 0.80, min_failure_phase_diversity: int = 2) -> Dict[str, Any]:
     root = _Path(dataset_dir)
     episodes = _safe_read(root / "episodes.jsonl")
     scenes = _safe_read(root / "scenes.jsonl")
@@ -112,11 +112,39 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
     transition_false = sum(1 for r in transition_labels if not r.get("z_e"))
     passenger_true_rate = passenger_true / max(1, passenger_true + passenger_false)
     skeleton_rate = len(skeletons) / max(1, len(certificates) + len(skeletons))
+
+    pudo_by_episode: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in pudos:
+        pudo_by_episode[str(row.get("episode_id") or "unknown")].append(row)
+
+    def _pudo_complete(row: Dict[str, Any]) -> bool:
+        if row.get("paper_evidence_complete") is not None:
+            return bool(row.get("paper_evidence_complete"))
+        core = all(row.get(k) is not None for k in ("curb_height_m", "deployment_clearance_m", "sidewalk_width_m"))
+        legality = str(row.get("legal_stop_source") or "").lower()
+        independent = bool(legality) and "no_matching_regulation" not in legality and "heuristic" not in legality and "no_legality_evidence" not in legality
+        return core and bool(row.get("adjacent_ped_node_id")) and independent and not _bad_source(row.get("source"))
+
+    def _pudo_eligible(row: Dict[str, Any]) -> bool:
+        if row.get("paper_eligible") is not None:
+            return bool(row.get("paper_eligible"))
+        return _pudo_complete(row) and bool(row.get("legal_stop"))
+
+    eligible_by_episode = {eid: sum(1 for row in rows if _pudo_eligible(row)) for eid, rows in pudo_by_episode.items()}
+    complete_by_episode = {eid: sum(1 for row in rows if _pudo_complete(row)) for eid, rows in pudo_by_episode.items()}
+    episode_ids = [str(ep.get("episode_id")) for ep in episodes]
+    episodes_meeting_pudo_gate = sum(1 for eid in episode_ids if eligible_by_episode.get(eid, 0) >= min_paper_eligible_pudos_per_episode)
+    episode_pudo_coverage_rate = _rate(episodes_meeting_pudo_gate, len(episode_ids))
+    certificate_phase_counts = Counter(str(c.get("phase") or "unknown") for c in certificates)
+    certificate_phase_diversity = len([k for k, v in certificate_phase_counts.items() if k != "unknown" and v > 0])
+
     issues: List[str] = []
     if validation.get("ok") is False:
         issues.append("schema_validation_failed")
     if len(skeletons) == 0:
         issues.append("no_passenger_complete_skeletons")
+    if len(certificates) == 0:
+        issues.append("no_failure_certificates")
     if passenger_labels and passenger_true == 0:
         issues.append("no_passenger_feasible_edges")
     elif passenger_labels and passenger_true_rate < 0.05:
@@ -165,10 +193,14 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
         if synthetic_sources: issues.append("paper_mode_synthetic_or_proxy_sources_present")
         if graph_node_counts and min(graph_node_counts) < min_graph_nodes: issues.append("paper_mode_graph_nodes_too_few")
         if graph_edge_counts and min(graph_edge_counts) < min_graph_edges: issues.append("paper_mode_graph_edges_too_few")
-        for k, r in pudo_missing_rates.items():
-            if r > max_core_pudo_missing_rate: issues.append(f"paper_mode_pudo_{k}_missing_rate_too_high")
+        # Missing values are allowed on retained uncertain candidates. Publication
+        # readiness instead requires enough fully evidenced, legally usable PUDOs.
+        if episode_pudo_coverage_rate < min_episode_pudo_coverage_rate:
+            issues.append("paper_mode_insufficient_episode_pudo_evidence_coverage")
         if passenger_labels and passenger_true_rate < min_edge_positive_rate: issues.append("paper_mode_passenger_edge_positive_rate_too_low")
         if (certificates or skeletons) and skeleton_rate < min_skeleton_positive_rate: issues.append("paper_mode_skeleton_positive_rate_too_low")
+        if certificate_phase_diversity < min_failure_phase_diversity:
+            issues.append("paper_mode_failure_certificate_phase_diversity_too_low")
 
     blocking_issues = sorted(set(issues)) if paper_mode else sorted(set(issues))
     warnings = []
@@ -230,6 +262,17 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
             "resource_missing_by_name": dict(resource_missing.most_common()),
             "missing_with_nonnull_value": len(missing_with_nonnull),
         },
+        "pudo_evidence_readiness": {
+            "paper_eligible_total": sum(eligible_by_episode.values()),
+            "paper_evidence_complete_total": sum(complete_by_episode.values()),
+            "paper_eligible_by_episode": eligible_by_episode,
+            "paper_evidence_complete_by_episode": complete_by_episode,
+            "min_required_eligible_per_episode": min_paper_eligible_pudos_per_episode if paper_mode else None,
+            "episodes_meeting_gate": episodes_meeting_pudo_gate,
+            "episode_coverage_rate": episode_pudo_coverage_rate,
+            "min_required_episode_coverage_rate": min_episode_pudo_coverage_rate if paper_mode else None,
+            "note": "Missing fields on uncertain candidates are permitted; only evidence-complete legal interfaces count as paper_eligible.",
+        },
         "label_health": {
             "transition_z_by_action": {k: dict(v) for k, v in sorted(transition_z_by_action.items())},
             "transition_z_true": transition_true,
@@ -241,6 +284,8 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
             "skeleton_label_count": len(skeletons),
             "oracle_skeleton_rate": skeleton_rate,
             "failed_resources": dict(failed_resources.most_common(30)),
+            "certificate_phase_counts": dict(certificate_phase_counts),
+            "certificate_phase_diversity": certificate_phase_diversity,
         },
         "truthfulness_flags": {
             "uses_proxy_entrances": any("proxy" in str(e.get("source", "")) for e in entrances),
@@ -270,6 +315,7 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
             "cross_slope": _rate(resource_missing.get("cross_slope", 0), len(resources)),
         },
         "publication_readiness": {
+            "status": "PASS" if len(blocking_issues) == 0 else "FAIL",
             "ready_for_main_results": len(blocking_issues) == 0,
             "issues": blocking_issues,
             "blocking_issues": blocking_issues,
@@ -289,16 +335,26 @@ def main() -> None:
     parser.add_argument("--fail_if_not_publication_ready", action="store_true")
     parser.add_argument("--min_graph_nodes", type=int, default=100)
     parser.add_argument("--min_graph_edges", type=int, default=150)
-    parser.add_argument("--max_core_pudo_missing_rate", type=float, default=0.05)
+    parser.add_argument("--max_core_pudo_missing_rate", type=float, default=1.0, help="Deprecated compatibility flag; candidate missingness no longer blocks paper mode.")
+    parser.add_argument("--min_paper_eligible_pudos_per_episode", type=int, default=2)
+    parser.add_argument("--min_episode_pudo_coverage_rate", type=float, default=0.80)
+    parser.add_argument("--min_failure_phase_diversity", type=int, default=2)
     parser.add_argument("--min_edge_positive_rate", type=float, default=0.10)
     parser.add_argument("--min_skeleton_positive_rate", type=float, default=0.10)
     args = parser.parse_args()
-    report = audit_dataset(args.dataset_dir, paper_mode=args.paper_mode, min_graph_nodes=args.min_graph_nodes, min_graph_edges=args.min_graph_edges, max_core_pudo_missing_rate=args.max_core_pudo_missing_rate, min_edge_positive_rate=args.min_edge_positive_rate, min_skeleton_positive_rate=args.min_skeleton_positive_rate)
+    report = audit_dataset(
+        args.dataset_dir, paper_mode=args.paper_mode, min_graph_nodes=args.min_graph_nodes, min_graph_edges=args.min_graph_edges,
+        max_core_pudo_missing_rate=args.max_core_pudo_missing_rate, min_edge_positive_rate=args.min_edge_positive_rate,
+        min_skeleton_positive_rate=args.min_skeleton_positive_rate, min_paper_eligible_pudos_per_episode=args.min_paper_eligible_pudos_per_episode,
+        min_episode_pudo_coverage_rate=args.min_episode_pudo_coverage_rate, min_failure_phase_diversity=args.min_failure_phase_diversity,
+    )
     text = json.dumps(report, indent=2, sort_keys=True)
     print(text)
+    ready = bool(report.get("publication_readiness", {}).get("ready_for_main_results", False))
+    print(f"ABILITYBENCH_DATASET_CHECK={'PASS' if ready else 'FAIL'}")
     if args.output:
         dump_json(args.output, report)
-    if args.fail_if_not_publication_ready and not report.get("publication_readiness", {}).get("ready_for_main_results", False):
+    if args.fail_if_not_publication_ready and not ready:
         raise SystemExit("dataset is not publication-ready: " + ", ".join(report.get("publication_readiness", {}).get("blocking_issues", [])))
 
 

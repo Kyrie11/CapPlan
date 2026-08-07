@@ -13,7 +13,6 @@ from typing import List
 DEFAULT_FILTERS = [
     "w/highway=footway,path,pedestrian,steps,crossing",
     "w/footway=sidewalk,crossing,access_aisle",
-    "w/sidewalk",
     "n/kerb",
     "n/curb",
     "n/curb_ramp",
@@ -26,6 +25,35 @@ DEFAULT_FILTERS = [
 def run(cmd: List[str]) -> None:
     print(" ".join(cmd))
     subprocess.check_call(cmd)
+
+
+def validate_osm_geojson(payload: dict) -> dict:
+    """Fail on the carriageway-as-sidewalk error and report pedestrian content."""
+    features = payload.get("features") or []
+    suspicious = []
+    pedestrian_lines = 0
+    for feat in features:
+        props = feat.get("properties") if isinstance(feat.get("properties"), dict) else {}
+        t = {str(k).lower(): str(v).lower() for k, v in props.items() if v is not None}
+        geom_type = str((feat.get("geometry") or {}).get("type") or "")
+        if geom_type in {"LineString", "MultiLineString"}:
+            highway = t.get("highway")
+            footway = t.get("footway")
+            if highway in {"footway", "path", "pedestrian", "steps", "crossing"} or footway in {"sidewalk", "crossing", "access_aisle"}:
+                pedestrian_lines += 1
+            # `sidewalk=*` on a motor-road describes sidewalk presence beside the
+            # carriageway; it is not pedestrian geometry. Such a feature should
+            # never be selected by this paper-mode extract.
+            if t.get("sidewalk") in {"yes", "both", "left", "right", "separate"} and highway not in {"footway", "path", "pedestrian", "steps", "crossing"} and footway not in {"sidewalk", "crossing", "access_aisle"}:
+                suspicious.append(str(props.get("@id") or props.get("id") or "unknown"))
+    if suspicious:
+        raise RuntimeError(
+            "OSM extract contains carriageway ways selected only by sidewalk=*; "
+            f"refusing to use them as pedestrian geometry. examples={suspicious[:10]}"
+        )
+    if pedestrian_lines <= 0:
+        raise RuntimeError("OSM extract contains no pedestrian line geometry")
+    return {"pedestrian_line_features": pedestrian_lines, "suspicious_carriageway_sidewalk_features": len(suspicious)}
 
 
 def main() -> None:
@@ -61,6 +89,7 @@ def main() -> None:
         features = payload.get("features") if isinstance(payload, dict) else None
         if payload.get("type") != "FeatureCollection" or not isinstance(features, list) or not features:
             raise RuntimeError("osmium export produced no GeoJSON features")
+        validation = validate_osm_geojson(payload)
         props = payload.setdefault("properties", {})
         props.update({
             "source": "OpenStreetMap local PBF extract",
@@ -74,7 +103,7 @@ def main() -> None:
         part = out.with_suffix(out.suffix + ".part")
         part.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         part.replace(out)
-    print(json.dumps({"output": str(out), "features": len(features)}, indent=2))
+    print(json.dumps({"status": "PASS", "output": str(out), "features": len(features), **validation}, indent=2))
 
 
 if __name__ == "__main__":

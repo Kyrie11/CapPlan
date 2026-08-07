@@ -77,3 +77,11 @@ def test_pudo_and_service_generators_use_graph_outputs(tmp_path):
     requests = read_jsonl(req_out)
     assert {p["profile_id"] for p in profiles} == {"basic_service_complete", "mobility_interface_constrained", "compound_uncertainty_sensitive"}
     assert len(requests) == 3
+
+
+def test_osm_sidewalk_attribute_on_carriageway_is_not_routable_sidewalk():
+    from capplan.data.gis_fusion import _classify_kind
+
+    geom = [[-71.0, 42.0], [-70.999, 42.0]]
+    assert _classify_kind({"highway": "residential", "sidewalk": "both"}, geom) == "road_with_sidewalk_tag"
+    assert _classify_kind({"highway": "footway", "footway": "sidewalk"}, geom) == "sidewalk"

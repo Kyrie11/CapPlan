@@ -228,7 +228,8 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     seed = int(config.get("seed", 13))
     min_nodes = int(config.get("quality", {}).get("min_graph_nodes", 100))
     min_edges = int(config.get("quality", {}).get("min_graph_edges", 150))
-    max_missing = float(config.get("quality", {}).get("max_core_pudo_missing_rate", 0.05))
+    min_paper_eligible = int(config.get("quality", {}).get("min_paper_eligible_pudos_per_episode", 2))
+    min_episode_pudo_coverage = float(config.get("quality", {}).get("min_episode_pudo_coverage_rate", 0.80))
     endpoint = str(config.get("overpass", {}).get("endpoint", "https://overpass-api.de/api/interpreter"))
     timeout_s = int(config.get("overpass", {}).get("timeout_s", 180))
 
@@ -393,8 +394,6 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(city_pudo),
                 "--candidate_radius_m",
                 str(config.get("pudo", {}).get("candidate_radius_m", 120)),
-                "--max_core_missing_rate",
-                str(max_missing),
                 "--source_name",
                 f"{city}_city_curb_regulation_inventory" if source_policy == "paper" else f"{city}_bootstrap_osm_pudo_candidates",
                 "--report_json",
@@ -404,8 +403,9 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             pudo_cmd += ["--georeference_json", str(_path(city_cfg["georeference_json"]))]
             _add_source_arg(pudo_cmd, "--curb_inventory_jsonl", city_curb_inventory, dry_run, required=(source_policy == "paper"), missing=missing_pudo_sources)
             _add_source_arg(pudo_cmd, "--curb_regulation_jsonl", city_curb_reg, dry_run, required=(source_policy == "paper"), missing=missing_pudo_sources)
-            if source_policy == "paper":
-                pudo_cmd.append("--fail_on_missing_core_evidence")
+            for candidate_source in (city_cfg.get("pudo_candidate_sources") or []):
+                candidate_path = _path(candidate_source)
+                _add_source_arg(pudo_cmd, "--pudo_candidate_source", candidate_path, dry_run, required=False, missing=missing_pudo_sources)
             if missing_pudo_sources:
                 raise RuntimeError("missing PUDO paper sources: " + "; ".join(missing_pudo_sources))
             _run(pudo_cmd, dry_run)
@@ -503,8 +503,8 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(min_nodes),
                 "--min_graph_edges",
                 str(min_edges),
-                "--max_core_pudo_missing_rate",
-                str(max_missing),
+                "--min_paper_eligible_pudos_per_episode",
+                str(min_paper_eligible),
                 "--output_dir",
                 str(city_dataset),
                 "--strict",
@@ -525,8 +525,10 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                     str(min_nodes),
                     "--min_graph_edges",
                     str(min_edges),
-                    "--max_core_pudo_missing_rate",
-                    str(max_missing),
+                    "--min_paper_eligible_pudos_per_episode",
+                    str(min_paper_eligible),
+                    "--min_episode_pudo_coverage_rate",
+                    str(min_episode_pudo_coverage),
                 ]
                 _run(audit_cmd, dry_run)
 
@@ -551,7 +553,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
 def main() -> None:
     p = argparse.ArgumentParser(description="Prepare OSM/OpenSidewalks/city-GIS/curb/DEM inputs and build nuPlan-based AbilityBench datasets.")
     p.add_argument("--config", default="configs/abilitybench_nuplan_real.yaml")
-    p.add_argument("--split", choices=["train", "val"], default="train")
+    p.add_argument("--split", choices=["train", "val", "test"], default="train")
     p.add_argument("--stages", default="all", help="Comma list: queries,download,map_crs,preflight,extract,graphs,pudo,service,dataset,merge,all. Online download is never implied by all.")
     p.add_argument("--dry_run", action="store_true", help="Print commands without executing them.")
     p.add_argument("--disable_tqdm", action="store_true", help="Disable city/stage and dataset progress bars.")

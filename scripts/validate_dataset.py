@@ -18,6 +18,8 @@ def main() -> None:
     result = validate_dataset(args.dataset_dir, strict=args.strict)
     dump_json(_Path(args.dataset_dir) / "validation_report.json", result)
     print(result)
+    errors = result.get("errors", []) if isinstance(result, dict) else []
+    print(f"DATASET_SCHEMA_CHECK={'PASS' if not errors else 'FAIL'}")
 
 
 if __name__ == "__main__":

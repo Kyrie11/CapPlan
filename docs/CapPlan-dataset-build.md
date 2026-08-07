@@ -1,3 +1,5 @@
+> **2026-08 数据语义修订：** 用于论文主实验时请优先执行 [`CapPlan-dataset-build-optimized.md`](CapPlan-dataset-build-optimized.md)。优化版修复了 OSM carriageway/sidewalk 混淆、PUDO legality/interface proxy、Boston deployment-clearance、train/val/test split、Pittsburgh/LTA 数据源和 paper PASS/FAIL gates。
+
 # CapPlan / AbilityBench-AV 数据集准备与复现实验指南
 
 > 适用项目路径：`/home/senzeyu2/code/CapPlan`  

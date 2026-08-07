@@ -132,19 +132,27 @@ def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: An
     if len(graph.nodes) < args.min_graph_nodes or len(graph.edges) < args.min_graph_edges:
         raise RuntimeError(f"paper_mode graph for {eid} is too small: {len(graph.nodes)} nodes/{len(graph.edges)} edges; required {args.min_graph_nodes}/{args.min_graph_edges}")
     if not pudo:
-        raise RuntimeError(f"paper_mode requires audited PUDO candidates for {eid}")
-    missing = {"curb_height_m": 0, "deployment_clearance_m": 0, "sidewalk_width_m": 0}
+        raise RuntimeError(f"paper_mode requires PUDO candidates for {eid}")
+    eligible = []
+    evidence_complete = []
     for a in pudo:
-        for k in list(missing):
-            if getattr(a, k) is None:
-                missing[k] += 1
         if _source_is_synthetic_or_proxy(a.source):
             raise RuntimeError(f"paper_mode rejects synthetic/proxy PUDO source for {eid}: {a.anchor_id} source={a.source}")
-    n = max(1, len(pudo))
-    for k, count in missing.items():
-        rate = count / n
-        if rate > args.max_core_pudo_missing_rate:
-            raise RuntimeError(f"paper_mode PUDO core evidence missing rate too high for {eid}: {k}={rate:.3f} > {args.max_core_pudo_missing_rate:.3f}")
+        core_complete = all(getattr(a, k) is not None for k in ("curb_height_m", "deployment_clearance_m", "sidewalk_width_m"))
+        legality_source = str(getattr(a, "legal_stop_source", "") or "").lower()
+        independent_legality = bool(legality_source) and "no_matching_regulation" not in legality_source and "heuristic" not in legality_source and "no_legality_evidence" not in legality_source
+        complete = bool(getattr(a, "paper_evidence_complete", False)) or (core_complete and bool(a.adjacent_ped_node_id) and independent_legality)
+        ok = bool(getattr(a, "paper_eligible", False)) or (complete and bool(a.legal_stop))
+        if complete:
+            evidence_complete.append(a)
+        if ok:
+            eligible.append(a)
+    if len(eligible) < args.min_paper_eligible_pudos_per_episode:
+        raise RuntimeError(
+            f"paper_mode requires >= {args.min_paper_eligible_pudos_per_episode} paper-eligible PUDOs for {eid}; "
+            f"found {len(eligible)} eligible / {len(evidence_complete)} evidence-complete / {len(pudo)} total. "
+            "Unknown/incomplete candidates may remain in the dataset, but cannot be used as main-result service interfaces."
+        )
 
 
 def _make_accessibility_builder(args: argparse.Namespace):
@@ -396,7 +404,8 @@ def main() -> None:
     p.add_argument("--reject_synthetic_accessibility", action="store_true", help="Fail if accessibility graph nodes/edges have synthetic/proxy provenance.")
     p.add_argument("--min_graph_nodes", type=int, default=100)
     p.add_argument("--min_graph_edges", type=int, default=150)
-    p.add_argument("--max_core_pudo_missing_rate", type=float, default=0.05)
+    p.add_argument("--max_core_pudo_missing_rate", type=float, default=1.0, help="Deprecated compatibility flag. Missing candidate evidence is allowed; use --min_paper_eligible_pudos_per_episode for paper-mode gating.")
+    p.add_argument("--min_paper_eligible_pudos_per_episode", type=int, default=2, help="Paper-mode gate: minimum PUDOs per episode with independent legality evidence, pedestrian binding, and complete curb/interface fields.")
     p.add_argument("--min_edge_positive_rate", type=float, default=0.10)
     p.add_argument("--min_skeleton_positive_rate", type=float, default=0.10)
     p.add_argument("--accessibility_source", choices=["synthetic_local", "synthetic", "prepared_jsonl", "geojson", "opensidewalks"], default="synthetic_local")
