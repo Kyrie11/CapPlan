@@ -46,18 +46,18 @@ overpass:
 
 splits:
   train:
-    cities: [boston, pittsburgh, las_vegas, singapore]
+    cities: [boston, pittsburgh, vegas, singapore]
     db_dirs: [train_boston, train_pittsburgh, train_vegas, train_singapore]
     max_scenarios_per_city: 1000
   val:
     # The official val DB directory may contain logs from multiple maps/cities.
     # City separation is done by nuPlan ScenarioFilter(map_names=...), not by
     # copying/moving DB files.
-    cities: [boston, pittsburgh, las_vegas, singapore]
+    cities: [boston, pittsburgh, vegas, singapore]
     db_dirs: [val]
     max_scenarios_per_city: 250
   test:
-    cities: [boston, pittsburgh, las_vegas, singapore]
+    cities: [boston, pittsburgh, vegas, singapore]
     db_dirs: [test]
     max_scenarios_per_city: 250
 
