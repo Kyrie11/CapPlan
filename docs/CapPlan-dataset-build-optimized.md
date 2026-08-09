@@ -158,9 +158,9 @@ stdout 最后出现：
 NUPLAN_DB_CITY_CHECK=PASS
 ```
 
-含义：每个 DB 中的 location/map metadata 都能够映射到 YAML 中的 Boston/Pittsburgh/Vegas/Singapore map name。
+含义：每个 DB 中的 location/map metadata 都能够通过 YAML 的 `map_names + location_aliases` 映射到 Boston/Pittsburgh/Vegas/Singapore；同时每个配置的 `db_dir` 都确实贡献了 DB。脚本默认递归扫描，因此嵌套目录也支持。
 
-若 FAIL：先看 JSON 的 unknown location；**不要猜城市，也不要复制 DB 到另一个城市目录。** 先确认实际 `log.location/map_version`。
+若 FAIL：同时检查 JSON 的 `unknown_locations`、`db_dir_reports`、`empty_db_dirs` 与 `configured_cities_not_observed`；**不要猜城市，也不要复制 DB 到另一个城市目录。** nuPlan DB 常见 location 字符串与 map name 不完全相同，例如 `las_vegas` 对应配置城市键 `vegas`，应通过 `location_aliases` 显式映射。
 
 ---
 
@@ -209,6 +209,24 @@ done
 - `map_gpkg` 指向当前 `$CAP_ROOT/data/nuplan/maps/...`；
 - 此时 `spatial_alignment_validated=false` **是正常状态**，不要手工改 true。
 
+在第 5 节重新生成 OSM 后，执行第二阶段 gross spatial alignment：
+
+```bash
+python scripts/validate_georeference_alignment.py \
+  --config configs/abilitybench_nuplan_real.yaml \
+  --cities boston,pittsburgh,vegas,singapore \
+  --write_georeference \
+  --report_json data/external/reports/georeference_spatial_alignment.json
+```
+
+要求 stdout 最后出现：
+
+```text
+GEOREFERENCE_SPATIAL_ALIGNMENT_CHECK=PASS
+```
+
+此检查会验证 configured AOI、nuPlan GPKG feature extent 和 prepared OSM extent 在同一 projected frame 下有实质重叠。PASS 后才会把 `spatial_alignment_validated` 写为 true。后续 per-episode accessibility graph 构建仍是更强的 scene-level alignment check。
+
 ---
 
 ## 5. OSM：必须用修订后的离线 PBF 流程重新生成
@@ -229,10 +247,10 @@ footway=sidewalk/crossing/access_aisle
 把下面四个变量改成你实际文件名：
 
 ```bash
-export BOS_PBF=/path/to/your/boston_or_massachusetts_latest.osm.pbf
-export PIT_PBF=/path/to/your/pittsburgh_or_pennsylvania_latest.osm.pbf
-export VEG_PBF=/path/to/your/las_vegas_or_nevada_latest.osm.pbf
-export SG_PBF=/path/to/your/singapore_region_latest.osm.pbf
+export BOS_PBF=data/external/raw/osm_pbf/massachusetts-latest.osm.pbf
+export PIT_PBF=data/external/raw/osm_pbf/pennsylvania-latest.osm.pbf
+export VEG_PBF=data/external/raw/osm_pbf/nevada-latest.osm.pbf
+export SG_PBF=data/external/raw/osm_pbf/malaysia-singapore-brunei-latest.osm.pbf
 ```
 
 重新生成：
@@ -501,13 +519,31 @@ Payment Points (Archives)
 Payments Points + Rates
 ```
 
-Current 保存例如：
+三个资源必须分别保存，不要互相覆盖：
 
 ```text
 data/external/raw/wprdc/pittsburgh/payment_points_current.csv
+data/external/raw/wprdc/pittsburgh/payment_points_archive.csv
+data/external/raw/wprdc/pittsburgh/payment_points_rates.csv
 ```
 
-归一化：
+**PUDO candidate 主输入固定使用 Current Payment Points**。Archive 仅用于历史/时间匹配，Rates 仅用于停车费率与时段上下文。
+
+先验证 Current CSV 确实含可用 WGS84 坐标：
+
+```bash
+python scripts/inspect_tabular_coordinates.py \
+  --input data/external/raw/wprdc/pittsburgh/payment_points_current.csv \
+  --min_valid_fraction 0.95
+```
+
+要求：
+
+```text
+TABULAR_COORDINATE_CHECK=PASS
+```
+
+再归一化：
 
 ```bash
 python scripts/normalize_accessibility_evidence.py \
@@ -516,6 +552,8 @@ python scripts/normalize_accessibility_evidence.py \
   --profile pittsburgh_parking_meter \
   --source "Pittsburgh Parking Authority via WPRDC"
 ```
+
+自动下载优先使用官方 CKAN resource ID，并在 direct dump 被 WPRDC 关闭时尝试 `datastore_search` API fallback。Current resource ID 为 `9ed126cc-3c06-496e-bd08-b7b6b14b4109`。
 
 #### C. Street Closures
 
@@ -559,14 +597,14 @@ https://data.wprdc.org/dataset/allegheny-county-addressing-address-points2
 保存：
 
 ```text
-data/external/raw/wprdc/pittsburgh/address_points.geojson
+data/external/raw/pasda/pittsburgh/address_points.geojson
 ```
 
 归一化：
 
 ```bash
 python scripts/normalize_accessibility_evidence.py \
-  --input data/external/raw/wprdc/pittsburgh/address_points.geojson \
+  --input data/external/raw/pasda/pittsburgh/address_points.geojson \
   --output data/external/normalized/candidates/pittsburgh/address_points.geojson \
   --profile pittsburgh_address_point \
   --source "Allegheny County Address Points via WPRDC"
@@ -713,6 +751,32 @@ data/external/raw/dem/vegas/*.tif
 gdalinfo data/external/raw/dem/boston/xxx.tif | \
   egrep 'Coordinate System|Pixel Size|NoData|UNIT'
 ```
+
+不需要先物理 mosaic。先验证多 tile 对整个 AOI 的实际 non-NoData coverage、CRS、分辨率与重叠情况：
+
+```bash
+python scripts/validate_dem_tiles.py \
+  --config configs/abilitybench_nuplan_real.yaml \
+  --city boston \
+  --rasters "$CAP_ROOT"/data/external/raw/dem/boston/*.tif \
+  --expected_resolution_m 1 \
+  --min_coverage 0.99 \
+  --report_json data/external/reports/dem_tiles_boston.json
+```
+
+要求：
+
+```text
+DEM_TILE_CHECK=PASS
+```
+
+如需要一个统一入口用于 GIS 可视化，可额外传：
+
+```bash
+--build_vrt data/external/raw/dem/boston/boston_3dep.vrt
+```
+
+VRT 只引用原 TIFF，不复制高分辨率栅格。
 
 采样：
 
@@ -1462,3 +1526,15 @@ python scripts/audit_dataset_quality.py \
 
 只有上述全部 PASS，才把该 dataset version 标为 paper evaluation dataset。
 
+
+
+---
+
+## 2026-08 实际运行补丁说明
+
+- `inspect_nuplan_db_cities.py` 现在支持 `location_aliases`，其中 `las_vegas -> vegas`；并对每个 `db_dir` 递归计数，避免 train_pittsburgh 空目录被其它城市 DB 数量掩盖。
+- `validate_georeference_alignment.py` 是 CRS metadata 之后的第二阶段空间重叠验证；不要手工把 false 改 true。
+- `normalize_accessibility_evidence.py` 现在规范化 CSV 表头，支持 `latitude/longitude`, `lat/lon`, `lng/long` 等显式 WGS84 别名，拒绝无 CRS 的普通 projected x/y 猜测，并能识别误下载的 HTML。
+- Pittsburgh `Sidewalks and Steps` 必须是 LineString/MultiLineString；如果下载成 blockgroup/tract 统计几何，归一化会直接 FAIL。
+- Pittsburgh Address Points 自动入口改为当前 PASDA Allegheny County ArcGIS layer 32，自动查询使用 `outSR=4326`。若使用 PASDA 静态 NAD83 GeoJSON 快照，可在 normalizer 中显式传 `--input_crs EPSG:4269`。
+- USGS 多个 1m TIFF 不要求物理合并；先跑 `validate_dem_tiles.py`，采样器会稳定排序 tiles 并保留 `source_tile` provenance。

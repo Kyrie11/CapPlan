@@ -2,9 +2,12 @@
 """Inspect nuPlan SQLite split directories and verify city/map coverage.
 
 The script never moves or duplicates DB files. It reads the `log` table's
-location/map metadata and checks that every discovered location is represented by
-one of the configured city map_names. This is the safest way to understand mixed
-val/test splits before ScenarioFilter(map_names=...) is applied.
+location/map metadata and maps DB-specific location strings through explicit
+`location_aliases` plus nuPlan map names from the configuration.
+
+It also validates every configured DB directory independently. This matters for
+multi-directory train splits: a missing/empty/nested directory must not be
+silently hidden by thousands of DBs found in the other cities.
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ import json
 import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, List
 
 try:
     import yaml  # type: ignore
@@ -48,35 +51,50 @@ def inspect_db(path: Path) -> Dict[str, Any]:
                 wanted.append(lower[key])
         query = "SELECT DISTINCT " + ", ".join(f'"{x}"' for x in wanted) + ' FROM "log"'
         rows = conn.execute(query).fetchall()
-        records = []
-        for row in rows:
-            rec = {wanted[i]: row[i] for i in range(len(wanted))}
-            records.append(rec)
-        locations = sorted({str(r.get(lower["location"]) or "").strip() for r in records if str(r.get(lower["location"]) or "").strip()})
+        records = [{wanted[i]: row[i] for i in range(len(wanted))} for row in rows]
+        locations = sorted({
+            str(r.get(lower["location"]) or "").strip()
+            for r in records
+            if str(r.get(lower["location"]) or "").strip()
+        })
         return {"db": str(path), "locations": locations, "log_metadata": records}
     finally:
         conn.close()
 
 
-def _city_for_location(location: str, city_map_names: Dict[str, List[str]]) -> List[str]:
-    value = location.strip().lower()
+def _normal(value: str) -> str:
+    return str(value).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _city_for_location(location: str, city_location_names: Dict[str, List[str]]) -> List[str]:
+    value = _normal(location)
     matches: List[str] = []
-    for city, map_names in city_map_names.items():
-        for name in map_names:
-            n = str(name).strip().lower()
-            # Exact map_name is preferred; substring tolerance handles historical
-            # DB strings that include a map version/path wrapper.
-            if value == n or n in value or value in n:
+    for city, names in city_location_names.items():
+        for name in names:
+            n = _normal(name)
+            # Exact alias is preferred. Substring tolerance remains only for
+            # historical wrappers such as '<map_name>/version'.
+            if value == n or (len(n) >= 6 and (n in value or value in n)):
                 matches.append(city)
                 break
     return sorted(set(matches))
+
+
+def _collect_db_path(candidate: Path, recursive: bool) -> List[Path]:
+    if candidate.is_file() and candidate.suffix.lower() == ".db":
+        return [candidate]
+    if not candidate.is_dir():
+        raise FileNotFoundError(f"configured nuPlan DB path does not exist: {candidate}")
+    pattern = "**/*.db" if recursive else "*.db"
+    return sorted(p for p in candidate.glob(pattern) if p.is_file())
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", default="configs/abilitybench_nuplan_real.yaml")
     p.add_argument("--split", choices=["train", "val", "test"], required=True)
-    p.add_argument("--fail_on_unknown", action="store_true", help="Exit non-zero when a DB location cannot be mapped to configured city map_names.")
+    p.add_argument("--fail_on_unknown", action="store_true", help="Exit non-zero when coverage/mapping checks fail.")
+    p.add_argument("--no_recursive", action="store_true", help="Only inspect .db files directly inside each configured db_dir.")
     p.add_argument("--report_json", default=None)
     args = p.parse_args()
 
@@ -84,19 +102,33 @@ def main() -> None:
     db_root = expand_path(cfg["nuplan"]["db_root"])
     split_cfg = cfg.get("splits", {}).get(args.split) or {}
     db_dirs = [str(x) for x in split_cfg.get("db_dirs") or []]
-    city_map_names = {str(c): [str(x) for x in (cfg["cities"][c].get("map_names") or [])] for c in split_cfg.get("cities") or []}
+    cities = [str(c) for c in split_cfg.get("cities") or []]
+    city_location_names: Dict[str, List[str]] = {}
+    for city in cities:
+        ccfg = cfg["cities"][city]
+        names = [str(x) for x in (ccfg.get("map_names") or [])]
+        names.extend(str(x) for x in (ccfg.get("location_aliases") or []))
+        # De-duplicate while preserving order.
+        city_location_names[city] = list(dict.fromkeys(names))
     if not db_dirs:
         raise RuntimeError(f"split {args.split!r} has no db_dirs in config")
 
     dbs: List[Path] = []
+    db_dir_reports: List[Dict[str, Any]] = []
+    empty_db_dirs: List[str] = []
+    recursive = not args.no_recursive
     for item in db_dirs:
         candidate = db_root / item
-        if candidate.is_dir():
-            dbs.extend(sorted(candidate.glob("*.db")))
-        elif candidate.is_file() and candidate.suffix == ".db":
-            dbs.append(candidate)
-        else:
-            raise FileNotFoundError(f"configured nuPlan DB path does not exist: {candidate}")
+        found = _collect_db_path(candidate, recursive=recursive)
+        db_dir_reports.append({
+            "configured": item,
+            "path": str(candidate),
+            "db_count": len(found),
+            "recursive": recursive,
+        })
+        if not found:
+            empty_db_dirs.append(str(candidate))
+        dbs.extend(found)
     dbs = sorted(set(dbs))
     if not dbs:
         raise RuntimeError(f"no .db files found for split {args.split} under {db_dirs}")
@@ -106,12 +138,17 @@ def main() -> None:
     unknown: Dict[str, List[str]] = defaultdict(list)
     ambiguous: Dict[str, List[str]] = defaultdict(list)
     db_reports = []
+    db_errors: List[Dict[str, str]] = []
     for db in dbs:
-        info = inspect_db(db)
+        try:
+            info = inspect_db(db)
+        except Exception as exc:
+            db_errors.append({"db": str(db), "error": f"{type(exc).__name__}: {exc}"})
+            continue
         mapped_cities = set()
         for loc in info["locations"]:
             location_counts[loc] += 1
-            matches = _city_for_location(loc, city_map_names)
+            matches = _city_for_location(loc, city_location_names)
             if len(matches) == 1:
                 mapped_cities.add(matches[0])
             elif len(matches) == 0:
@@ -123,19 +160,29 @@ def main() -> None:
         info["mapped_cities"] = sorted(mapped_cities)
         db_reports.append(info)
 
+    missing_configured = sorted(c for c in city_location_names if city_db_counts.get(c, 0) == 0)
     issues = []
+    if empty_db_dirs:
+        issues.append("one or more configured db_dirs contain no .db files (recursive scan)")
+    if db_errors:
+        issues.append("one or more DB files could not be inspected")
     if unknown:
-        issues.append("unknown log.location values are not represented by configured city map_names")
+        issues.append("unknown log.location values are not represented by configured map_names/location_aliases")
     if ambiguous:
         issues.append("some log.location values match more than one configured city")
-    missing_configured = sorted(c for c in city_map_names if city_db_counts.get(c, 0) == 0)
-    # A split is allowed to omit a city, so this is diagnostic rather than a hard error.
+    if bool(split_cfg.get("require_all_cities", False)) and missing_configured:
+        issues.append("split requires all configured cities, but one or more cities were not observed")
+
     report = {
         "status": "PASS" if not issues else "FAIL",
         "split": args.split,
         "db_root": str(db_root),
         "db_dirs": db_dirs,
+        "db_dir_reports": db_dir_reports,
+        "empty_db_dirs": empty_db_dirs,
         "db_count": len(dbs),
+        "db_errors": db_errors,
+        "location_aliases": city_location_names,
         "location_db_counts": dict(sorted(location_counts.items())),
         "city_db_counts": dict(sorted(city_db_counts.items())),
         "configured_cities_not_observed": missing_configured,

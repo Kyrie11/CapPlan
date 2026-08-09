@@ -8,6 +8,7 @@ truth; it only preserves the original resource and provenance.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import http.client
 import random
@@ -94,6 +95,43 @@ def get_json(url: str, *, timeout: int, retries: int) -> Dict[str, Any]:
     if not payload.get("success"):
         raise RuntimeError(f"CKAN API error: {payload}")
     return payload
+
+
+def download_datastore_csv(portal: str, resource_id: str, destination: Path, *, timeout: int, retries: int, page_size: int = 5000) -> tuple[str, str]:
+    """Fallback for CKAN DataStore CSV resources when direct dump URLs are blocked.
+
+    Uses the official CKAN `datastore_search` action with pagination. This path
+    is intentionally limited to tabular DataStore resources; uploaded ZIP/SHP
+    resources still require their original download URL or manual fallback.
+    """
+    endpoint = portal.rstrip("/") + "/api/3/action/datastore_search"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination
+    offset = 0
+    writer = None
+    f = tmp.open("w", encoding="utf-8", newline="")
+    try:
+        while True:
+            query = urllib.parse.urlencode({"resource_id": resource_id, "limit": page_size, "offset": offset})
+            payload = get_json(endpoint + "?" + query, timeout=timeout, retries=retries)["result"]
+            records = payload.get("records") or []
+            fields = [str(x.get("id")) for x in (payload.get("fields") or []) if x.get("id") is not None]
+            if writer is None:
+                if not fields:
+                    raise RuntimeError("CKAN datastore_search returned no fields")
+                writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+            for rec in records:
+                writer.writerow({k: rec.get(k) for k in fields})
+            offset += len(records)
+            total = int(payload.get("total") or offset)
+            if not records or offset >= total:
+                break
+        if offset <= 0:
+            raise RuntimeError("CKAN datastore_search returned zero rows")
+    finally:
+        f.close()
+    return "text/csv", endpoint + "?resource_id=" + urllib.parse.quote(resource_id)
 
 
 def safe_name(value: str) -> str:
@@ -227,7 +265,21 @@ def main() -> None:
         raise SystemExit(f"{output} exists; use --force to replace it")
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_suffix(output.suffix + ".part")
-    ctype, final_url = download_to_file(str(resource["url"]), tmp, timeout=args.timeout, retries=args.retries)
+    download_method = "resource_url"
+    try:
+        ctype, final_url = download_to_file(str(resource["url"]), tmp, timeout=args.timeout, retries=args.retries)
+    except RuntimeError as direct_exc:
+        fmt = str(resource.get("format") or "").strip().lower()
+        if bool(resource.get("datastore_active")) and fmt == "csv":
+            tmp.unlink(missing_ok=True)
+            ctype, final_url = download_datastore_csv(
+                args.portal, str(resource.get("id")), tmp, timeout=args.timeout, retries=args.retries
+            )
+            download_method = "ckan_datastore_search_fallback"
+        else:
+            raise RuntimeError(
+                f"direct CKAN resource download failed and no DataStore CSV fallback applies: {direct_exc}"
+            ) from direct_exc
     final_suffix = infer_suffix(resource, final_url, ctype)
     if not Path(name).suffix and final_suffix != provisional_suffix:
         output = Path(args.output_dir).expanduser() / f"{name}{final_suffix}"
@@ -245,6 +297,7 @@ def main() -> None:
         "resource_name": resource.get("name"),
         "resource_format": resource.get("format"),
         "source_url": final_url,
+        "download_method": download_method,
         "retrieved_at": datetime.now(timezone.utc).isoformat(),
         "output": str(output),
         "status": "PASS",

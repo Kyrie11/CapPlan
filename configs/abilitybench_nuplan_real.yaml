@@ -47,6 +47,7 @@ overpass:
 splits:
   train:
     cities: [boston, pittsburgh, vegas, singapore]
+    require_all_cities: true
     db_dirs: [train_boston, train_pittsburgh, train_vegas, train_singapore]
     max_scenarios_per_city: 1000
   val:
@@ -64,6 +65,7 @@ splits:
 cities:
   boston:
     map_names: [us-ma-boston]
+    location_aliases: [us-ma-boston, boston]
     bbox: [42.30, -71.15, 42.42, -70.98]
     georeference_json: "{project_root}/data/external/georeference/boston.json"
     osm_source: "{project_root}/data/external/normalized/osm/boston_sidewalks.geojson"
@@ -80,6 +82,7 @@ cities:
 
   pittsburgh:
     map_names: [us-pa-pittsburgh-hazelwood]
+    location_aliases: [us-pa-pittsburgh-hazelwood, pittsburgh]
     bbox: [40.38, -80.04, 40.48, -79.88]
     georeference_json: "{project_root}/data/external/georeference/pittsburgh.json"
     osm_source: "{project_root}/data/external/normalized/osm/pittsburgh_sidewalks.geojson"
@@ -101,6 +104,7 @@ cities:
 
   vegas:
     map_names: [us-nv-las-vegas-strip]
+    location_aliases: [us-nv-las-vegas-strip, las_vegas, las-vegas, vegas]
     bbox: [36.07, -115.23, 36.20, -115.10]
     georeference_json: "{project_root}/data/external/georeference/vegas.json"
     osm_source: "{project_root}/data/external/normalized/osm/vegas_sidewalks.geojson"
@@ -120,6 +124,7 @@ cities:
 
   singapore:
     map_names: [sg-one-north]
+    location_aliases: [sg-one-north, singapore]
     bbox: [1.27, 103.75, 1.33, 103.82]
     georeference_json: "{project_root}/data/external/georeference/singapore.json"
     osm_source: "{project_root}/data/external/normalized/osm/singapore_sidewalks.geojson"

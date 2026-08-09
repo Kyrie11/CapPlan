@@ -113,7 +113,10 @@ def main() -> None:
 
     external_root = Path(args.external_root).expanduser().resolve()
     normalized_root = external_root / "normalized"
-    rasters = [Path(x).expanduser().resolve() for x in args.rasters]
+    # Deterministic ordering matters when 3DEP tiles overlap. Overlap is not
+    # an error for this terrain-prior use case; the first valid tile in this
+    # stable order supplies the sample and source_tile records provenance.
+    rasters = sorted({Path(x).expanduser().resolve() for x in args.rasters})
     missing = [str(x) for x in rasters if not x.exists()]
     if missing:
         raise RuntimeError("missing raster files: " + ", ".join(missing))
@@ -174,6 +177,7 @@ def main() -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    print(f"DEM_SAMPLING_CHECK={report['status']}")
 
 
 if __name__ == "__main__":

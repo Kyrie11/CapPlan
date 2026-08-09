@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 
-def _ogr2ogr_geojsonseq(path: Path, *, layer: str | None = None) -> Path:
+def _ogr2ogr_geojsonseq(path: Path, *, layer: str | None = None, source_crs: str | None = None) -> Path:
     ogr2ogr = shutil.which("ogr2ogr")
     if not ogr2ogr:
         raise RuntimeError(
@@ -52,24 +52,31 @@ def _ogr2ogr_geojsonseq(path: Path, *, layer: str | None = None) -> Path:
         else:
             src = shapefiles[0]
     out = tmp_root / "converted.geojsonl"
-    cmd = [ogr2ogr, "-f", "GeoJSONSeq", "-t_srs", "EPSG:4326", str(out), str(src)]
+    cmd = [ogr2ogr, "-f", "GeoJSONSeq"]
+    if source_crs:
+        cmd.extend(["-s_srs", source_crs])
+    cmd.extend(["-t_srs", "EPSG:4326", str(out), str(src)])
     if layer and path.suffix.lower() in {".gpkg", ".sqlite"}:
         cmd.append(layer)
     subprocess.check_call(cmd)
     return out
 
 
-def read_rows(path: Path, *, layer: str | None = None) -> Iterator[Dict[str, Any]]:
+def read_rows(path: Path, *, layer: str | None = None, input_crs: str | None = None) -> Iterator[Dict[str, Any]]:
     suffix = path.suffix.lower()
     if suffix in {".shp", ".gpkg", ".sqlite", ".zip"}:
-        converted = _ogr2ogr_geojsonseq(path, layer=layer)
+        converted = _ogr2ogr_geojsonseq(path, layer=layer, source_crs=input_crs)
+        yield from read_rows(converted)
+        return
+    if suffix == ".geojson" and input_crs and input_crs.upper() != "EPSG:4326":
+        converted = _ogr2ogr_geojsonseq(path, layer=layer, source_crs=input_crs)
         yield from read_rows(converted)
         return
     if suffix == ".geojson" and path.stat().st_size > 64 * 1024 * 1024 and shutil.which("ogr2ogr"):
         # Large citywide GeoJSON (e.g. county address points) can be hundreds
         # of MB. Convert to newline-delimited GeoJSON features so normalization
         # stays streaming instead of loading the entire FeatureCollection.
-        converted = _ogr2ogr_geojsonseq(path, layer=layer)
+        converted = _ogr2ogr_geojsonseq(path, layer=layer, source_crs=input_crs)
         yield from read_rows(converted)
         return
     if suffix in {".json", ".geojson"}:
@@ -88,8 +95,15 @@ def read_rows(path: Path, *, layer: str | None = None) -> Iterator[Dict[str, Any
                     yield json.loads(line)
         return
     if suffix == ".csv":
+        with path.open("rb") as bf:
+            head = bf.read(512).lstrip().lower()
+        if head.startswith((b"<html", b"<!doctype html")):
+            raise RuntimeError(f"CSV input is actually an HTML page/error response: {path}")
         with path.open("r", encoding="utf-8-sig", newline="") as f:
-            yield from csv.DictReader(f)
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                raise RuntimeError(f"CSV has no header row: {path}")
+            yield from reader
         return
     raise ValueError(f"unsupported input suffix: {suffix}")
 
@@ -99,10 +113,19 @@ def props(row: Dict[str, Any]) -> Dict[str, Any]:
     return {**p, **{k: v for k, v in row.items() if k not in {"properties", "geometry", "type"}}}
 
 
+def _canon_key(value: Any) -> str:
+    text = str(value).replace("\ufeff", "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text
+
+
 def first(d: Dict[str, Any], *keys: str) -> Any:
-    lower = {str(k).lower(): v for k, v in d.items()}
+    # Public CSV headers frequently contain BOMs, spaces, dashes or case
+    # differences. Canonicalize only the *field name*; never reinterpret the
+    # field value or its units.
+    lower = {_canon_key(k): v for k, v in d.items()}
     for key in keys:
-        value = lower.get(key.lower())
+        value = lower.get(_canon_key(key))
         if value not in (None, "", "unknown", "n/a", "NULL", "null"):
             return value
     return None
@@ -183,6 +206,18 @@ def geometry(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return _geometry_from_text(first(d, "geometry", "geom", "wkt"))
 
 
+def _valid_wgs84(lon: Any, lat: Any) -> Optional[Tuple[float, float]]:
+    try:
+        x, y = float(str(lon).strip()), float(str(lat).strip())
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+    if not (-180.0 <= x <= 180.0 and -90.0 <= y <= 90.0):
+        return None
+    return x, y
+
+
 def representative_point(row: Dict[str, Any]) -> Optional[Tuple[float, float]]:
     geom = geometry(row)
     if geom:
@@ -196,12 +231,16 @@ def representative_point(row: Dict[str, Any]) -> Optional[Tuple[float, float]]:
                     walk(item)
         walk(coords)
         if points:
-            return sum(x for x, _ in points) / len(points), sum(y for _, y in points) / len(points)
+            xy = (sum(x for x, _ in points) / len(points), sum(y for _, y in points) / len(points))
+            if _valid_wgs84(*xy):
+                return xy
     d = props(row)
-    lon = first(d, "lon", "longitude", "POINT_X", "x")
-    lat = first(d, "lat", "latitude", "POINT_Y", "y")
+    # Explicit WGS84 aliases used by WPRDC and similar public tabular layers.
+    # Plain projected x/y values are intentionally *not* accepted here.
+    lon = first(d, "lon", "longitude", "lng", "long", "long_dd", "longitude_dd", "point_x")
+    lat = first(d, "lat", "latitude", "lat_dd", "latitude_dd", "point_y")
     if lon is not None and lat is not None:
-        return float(lon), float(lat)
+        return _valid_wgs84(lon, lat)
     return None
 
 
@@ -281,6 +320,13 @@ def normalize(profile: str, row: Dict[str, Any], index: int, source: str, args: 
         }
 
     if profile == "pittsburgh_sidewalks_steps":
+        geom = geometry(row)
+        if not isinstance(geom, dict) or geom.get("type") not in {"LineString", "MultiLineString"}:
+            raise ValueError(
+                "pittsburgh_sidewalks_steps must contain line pedestrian geometry; "
+                f"got geometry_type={geom.get('type') if isinstance(geom, dict) else None}. "
+                "Do not use the blockgroup/tract ratio table as sidewalk geometry."
+            )
         type_name = str(first(d, "Type_Name", "TYPE_NAME", "TYPE", "FEATURE_TYPE") or "sidewalk").strip().lower()
         if "step" in type_name:
             kind = "steps"
@@ -324,7 +370,15 @@ def normalize(profile: str, row: Dict[str, Any], index: int, source: str, args: 
     if profile in {"vegas_parking_zone", "pittsburgh_parking_meter", "lta_taxi_stand", "lta_passenger_pickup_bay", "generic_pudo_candidate"}:
         xy = representative_point(row)
         if not xy:
-            raise ValueError(f"{profile} feature has no geometry/coordinates")
+            fields = sorted(str(k) for k in d.keys())[:80]
+            coord_preview = {
+                k: d.get(k) for k in d
+                if any(token in _canon_key(k) for token in ("lat", "lon", "lng", "long", "coord", "geom", "wkt"))
+            }
+            raise ValueError(
+                f"{profile} feature has no valid WGS84 geometry/coordinates; "
+                f"available_fields={fields}; coordinate_like_values={coord_preview}"
+            )
         rid = first(d, "OBJECTID", "UNITID", "METER_NO", "id", "TaxiCode", "TAXI_CODE") or f"{profile}_{index}"
         official_candidate = profile in {"vegas_parking_zone", "lta_taxi_stand", "lta_passenger_pickup_bay"}
         return {
@@ -371,6 +425,7 @@ def main() -> None:
         "lta_footpath", "lta_kerbline", "generic_pudo_candidate", "government_entrance", "generic_city_gis",
     ])
     p.add_argument("--source", required=True)
+    p.add_argument("--input_crs", default=None, help="Optional source CRS override (e.g. EPSG:4269 for PASDA NAD83 GeoJSON); vector geometry is reprojected to EPSG:4326 via GDAL.")
     p.add_argument("--width_unit", choices=["unknown", "m", "feet", "inches"], default="unknown")
     p.add_argument("--reveal_unit", choices=["unknown", "m", "feet", "inches"], default="unknown")
     p.add_argument("--slope_unit", choices=["unknown", "ratio", "percent", "degrees"], default="unknown")
@@ -379,7 +434,7 @@ def main() -> None:
 
     rows: List[Dict[str, Any]] = []
     errors: List[str] = []
-    for i, row in enumerate(read_rows(Path(args.input), layer=args.layer)):
+    for i, row in enumerate(read_rows(Path(args.input), layer=args.layer, input_crs=args.input_crs)):
         try:
             rows.append(normalize(args.profile, row, i, args.source, args))
         except Exception as exc:
@@ -402,10 +457,18 @@ def main() -> None:
 
     def missing(field: str) -> int:
         return sum(1 for r in rows if (r.get("properties", {}) if isinstance(r.get("properties"), dict) else r).get(field) is None)
+    geometry_type_counts: Dict[str, int] = {}
+    for r in rows:
+        g = r.get("geometry") if isinstance(r, dict) else None
+        gt = str(g.get("type")) if isinstance(g, dict) and g.get("type") else "None"
+        geometry_type_counts[gt] = geometry_type_counts.get(gt, 0) + 1
     report = {
         "status": "PASS", "input": args.input, "output": str(out), "profile": args.profile,
         "records": len(rows), "skipped": len(errors), "errors": errors[:100],
+        "geometry_type_counts": dict(sorted(geometry_type_counts.items())),
         "unit_mapping": {"width_unit": args.width_unit, "reveal_unit": args.reveal_unit, "slope_unit": args.slope_unit},
+        "input_crs_override": args.input_crs,
+        "output_geometry_crs": "EPSG:4326",
         "missing_counts": {k: missing(k) for k in ["sidewalk_width_m", "curb_height_m", "deployment_clearance_m", "slope", "ramp_slope"]},
     }
     out.with_suffix(out.suffix + ".report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")

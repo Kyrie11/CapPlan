@@ -25,6 +25,7 @@ from download_arcgis_layer import download_layer
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BOSTON_BASE = "https://gisportal.boston.gov/arcgis/rest/services/Infrastructure/OpenData/MapServer"
 VEGAS_TAXI = "https://mapdata.lasvegasnevada.gov/clvgis/rest/services/Transportation/CLV_ParkingServices_ParkingZones/MapServer/4"
+PASDA_ALLEGHENY_ADDRESS_POINTS = "https://mapservices.pasda.psu.edu/server/rest/services/pasda/AlleghenyCounty/MapServer/32"
 WPRDC = "https://data.wprdc.org"
 
 
@@ -47,7 +48,7 @@ def normalize(input_path: Path, output_path: Path, profile: str, source: str, ex
     run(cmd)
 
 
-def ckan(package: str, resource: str, out_dir: Path, output_name: str, force: bool) -> Path:
+def ckan(package: str, resource: str, out_dir: Path, output_name: str, force: bool, *, resource_id: str | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     existing = sorted(
         [p for p in out_dir.glob(output_name + ".*") if not p.name.endswith(".provenance.json") and not p.name.endswith(".part")],
@@ -58,9 +59,12 @@ def ckan(package: str, resource: str, out_dir: Path, output_name: str, force: bo
     cmd = [
         sys.executable, "scripts/download_ckan_resource.py",
         "--portal", WPRDC, "--package_id", package,
-        "--resource_name", resource, "--output_dir", str(out_dir),
-        "--output_name", output_name,
+        "--output_dir", str(out_dir), "--output_name", output_name,
     ]
+    if resource_id:
+        cmd.extend(["--resource_id", resource_id])
+    else:
+        cmd.extend(["--resource_name", resource])
     if force:
         cmd.append("--force")
     run(cmd)
@@ -130,14 +134,20 @@ def main() -> None:
         attempt("pittsburgh", "Sidewalks and Steps SHP", sw,
                 "WPRDC dataset 'Sidewalk to Street \"Walkability\" Ratio' -> Data and Resources -> 'Sidewalks and Steps SHP'; save ZIP under data/external/raw/wprdc/pittsburgh/")
 
+        # Stable WPRDC datastore resource IDs verified from the official CKAN
+        # resource pages. Current Payment Points is the primary geometry source;
+        # archive/rates are retained only as temporal/context metadata.
         parking_specs = [
-            ("Current Payment Points", "payment_points_current"),
-            ("Payment Points (Archives)", "payment_points_archive"),
-            ("Payments Points + Rates", "payment_points_rates"),
+            ("Current Payment Points", "payment_points_current", "9ed126cc-3c06-496e-bd08-b7b6b14b4109"),
+            ("Payment Points (Archives)", "payment_points_archive", "db139ccd-6753-48ad-b3ff-118fe2223d55"),
+            ("Payments Points + Rates", "payment_points_rates", "aefaf190-7f4c-4466-a28b-1b7ce039419d"),
         ]
-        for resource, stem in parking_specs:
-            def pp(resource=resource, stem=stem):
-                src = ckan("pittsburgh-parking-meters-and-payment-points", resource, raw, stem, args.force)
+        for resource, stem, resource_id in parking_specs:
+            def pp(resource=resource, stem=stem, resource_id=resource_id):
+                src = ckan(
+                    "pittsburgh-parking-meters-and-payment-points", resource, raw, stem, args.force,
+                    resource_id=resource_id,
+                )
                 if resource == "Current Payment Points":
                     dst = external / "normalized" / "candidates" / "pittsburgh" / "payment_points_current.jsonl"
                     normalize(src, dst, "pittsburgh_parking_meter", "Pittsburgh Parking Authority via WPRDC")
@@ -155,12 +165,21 @@ def main() -> None:
                 "WPRDC dataset 'DOMI Street Closures For GIS Mapping' -> 'Street Closures'; save as data/external/raw/wprdc/pittsburgh/street_closures.csv")
 
         def addresses():
-            src = ckan("allegheny-county-addressing-address-points2", "GeoJSON", raw, "address_points", args.force)
+            # Prefer the current Allegheny County layer hosted by PASDA. Keep
+            # PASDA raw data in its own provenance directory rather than under
+            # WPRDC. The ArcGIS query explicitly requests outSR=4326 and crops
+            # to the Pittsburgh AOI, avoiding a huge countywide file and
+            # NAD83/WGS84 ambiguity in manually downloaded snapshots.
+            pasda_raw = external / "raw" / "pasda" / "pittsburgh"
+            pasda_raw.mkdir(parents=True, exist_ok=True)
+            src = pasda_raw / "address_points_aoi_wgs84.geojson"
+            if args.force or not src.exists():
+                download_layer(PASDA_ALLEGHENY_ADDRESS_POINTS, src, bbox=cfg["cities"]["pittsburgh"]["bbox"])
             dst = external / "normalized" / "candidates" / "pittsburgh" / "address_points.geojson"
-            normalize(src, dst, "pittsburgh_address_point", "Allegheny County Address Points via WPRDC")
+            normalize(src, dst, "pittsburgh_address_point", "Allegheny County Address Points via PASDA")
             return dst
         attempt("pittsburgh", "Address Points GeoJSON", addresses,
-                "WPRDC dataset 'Allegheny County Addressing Address Points' -> 'GeoJSON'; save as data/external/raw/wprdc/pittsburgh/address_points.geojson")
+                f"PASDA Allegheny County ArcGIS layer {PASDA_ALLEGHENY_ADDRESS_POINTS}; query the Pittsburgh AOI with outSR=4326 and save as data/external/raw/pasda/pittsburgh/address_points_aoi_wgs84.geojson")
 
     if "vegas" in cities:
         bbox = cfg["cities"]["vegas"]["bbox"]
