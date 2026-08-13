@@ -68,6 +68,8 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
     validation = json.loads((root / "validation_report.json").read_text()) if (root / "validation_report.json").exists() else {}
     manifest = json.loads((root / "dataset_manifest.json").read_text()) if (root / "dataset_manifest.json").exists() else {}
     service_requests = _safe_read(root / "service_requests.jsonl")
+    vehicles = _safe_read(root / "vehicle_interfaces.jsonl")
+    counterfactual_pairs = _safe_read(root / "counterfactual_pairs.jsonl")
 
     graph_node_counts: List[int] = []
     graph_edge_counts: List[int] = []
@@ -138,6 +140,51 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
     certificate_phase_counts = Counter(str(c.get("phase") or "unknown") for c in certificates)
     certificate_phase_diversity = len([k for k, v in certificate_phase_counts.items() if k != "unknown" and v > 0])
 
+    # T4 paper counterfactual audit.  These are the seven capability axes named
+    # in the benchmark protocol; paper-mode should not silently drop any of them.
+    required_cf_axes = {
+        "access_distance", "step_free", "min_width", "ramp_lift",
+        "door_side_clearance", "ride_motion", "confidence",
+    }
+    cf_axes = {str(r.get("counterfactual_axis")) for r in counterfactual_pairs if r.get("counterfactual_axis")}
+    cf_pairs_by_episode = Counter(str(r.get("episode_id")) for r in counterfactual_pairs)
+    cf_axes_by_episode: Dict[str, set[str]] = defaultdict(set)
+    for row in counterfactual_pairs:
+        eid = str(row.get("episode_id"))
+        axis = str(row.get("counterfactual_axis") or "")
+        if axis:
+            cf_axes_by_episode[eid].add(axis)
+    cf_missing_axes_by_episode = {
+        eid: sorted(required_cf_axes - cf_axes_by_episode.get(eid, set()))
+        for eid in episode_ids
+        if not required_cf_axes.issubset(cf_axes_by_episode.get(eid, set()))
+    }
+    episodes_with_full_cf = len(episode_ids) - len(cf_missing_axes_by_episode)
+    cf_episode_coverage_rate = _rate(episodes_with_full_cf, len(episode_ids))
+
+    def _fleet_source(row: Dict[str, Any]) -> str:
+        return str(row.get("source") or (row.get("metadata") or {}).get("source") or "").strip().lower()
+
+    unverified_fleet = [
+        r for r in vehicles
+        if (not _fleet_source(r))
+        or _fleet_source(r).startswith("synthetic")
+        or "proxy" in _fleet_source(r)
+        or "example" in _fleet_source(r)
+        or _fleet_source(r) in {"toy", "mock", "default", "unknown"}
+    ]
+    required_vehicle_fields = {
+        "door_side", "ramp", "lift", "low_floor", "door_width_m",
+        "deployment_clearance_m", "notification_modes", "dwell_time_s", "kneeling",
+    }
+    incomplete_fleet = []
+    for row in vehicles:
+        meta = row.get("metadata") or {}
+        provided = {str(x) for x in (meta.get("provided_interface_fields") or [])}
+        missing = sorted(required_vehicle_fields - provided)
+        if missing:
+            incomplete_fleet.append({"vehicle_id": row.get("vehicle_id"), "missing_fields": missing})
+
     issues: List[str] = []
     if validation.get("ok") is False:
         issues.append("schema_validation_failed")
@@ -160,17 +207,15 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
     if any("synthetic" in str(src) for src in graph_edge_sources):
         issues.append("synthetic_accessibility_edges_used")
 
-    if manifest.get("source_policy") != "paper":
-        issues.append("source_policy_not_paper")
-    if not manifest.get("paper_mode"):
-        issues.append("dataset_not_built_in_paper_mode")
     preflight = manifest.get("external_source_preflight") if isinstance(manifest.get("external_source_preflight"), dict) else {}
     missing_external = []
     if preflight:
         if isinstance(preflight.get("cities"), list):
             missing_external = list(preflight.get("blockers", []))
-            if not preflight.get("publication_ready", False):
+            if paper_mode and not preflight.get("publication_ready", False):
                 issues.append("external_sources_not_publication_ready")
+            elif not paper_mode and not preflight.get("ready_for_requested_policy", True):
+                issues.append("external_sources_not_ready_for_requested_policy")
         else:
             # Backward compatibility with v1 existence-only preflight reports.
             missing_external = [f"{r.get('city')}:{r.get('key')}" for r in preflight.get("sources", []) if not r.get("exists") and r.get("key") != "georeference_json"]
@@ -187,6 +232,8 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
         "curb_height_m": _rate(sum(1 for p in pudos if p.get("curb_height_m") is None), len(pudos)),
     }
     if paper_mode:
+        if manifest.get("source_policy") != "paper": issues.append("source_policy_not_paper")
+        if not manifest.get("paper_mode"): issues.append("dataset_not_built_in_paper_mode")
         if manifest.get("scene_source") != "nuplan": issues.append("paper_mode_requires_nuplan_scene_source")
         if manifest.get("accessibility_source") in {"synthetic", "synthetic_local"}: issues.append("paper_mode_rejects_synthetic_accessibility_source")
         if manifest.get("service_layer_source") in {None, "synthetic_smoke"}: issues.append("paper_mode_rejects_synthetic_service_layer")
@@ -201,6 +248,18 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
         if (certificates or skeletons) and skeleton_rate < min_skeleton_positive_rate: issues.append("paper_mode_skeleton_positive_rate_too_low")
         if certificate_phase_diversity < min_failure_phase_diversity:
             issues.append("paper_mode_failure_certificate_phase_diversity_too_low")
+        if unverified_fleet:
+            issues.append("paper_mode_unverified_or_example_vehicle_interface")
+        if incomplete_fleet:
+            issues.append("paper_mode_vehicle_interface_fields_not_explicit")
+        if not counterfactual_pairs:
+            issues.append("paper_mode_no_counterfactual_pairs")
+        if not required_cf_axes.issubset(cf_axes):
+            issues.append("paper_mode_counterfactual_axes_incomplete")
+        if cf_missing_axes_by_episode:
+            issues.append("paper_mode_counterfactual_episode_axes_incomplete")
+        if cf_episode_coverage_rate < 1.0:
+            issues.append("paper_mode_counterfactual_episode_coverage_incomplete")
 
     blocking_issues = sorted(set(issues)) if paper_mode else sorted(set(issues))
     warnings = []
@@ -313,6 +372,23 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
             "sidewalk_width_m": pudo_missing_rates["sidewalk_width_m"],
             "slope": _rate(resource_missing.get("slope", 0), len(resources)),
             "cross_slope": _rate(resource_missing.get("cross_slope", 0), len(resources)),
+        },
+        "counterfactual_audit": {
+            "required_axes": sorted(required_cf_axes),
+            "observed_axes": sorted(cf_axes),
+            "num_pairs": len(counterfactual_pairs),
+            "pairs_by_episode": dict(cf_pairs_by_episode),
+            "axes_by_episode": {eid: sorted(v) for eid, v in sorted(cf_axes_by_episode.items())},
+            "missing_axes_by_episode": cf_missing_axes_by_episode,
+            "episodes_with_full_counterfactual_set": episodes_with_full_cf,
+            "episode_coverage_rate": cf_episode_coverage_rate,
+        },
+        "vehicle_interface_audit": {
+            "num_vehicle_rows": len(vehicles),
+            "unverified_or_example_count": len(unverified_fleet),
+            "first_unverified_or_example": [r.get("vehicle_id") for r in unverified_fleet[:10]],
+            "explicit_field_incomplete_count": len(incomplete_fleet),
+            "first_explicit_field_incomplete": incomplete_fleet[:10],
         },
         "publication_readiness": {
             "status": "PASS" if len(blocking_issues) == 0 else "FAIL",

@@ -7,6 +7,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 import argparse
 import hashlib
+import math
 import subprocess
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -25,7 +26,7 @@ from capplan.data.passenger_service_layer import (
     load_service_requests_by_episode,
     service_request_to_trip_context,
 )
-from capplan.data.schemas import EntranceAnchor, Pose2D, PUDOAnchor, to_dict, transition_label_from_transition
+from capplan.data.schemas import CounterfactualPair, EntranceAnchor, Pose2D, PUDOAnchor, to_dict, transition_label_from_transition
 from capplan.data.validate_dataset import validate_dataset
 from capplan.planning.transition_generator import TransitionGenerator
 from capplan.utils.serialization import dump_json, load_json, read_jsonl, write_jsonl
@@ -114,6 +115,50 @@ def _source_is_synthetic_or_proxy(value: Any) -> bool:
     return s.startswith("synthetic") or "proxy" in s or s in {"toy", "mock"}
 
 
+def _source_is_example_or_unverified_fleet(value: Any) -> bool:
+    s = str(value or "").strip().lower()
+    return (
+        not s
+        or s.startswith("synthetic")
+        or "proxy" in s
+        or "example" in s
+        or s in {"toy", "mock", "default", "unknown"}
+    )
+
+
+def _enforce_paper_vehicle_quality(args: argparse.Namespace, eid: str, vehicles: List[Any]) -> None:
+    if not getattr(args, "paper_mode", False):
+        return
+    if not vehicles:
+        raise RuntimeError(f"paper_mode requires at least one audited vehicle interface for {eid}")
+    required_fields = {
+        "door_side", "ramp", "lift", "low_floor", "door_width_m",
+        "deployment_clearance_m", "notification_modes", "dwell_time_s", "kneeling",
+    }
+    bad_sources = []
+    incomplete = []
+    for v in vehicles:
+        meta = getattr(v, "metadata", {}) or {}
+        source = meta.get("source")
+        if _source_is_example_or_unverified_fleet(source):
+            bad_sources.append(f"{getattr(v, 'vehicle_id', 'unknown')}:{source}")
+        provided = {str(x) for x in (meta.get("provided_interface_fields") or [])}
+        missing = sorted(required_fields - provided)
+        if missing:
+            incomplete.append(f"{getattr(v, 'vehicle_id', 'unknown')} missing {missing}")
+    if bad_sources:
+        raise RuntimeError(
+            "paper_mode rejects example/synthetic/unverified vehicle interfaces for "
+            f"{eid}: {bad_sources[:5]}. Replace configs/fleet.abilitybench.example.jsonl with "
+            "measured or manufacturer/vehicle-operator verified interface specifications and provenance."
+        )
+    if incomplete:
+        raise RuntimeError(
+            "paper_mode requires every core vehicle-interface field to be explicitly present in fleet_jsonl; "
+            "dataclass defaults are not evidence. First incomplete rows: " + "; ".join(incomplete[:5])
+        )
+
+
 def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: Any, origin: EntranceAnchor, destination: EntranceAnchor, pudo: List[PUDOAnchor]) -> None:
     if getattr(args, "source_policy", "bootstrap") == "paper" and not getattr(args, "paper_mode", False):
         raise RuntimeError("--source_policy paper requires --paper_mode")
@@ -138,11 +183,13 @@ def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: An
     for a in pudo:
         if _source_is_synthetic_or_proxy(a.source):
             raise RuntimeError(f"paper_mode rejects synthetic/proxy PUDO source for {eid}: {a.anchor_id} source={a.source}")
-        core_complete = all(getattr(a, k) is not None for k in ("curb_height_m", "deployment_clearance_m", "sidewalk_width_m"))
-        legality_source = str(getattr(a, "legal_stop_source", "") or "").lower()
-        independent_legality = bool(legality_source) and "no_matching_regulation" not in legality_source and "heuristic" not in legality_source and "no_legality_evidence" not in legality_source
-        complete = bool(getattr(a, "paper_evidence_complete", False)) or (core_complete and bool(a.adjacent_ped_node_id) and independent_legality)
-        ok = bool(getattr(a, "paper_eligible", False)) or (complete and bool(a.legal_stop))
+        # Paper-mode trusts the explicit evidence audit flags emitted by
+        # build_pudo_evidence.py.  Do not re-infer publication eligibility from
+        # three populated numeric fields alone: the PUDO audit additionally
+        # requires independent stopping-legality and auditable curb/interface
+        # provenance.
+        complete = bool(getattr(a, "paper_evidence_complete", False))
+        ok = bool(getattr(a, "paper_eligible", False)) and bool(a.legal_stop)
         if complete:
             evidence_complete.append(a)
         if ok:
@@ -151,7 +198,8 @@ def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: An
         raise RuntimeError(
             f"paper_mode requires >= {args.min_paper_eligible_pudos_per_episode} paper-eligible PUDOs for {eid}; "
             f"found {len(eligible)} eligible / {len(evidence_complete)} evidence-complete / {len(pudo)} total. "
-            "Unknown/incomplete candidates may remain in the dataset, but cannot be used as main-result service interfaces."
+            "Unknown/incomplete candidates may remain in the dataset, but cannot be used as main-result service interfaces. "
+            "Generate/refresh these flags with scripts/build_pudo_evidence.py after the manual curb, legality, and interface audit."
         )
 
 
@@ -192,6 +240,7 @@ def _apply_pudo_evidence_overrides(anchors: List[PUDOAnchor], evidence: Dict[tup
         "curb_height_m", "sidewalk_width_m", "deployment_clearance_m",
         "blockage_risk", "map_confidence", "dynamic_confidence",
         "lighting", "shelter", "legal_stop", "side", "legal_stop_source", "source",
+        "paper_evidence_complete", "paper_eligible", "evidence_status", "evidence_notes",
     }
     updated: List[PUDOAnchor] = []
     for a in anchors:
@@ -290,6 +339,10 @@ def _pudo_anchors_from_evidence_rows(evidence: Dict[tuple[str | None, str], Dict
             shelter=row.get("shelter"),
             timestamp_s=row.get("timestamp_s"),
             source=source,
+            paper_evidence_complete=_as_bool_field(row.get("paper_evidence_complete"), default=False),
+            paper_eligible=_as_bool_field(row.get("paper_eligible"), default=False),
+            evidence_status=str(row.get("evidence_status") or "candidate_uncertain"),
+            evidence_notes=row.get("evidence_notes"),
         ))
     return anchors
 
@@ -300,16 +353,30 @@ def _git_commit() -> str | None:
         return None
 
 
-def _write_splits(out: Path, episode_rows: List[Dict[str, Any]]) -> None:
-    """Write leakage-resistant splits grouped by original nuPlan log.
+def _write_splits(out: Path, episode_rows: List[Dict[str, Any]], dataset_split: str | None = None, preserve_official_split: bool = False) -> None:
+    """Write leakage-resistant split files.
 
-    All capability counterfactuals already share an episode_id; grouping episodes
-    by log_name additionally prevents nearby scenarios from the same drive/log
-    leaking across train/validation/test.  Unlike the previous implementation,
-    tiny datasets are never duplicated across splits.
+    For real nuPlan builds the upstream DB set already defines train/val/test.
+    We therefore preserve that official split exactly: every episode goes only
+    into the requested dataset_split and the other two files remain empty.
+    Synthetic/debug builds retain deterministic log-group splitting.
     """
     split_dir = out / "splits"
     split_dir.mkdir(parents=True, exist_ok=True)
+    if preserve_official_split and dataset_split in {"train", "val", "test"}:
+        ids = [str(row.get("episode_id")) for row in episode_rows if row.get("episode_id")]
+        groups = {str(row.get("log_name") or row.get("scenario_id") or row.get("episode_id")) for row in episode_rows}
+        for name in ("train", "val", "test"):
+            selected = ids if name == dataset_split else []
+            (split_dir / f"{name}_episodes.txt").write_text("\n".join(selected) + ("\n" if selected else ""), encoding="utf-8")
+        dump_json(split_dir / "split_manifest.json", {
+            "policy": "preserve_upstream_nuplan_db_split",
+            "upstream_split": dataset_split,
+            "group_key": "log_name",
+            "num_log_groups": len(groups),
+            "episode_counts": {name: (len(ids) if name == dataset_split else 0) for name in ("train", "val", "test")},
+        })
+        return
     groups: Dict[str, List[str]] = {}
     for row in episode_rows:
         eid = str(row.get("episode_id"))
@@ -348,6 +415,105 @@ def _write_splits(out: Path, episode_rows: List[Dict[str, Any]]) -> None:
         manifest["groups"][name] = group_splits[name]
         manifest["episode_counts"][name] = len(ids)
     dump_json(split_dir / "split_manifest.json", manifest)
+
+
+def _counterfactual_pairs_from_service_requests(
+    episode_id: str,
+    requests: List[Dict[str, Any]],
+    contracts: List[Any],
+) -> List[CounterfactualPair]:
+    """Build explicit same-scene/same-OD counterfactual pair labels.
+
+    External/calibrated profile mode previously emitted no pairs at all.  Pair
+    construction is driven by service-request metadata so the dataset can prove
+    that both contracts share the exact same origin, destination, request time,
+    and traffic scene.
+    """
+    if len(requests) < 2 or len(contracts) < 2:
+        return []
+    by_request_id = {str(c.metadata.get("request_id")): c for c in contracts if c.metadata.get("request_id")}
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for req in requests:
+        gid = str(req.get("counterfactual_group_id") or f"{episode_id}:implicit_cf")
+        groups.setdefault(gid, []).append(req)
+    pairs: List[CounterfactualPair] = []
+    pair_idx = 0
+    for gid, group in sorted(groups.items()):
+        if len(group) < 2:
+            continue
+        odt = {
+            (str(r.get("origin_entrance_id")), str(r.get("destination_entrance_id")), float(r.get("request_time_s", 0.0)))
+            for r in group
+        }
+        if len(odt) != 1:
+            raise RuntimeError(f"counterfactual group {gid} is not same-OD/time: {sorted(odt)}")
+        base = next((r for r in group if r.get("counterfactual_role") == "base"), group[0])
+        base_contract = by_request_id.get(str(base.get("request_id")))
+        if base_contract is None:
+            continue
+        for variant in group:
+            if variant is base:
+                continue
+            strict_contract = by_request_id.get(str(variant.get("request_id")))
+            if strict_contract is None:
+                continue
+            relation = str(variant.get("counterfactual_relation") or "different_interface")
+            if relation not in {"stricter_or_equal", "different_modality", "different_interface"}:
+                relation = "different_interface"
+            pairs.append(CounterfactualPair(
+                pair_id=f"{episode_id}:service_cf{pair_idx:03d}",
+                episode_id=episode_id,
+                weak_passenger_id=base_contract.passenger_id,
+                strict_passenger_id=strict_contract.passenger_id,
+                relation=relation,  # type: ignore[arg-type]
+                expected_monotonic=bool(variant.get("expected_monotonic", relation == "stricter_or_equal")),
+                counterfactual_axis=str(variant.get("counterfactual_axis") or "unknown"),
+                counterfactual_group_id=gid,
+                weak_profile_id=str(base.get("passenger_profile_id") or ""),
+                strict_profile_id=str(variant.get("passenger_profile_id") or ""),
+            ))
+            pair_idx += 1
+    return pairs
+
+
+def _motion_fields_from_ego_history(ego_history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Derive reproducible ride-motion supervision from nuPlan ego history.
+
+    The previous dataset builder labelled nuPlan ride edges with fixed
+    index-based heuristic acceleration/jerk values while claiming the evidence
+    source was ``trajectory``.  This helper uses the recorded ego samples
+    instead. ``motion_exposure`` is an explicit benchmark score (not ISO-2631
+    vibration dose): RMS longitudinal acceleration + 0.25*RMS jerk +
+    0.5*RMS lateral acceleration. Closed-loop nuPlan metrics remain the primary
+    vehicle-dynamics evaluation for final experiments.
+    """
+    rows = [r for r in ego_history if isinstance(r, dict)]
+    if not rows:
+        return {}
+    accels = [abs(float(r.get("a", 0.0) or 0.0)) for r in rows]
+    jerks: List[float] = []
+    lateral: List[float] = []
+    for prev, cur in zip(rows, rows[1:]):
+        dt = float(cur.get("t", 0.0) or 0.0) - float(prev.get("t", 0.0) or 0.0)
+        if dt <= 1e-6:
+            continue
+        a0, a1 = float(prev.get("a", 0.0) or 0.0), float(cur.get("a", 0.0) or 0.0)
+        jerks.append(abs(a1 - a0) / dt)
+        h0, h1 = float(prev.get("heading", 0.0) or 0.0), float(cur.get("heading", 0.0) or 0.0)
+        dh = (h1 - h0 + math.pi) % (2 * math.pi) - math.pi
+        v = 0.5 * (abs(float(prev.get("v", 0.0) or 0.0)) + abs(float(cur.get("v", 0.0) or 0.0)))
+        lateral.append(abs(v * dh / dt))
+
+    def rms(xs: List[float]) -> float:
+        return math.sqrt(sum(x * x for x in xs) / len(xs)) if xs else 0.0
+
+    return {
+        "peak_accel_mps2": max(accels or [0.0]),
+        "peak_jerk_mps3": max(jerks or [0.0]),
+        "motion_exposure": rms(accels) + 0.25 * rms(jerks) + 0.5 * rms(lateral),
+        "ride_motion_evidence_source": "nuplan_ego_history",
+        "motion_exposure_definition": "rms_abs_accel+0.25*rms_jerk+0.5*rms_lateral_accel",
+    }
 
 
 
@@ -488,7 +654,10 @@ def main() -> None:
             if not requests:
                 raise RuntimeError(f"{args.service_layer_source} service layer has no request for episode {eid}")
             request = requests[0]
-            service_request_records.append(dict(request))
+            # Persist every same-OD counterfactual request, not just the base
+            # request. Closed-loop evaluation uses these rows to recover the
+            # exact profile/request metadata for each contract.
+            service_request_records.extend(dict(r) for r in requests)
             graph = acc_builder.build(eid, seed=ep.seed)
             try:
                 origin, destination = bind_service_request_to_graph(request, graph)
@@ -527,6 +696,7 @@ def main() -> None:
                 raise RuntimeError(f"service request for {eid} requested vehicle {requested_vehicle_id}, but it is not present in fleet_jsonl")
         else:
             primary_vehicle = next((v for v in vehicles if v.vehicle_id == "wav_ramp_right"), vehicles[0])
+        _enforce_paper_vehicle_quality(args, eid, vehicles)
         pudo_context = {
             "episode_id": eid,
             "seed": ep.seed,
@@ -558,7 +728,12 @@ def main() -> None:
         write_accessibility_graph(out, graph)
         pudo_records.extend(to_dict(x) for x in pudo)
 
-        trip_context = {**to_dict(ep), "route_corridor": scene.route_corridor, "trip_modifiers": {}}
+        trip_context = {
+            **to_dict(ep),
+            "route_corridor": scene.route_corridor,
+            "trip_modifiers": {},
+            **(_motion_fields_from_ego_history(scene.ego_history) if scene.source == "nuplan" else {}),
+        }
         if request:
             trip_context.update(service_request_to_trip_context(request))
         ts = trans_gen.generate(eid, graph, pudo, primary_vehicle, origin.anchor_id, destination.anchor_id, scene_context=trip_context)
@@ -572,7 +747,7 @@ def main() -> None:
             episode_contracts = profile_contracts_by_episode.get(eid, [])
             if not episode_contracts:
                 raise RuntimeError(f"no capability profile/contract available for episode {eid}")
-            pairs = []
+            pairs = _counterfactual_pairs_from_service_requests(eid, requests if request is not None else [], episode_contracts)
         else:
             episode_contracts, pairs = sample_contracts_with_pairs(eid, args.num_contracts_per_scene, seed=ep.seed)
         counterfactual_pairs.extend(to_dict(pair) for pair in pairs)
@@ -617,7 +792,7 @@ def main() -> None:
     write_jsonl(out / "certificate_labels.jsonl", certificate_labels)
     write_jsonl(out / "counterfactual_pairs.jsonl", counterfactual_pairs)
     write_jsonl(out / "service_requests.jsonl", service_request_records)
-    _write_splits(out, episodes)
+    _write_splits(out, episodes, dataset_split=args.split, preserve_official_split=(args.scene_source == "nuplan"))
 
     preflight = load_json(args.external_source_preflight_json) if args.external_source_preflight_json else None
     manifest = {

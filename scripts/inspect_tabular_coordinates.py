@@ -70,6 +70,8 @@ def main() -> None:
     p.add_argument("--input", required=True)
     p.add_argument("--min_valid_fraction", type=float, default=0.95)
     p.add_argument("--min_rows", type=int, default=10)
+    p.add_argument("--min_valid_rows", type=int, default=0,
+                   help="Optional absolute minimum usable coordinate rows. Useful when a public table legitimately contains non-spatial/retired rows.")
     args = p.parse_args()
     path = Path(args.input)
     if not path.exists():
@@ -87,7 +89,11 @@ def main() -> None:
         elif len(bad_examples) < 5:
             bad_examples.append({"lon": lon, "lat": lat, "row": {str(k): v for k, v in list(row.items())[:20]}})
     frac = valid / total if total else 0.0
-    status = "PASS" if total >= args.min_rows and frac >= args.min_valid_fraction else "FAIL"
+    status = "PASS" if (
+        total >= args.min_rows
+        and valid >= args.min_valid_rows
+        and frac >= args.min_valid_fraction
+    ) else "FAIL"
     report = {
         "status": status,
         "input": str(path),
@@ -95,6 +101,7 @@ def main() -> None:
         "valid_wgs84_rows": valid,
         "valid_fraction": frac,
         "min_valid_fraction": args.min_valid_fraction,
+        "min_valid_rows": args.min_valid_rows,
         "fields": fields,
         "bad_examples": bad_examples,
     }

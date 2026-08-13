@@ -109,6 +109,11 @@ def main() -> None:
     p.add_argument("--precision", type=int, default=7)
     p.add_argument("--include_city_gis", action="store_true")
     p.add_argument("--allow_partial_coverage", action="store_true")
+    p.add_argument(
+        "--tile_validation_report",
+        default=None,
+        help="Optional JSON report from validate_dem_tiles.py. When supplied it must be PASS, preventing point-sampling PASS from masking incomplete AOI raster coverage.",
+    )
     args = p.parse_args()
 
     external_root = Path(args.external_root).expanduser().resolve()
@@ -120,6 +125,22 @@ def main() -> None:
     missing = [str(x) for x in rasters if not x.exists()]
     if missing:
         raise RuntimeError("missing raster files: " + ", ".join(missing))
+    tile_validation: Optional[Dict[str, Any]] = None
+    if args.tile_validation_report:
+        report_path = Path(args.tile_validation_report).expanduser().resolve()
+        if not report_path.exists():
+            raise FileNotFoundError(report_path)
+        tile_validation = json.loads(report_path.read_text(encoding="utf-8"))
+        if str(tile_validation.get("status")) != "PASS":
+            raise RuntimeError(
+                "DEM tile/AOI validation is not PASS: "
+                f"{report_path} status={tile_validation.get('status')} "
+                f"coverage={tile_validation.get('coverage')} issues={tile_validation.get('issues')}"
+            )
+        if str(tile_validation.get("city")) != args.city:
+            raise RuntimeError(
+                f"DEM tile validation report city mismatch: expected {args.city}, got {tile_validation.get('city')}"
+            )
     points = collect_points(
         normalized_root,
         args.city,
@@ -171,6 +192,9 @@ def main() -> None:
         "resolution_units": sorted({u for u in resolution_units if u}),
         "output": str(out),
         "publication_note": "terrain elevation is auxiliary; critical PUDO slopes still require authoritative data or manual audit",
+        "tile_validation_report": str(Path(args.tile_validation_report).expanduser().resolve()) if args.tile_validation_report else None,
+        "aoi_tile_validation_status": tile_validation.get("status") if tile_validation else "NOT_CHECKED",
+        "aoi_tile_validation_coverage": tile_validation.get("coverage") if tile_validation else None,
         "status": "PASS" if coverage >= 0.99 or args.allow_partial_coverage else "FAIL",
     }
     report_path = external_root / "reports" / f"local_dem_sampling_{args.city}.json"

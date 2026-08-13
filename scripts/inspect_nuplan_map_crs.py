@@ -26,21 +26,42 @@ def expand_path(value: str) -> Path:
     return p if p.is_absolute() else PROJECT_ROOT / p
 
 
-def find_gpkg(map_root: Path, map_version: str, map_name: str) -> Path:
-    candidates = [
-        map_root / map_version / map_name / f"{map_name}.gpkg",
-        map_root / map_version / map_name / "map.gpkg",
-        map_root / map_name / f"{map_name}.gpkg",
-        map_root / map_name / "map.gpkg",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    matches = sorted(map_root.rglob(f"{map_name}.gpkg")) + sorted(map_root.rglob("map.gpkg"))
-    for p in matches:
-        if map_name in str(p):
-            return p
-    raise FileNotFoundError(f"could not locate GPKG for {map_name} below {map_root}")
+def load_map_manifest(map_root: Path, map_version: str) -> Dict[str, Any]:
+    """Load the nuPlan maps-db version manifest required by the devkit."""
+    manifest = map_root / f"{map_version}.json"
+    if not manifest.exists():
+        legacy = map_root / map_version
+        hint = f" A non-standard nested directory exists at {legacy}." if legacy.exists() else ""
+        raise FileNotFoundError(
+            f"missing nuPlan map manifest {manifest}.{hint} The devkit expects "
+            f"<map_root>/{map_version}.json and <map_root>/<location>/<version>/map.gpkg."
+        )
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"invalid nuPlan map manifest {manifest}: {exc}") from exc
+    if not isinstance(payload, dict) or not payload:
+        raise RuntimeError(f"nuPlan map manifest is empty or not an object: {manifest}")
+    return payload
+
+
+def find_gpkg(map_root: Path, map_version: str, map_name: str, manifest: Optional[Dict[str, Any]] = None) -> Path:
+    """Resolve the exact devkit-compatible map path; never recursively guess."""
+    manifest = manifest or load_map_manifest(map_root, map_version)
+    record = manifest.get(map_name)
+    if not isinstance(record, dict) or not record.get("version"):
+        raise KeyError(f"map {map_name!r} is absent from {map_root / (map_version + '.json')}")
+    location_version = str(record["version"])
+    expected = map_root / map_name / location_version / "map.gpkg"
+    if expected.exists():
+        return expected
+    legacy = map_root / map_version / map_name / location_version / "map.gpkg"
+    if legacy.exists():
+        raise FileNotFoundError(
+            f"nuPlan GPKG is nested one directory too deep: {legacy}. Move/extract it to {expected}; "
+            "the official devkit resolves map files relative to map_root, not map_root/map_version/."
+        )
+    raise FileNotFoundError(f"missing nuPlan GPKG required by manifest: {expected}")
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
@@ -126,6 +147,7 @@ def main() -> None:
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
     map_root = expand_path(cfg["nuplan"]["map_root"])
     map_version = str(cfg["nuplan"]["map_version"])
+    manifest = load_map_manifest(map_root, map_version)
     cities = [x for x in args.cities.replace(",", "+").split("+") if x] if args.cities else list(cfg["cities"])
     out_dir = expand_path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -134,7 +156,7 @@ def main() -> None:
         map_names = cfg["cities"][city].get("map_names") or []
         if len(map_names) != 1:
             raise RuntimeError(f"{city} must have exactly one map_name for CRS generation: {map_names}")
-        gpkg = find_gpkg(map_root, map_version, map_names[0])
+        gpkg = find_gpkg(map_root, map_version, map_names[0], manifest)
         epsg, evidence = projected_crs_from_gpkg(gpkg)
         parsed = CRS.from_user_input(epsg)
         if not parsed.is_projected:
@@ -156,7 +178,14 @@ def main() -> None:
         }
         dest = out_dir / f"{city}.json"
         dest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        report.append({"city": city, "output": str(dest), "local_crs": epsg, "map_gpkg": str(gpkg)})
+        report.append({
+            "city": city,
+            "output": str(dest),
+            "local_crs": epsg,
+            "map_gpkg": str(gpkg),
+            "map_version_manifest": str(map_root / f"{map_version}.json"),
+            "devkit_map_layout_validated": True,
+        })
     print(json.dumps({"status": "PASS", "cities": report}, indent=2, sort_keys=True))
 
 

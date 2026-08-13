@@ -364,6 +364,12 @@ class CounterfactualPair:
     strict_passenger_id: str
     relation: Literal["stricter_or_equal", "different_modality", "different_interface"]
     expected_monotonic: bool
+    # Optional audit metadata for paper counterfactuals. Keeping the axis on the
+    # pair makes T4 reproducible without inferring semantics from profile names.
+    counterfactual_axis: str | None = None
+    counterfactual_group_id: str | None = None
+    weak_profile_id: str | None = None
+    strict_profile_id: str | None = None
 
 
 @dataclass

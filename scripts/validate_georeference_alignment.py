@@ -55,22 +55,68 @@ def fraction_covered(target: Bounds, cover: Bounds) -> float:
     return area(intersect(target, cover)) / denom if denom > 0 else 0.0
 
 
-def gpkg_feature_bounds(path: Path) -> Bounds:
+def _gpkg_srs_crs(conn: sqlite3.Connection, srs_id: int) -> CRS:
+    """Resolve a GeoPackage ``srs_id`` to a pyproj CRS.
+
+    ``gpkg_contents`` extents are expressed in the native CRS of each layer.
+    nuPlan map layers are commonly stored with geographic extents in
+    ``gpkg_contents`` even though the devkit exposes them in a projected local
+    frame.  Comparing those degree-valued extents directly with UTM AOI bounds
+    creates a guaranteed false FAIL, so every layer extent is transformed to
+    the requested target CRS before unioning.
+    """
+    row = conn.execute(
+        "SELECT organization,organization_coordsys_id,definition "
+        "FROM gpkg_spatial_ref_sys WHERE srs_id=?",
+        (int(srs_id),),
+    ).fetchone()
+    if not row:
+        raise RuntimeError(f"GeoPackage SRS id {srs_id} is not registered")
+    organization, organization_coordsys_id, definition = row
+    if str(organization or "").upper() == "EPSG":
+        try:
+            return CRS.from_epsg(int(organization_coordsys_id))
+        except Exception:
+            pass
+    if definition and str(definition).strip().lower() not in {"undefined", "none"}:
+        try:
+            return CRS.from_user_input(str(definition))
+        except Exception:
+            pass
+    raise RuntimeError(
+        f"cannot resolve GeoPackage SRS id {srs_id}: "
+        f"organization={organization!r} coordsys={organization_coordsys_id!r}"
+    )
+
+
+def _transform_bounds_between(bounds: Bounds, src_crs: CRS, dst_crs: CRS) -> Bounds:
+    if src_crs == dst_crs:
+        return bounds
+    tr = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    return tuple(float(x) for x in tr.transform_bounds(*bounds, densify_pts=21))  # type: ignore[return-value]
+
+
+def gpkg_feature_bounds(path: Path, target_crs: str | CRS | None = None) -> Bounds:
     conn = sqlite3.connect(str(path))
     try:
         tables = {str(r[0]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "gpkg_contents" not in tables:
             raise RuntimeError(f"GeoPackage has no gpkg_contents: {path}")
         rows = conn.execute(
-            "SELECT table_name,min_x,min_y,max_x,max_y FROM gpkg_contents "
+            "SELECT table_name,min_x,min_y,max_x,max_y,srs_id FROM gpkg_contents "
             "WHERE data_type='features' AND min_x IS NOT NULL AND min_y IS NOT NULL "
             "AND max_x IS NOT NULL AND max_y IS NOT NULL"
         ).fetchall()
-        valid = []
-        for name, minx, miny, maxx, maxy in rows:
+        valid: List[Tuple[str, float, float, float, float]] = []
+        dst = CRS.from_user_input(target_crs) if target_crs is not None else None
+        for name, minx, miny, maxx, maxy, srs_id in rows:
             vals = [float(minx), float(miny), float(maxx), float(maxy)]
             if all(math.isfinite(v) for v in vals) and vals[2] > vals[0] and vals[3] > vals[1]:
-                valid.append((str(name), *vals))
+                b: Bounds = (vals[0], vals[1], vals[2], vals[3])
+                if dst is not None:
+                    src = _gpkg_srs_crs(conn, int(srs_id))
+                    b = _transform_bounds_between(b, src, dst)
+                valid.append((str(name), *b))
         if not valid:
             raise RuntimeError("nuPlan GPKG has no finite feature extents in gpkg_contents")
         return (
@@ -158,7 +204,7 @@ def main() -> None:
             south, west, north, east = [float(x) for x in ccfg["bbox"]]
             aoi_wgs: Bounds = (west, south, east, north)
             aoi_local = transform_bounds(aoi_wgs, local_crs)
-            map_local = gpkg_feature_bounds(map_gpkg)
+            map_local = gpkg_feature_bounds(map_gpkg, local_crs)
             osm_wgs = geojson_bounds(osm_path)
             osm_local = transform_bounds(osm_wgs, local_crs)
 

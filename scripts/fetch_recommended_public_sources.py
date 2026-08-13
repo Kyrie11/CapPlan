@@ -150,7 +150,12 @@ def main() -> None:
                 )
                 if resource == "Current Payment Points":
                     dst = external / "normalized" / "candidates" / "pittsburgh" / "payment_points_current.jsonl"
-                    normalize(src, dst, "pittsburgh_parking_meter", "Pittsburgh Parking Authority via WPRDC")
+                    # WPRDC includes a minority of current/non-spatial payment
+                    # point rows whose latitude/longitude fields are blank.
+                    # They are not PUDO coordinates and must be dropped rather
+                    # than fabricated. The normalization report records exactly
+                    # how many rows were skipped.
+                    normalize(src, dst, "pittsburgh_parking_meter", "Pittsburgh Parking Authority via WPRDC", ["--skip_invalid"])
                     return dst
                 return src
             attempt("pittsburgh", resource, pp,

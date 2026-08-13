@@ -105,7 +105,12 @@ $CAP_ROOT/data/
 │   │   ├── train_singapore/*.db
 │   │   ├── val/*.db
 │   │   └── test/*.db
-│   └── maps/nuplan-maps-v1.0/...
+│   └── maps/
+│       ├── nuplan-maps-v1.0.json
+│       ├── us-ma-boston/9.12.1817/map.gpkg
+│       ├── us-pa-pittsburgh-hazelwood/9.17.1937/map.gpkg
+│       ├── us-nv-las-vegas-strip/9.15.1915/map.gpkg
+│       └── sg-one-north/9.17.1964/map.gpkg
 ├── external/
 │   ├── raw/
 │   ├── normalized/
@@ -534,7 +539,8 @@ data/external/raw/wprdc/pittsburgh/payment_points_rates.csv
 ```bash
 python scripts/inspect_tabular_coordinates.py \
   --input data/external/raw/wprdc/pittsburgh/payment_points_current.csv \
-  --min_valid_fraction 0.95
+  --min_valid_fraction 0.90 \
+  --min_valid_rows 1000
 ```
 
 要求：
@@ -550,10 +556,13 @@ python scripts/normalize_accessibility_evidence.py \
   --input data/external/raw/wprdc/pittsburgh/payment_points_current.csv \
   --output data/external/normalized/candidates/pittsburgh/payment_points_current.jsonl \
   --profile pittsburgh_parking_meter \
-  --source "Pittsburgh Parking Authority via WPRDC"
+  --source "Pittsburgh Parking Authority via WPRDC" \
+  --skip_invalid
 ```
 
 自动下载优先使用官方 CKAN resource ID，并在 direct dump 被 WPRDC 关闭时尝试 `datastore_search` API fallback。Current resource ID 为 `9ed126cc-3c06-496e-bd08-b7b6b14b4109`。
+
+`Current Payment Points` 中存在合法的非空间/虚拟 payment point 行，其 `latitude/longitude` 为空。它们不能被伪造坐标，也不应让整个 candidate layer 失败。`--min_valid_fraction 0.90 --min_valid_rows 1000` 用来确认“绝大多数且绝对数量足够”的空间点；normalizer 用 `--skip_invalid` 明确丢弃无坐标行并保留其统计。该图层仍只是 PUDO candidate cue，不是 `legal_stop=true` 的独立法规证据。
 
 #### C. Street Closures
 
@@ -788,6 +797,7 @@ python scripts/sample_raster_dem.py \
   --vertical_datum NAVD88 \
   --source_name USGS_3DEP_1m \
   --nominal_resolution_m 1 \
+  --tile_validation_report data/external/reports/dem_tiles_boston.json \
   --include_city_gis
 ```
 
@@ -850,14 +860,14 @@ https://documentation.dataspace.copernicus.eu/Data/Others/CCM.html
 
 截至 2026-07-28 起，GLO-30 View Service 要求账户成为 CCM authorised user；在 CDSE profile 中启用：
 
-```text
+```text 
 I am also interested in accessing Copernicus Contributing Missions data
 ```
 
 搜索条件：
 
 ```text
-Dataset: COP-DEM_GLO-30-DGED / 2024_1
+Dataset: GCOP-DEM_GLO-30-DED / 2024_1
 Grid ID: N01_E103
 ```
 
@@ -869,7 +879,19 @@ Grid ID: N01_E103
 data/external/raw/dem/singapore/*.tif
 ```
 
-然后：
+先验证完整 One-North AOI 覆盖；不要只下载 `103.7600~103.8100` 的手工裁剪，因为配置 AOI 是 `103.75~103.82`：
+
+```bash
+python scripts/validate_dem_tiles.py \
+  --config configs/abilitybench_nuplan_real.yaml \
+  --city singapore \
+  --rasters "$CAP_ROOT"/data/external/raw/dem/singapore/*.tif \
+  --expected_resolution_m 30 \
+  --min_coverage 0.99 \
+  --report_json data/external/reports/dem_tiles_singapore.json
+```
+
+再采样：
 
 ```bash
 python scripts/sample_raster_dem.py \
@@ -879,10 +901,33 @@ python scripts/sample_raster_dem.py \
   --vertical_datum EGM2008 \
   --source_name COPERNICUS_GLO30_DSM \
   --nominal_resolution_m 30 \
+  --tile_validation_report data/external/reports/dem_tiles_singapore.json \
   --include_city_gis
 ```
 
 注意它是 DSM，包含建筑/基础设施/植被表面；只作为大尺度 terrain prior。
+
+---
+
+## 11.5. Vehicle interface：bootstrap 示例与 paper 证据必须分开
+
+YAML 指向：
+
+```text
+data/external/normalized/fleet/vehicle_interfaces.jsonl
+```
+
+仅为打通 **bootstrap**，可以：
+
+```bash
+mkdir -p data/external/normalized/fleet
+cp configs/fleet.abilitybench.example.jsonl \
+   data/external/normalized/fleet/vehicle_interfaces.jsonl
+```
+
+这两条示例车辆只用于工程 sanity check。修订后的 paper-mode 会拒绝 `abilitybench_example_fleet`、synthetic/proxy/unknown vehicle source。主结果必须换成量测或制造商/运营方核验的接口规格，并在每行 `source` / `metadata.source` 中写可审计来源；至少包括 `door_side, ramp, lift, low_floor, door_width_m, deployment_clearance_m, notification_modes, dwell_time_s, kneeling`。
+
+这些字段还必须在 `fleet_jsonl` 中**显式出现**。修订后的 loader 会记录 `metadata.provided_interface_fields`，paper-mode 不再把 dataclass 默认值当作“已量测证据”。
 
 ---
 
@@ -952,6 +997,33 @@ Bootstrap PASS 只表示：
 - 没有 synthetic fallback 偷偷代替真实数据。
 
 它**不等价于 publication-ready**。
+
+---
+
+## 13.5. T4 same-scene capability counterfactual 必须显式生成
+
+修订后的配置默认使用：
+
+```text
+configs/capability_profiles.counterfactual.yaml
+configs/demand.counterfactual.yaml
+```
+
+每个 episode 生成 1 个 base + 7 个 stricter variants，且强制共享完全相同的 `origin_entrance_id / destination_entrance_id / request_time_s / traffic scene`。七个轴为：
+
+```text
+access_distance
+step_free
+min_width
+ramp_lift
+door_side_clearance
+ride_motion
+confidence
+```
+
+最终 `counterfactual_pairs.jsonl` 必须每 episode 至少 7 对，并携带 `counterfactual_axis / counterfactual_group_id / weak_profile_id / strict_profile_id`；`validate_dataset.py` 会再次校验 pair 的 service-request O/D/time 一致性，`audit_dataset_quality.py --paper_mode` 会检查七轴覆盖。
+
+质量 gate 不是只数“7 对”：修订后会对**每个 episode**分别检查七个 axis 是否齐全，避免“7 个 pair 其实重复同一个 axis”的假阳性 PASS。
 
 ---
 
@@ -1257,6 +1329,22 @@ python scripts/prepare_abilitybench_external.py \
 
 ---
 
+## 21.5. Train/val/test 必须保留 nuPlan DB-set 原始 split
+
+对真实 nuPlan 构建，不能在 `train/val/test` DB set 内再次随机切分。修订后的 `build_dataset.py` 会把当前 `--split train|val|test` 的 episode **全部且只**写入对应的 `splits/<split>_episodes.txt`，另两个文件留空；`merge_datasets.py` 只合并上游 split，不再用 fallback 人工复制 episode 到其他 split，并显式检查 overlap。
+
+因此推荐分别运行：
+
+```bash
+python scripts/prepare_abilitybench_external.py --config configs/abilitybench_nuplan_real.yaml --split train --source_policy paper --stages extract,graphs,pudo,service,dataset,merge
+python scripts/prepare_abilitybench_external.py --config configs/abilitybench_nuplan_real.yaml --split val   --source_policy paper --stages extract,graphs,pudo,service,dataset,merge
+python scripts/prepare_abilitybench_external.py --config configs/abilitybench_nuplan_real.yaml --split test  --source_policy paper --stages extract,graphs,pudo,service,dataset,merge
+```
+
+主训练/验证/测试分别使用 `abilitybench_av_train / abilitybench_av_val / abilitybench_av_test`；不要把某一个目录内部再重新划分成三份。
+
+---
+
 ## 22. Dataset schema + quality gate
 
 城市 dataset：
@@ -1313,6 +1401,8 @@ skeleton_positive_rate
 
 **candidate missingness 不再作为 paper fail 的直接理由。** 真正检查的是有没有足够 evidence-complete 的合法 interface 支撑主实验。
 
+`paper_evidence_complete/paper_eligible` 必须来自 `scripts/build_pudo_evidence.py` 的显式 evidence audit。修订后的 paper-mode 不再因为 `curb_height_m/sidewalk_width_m/deployment_clearance_m` 三个数“恰好非空”就自行推断 publication eligibility；这避免缺少独立 legality/interface provenance 的 PUDO 假阳性。
+
 ---
 
 ## 23. 一条命令做总检查
@@ -1362,20 +1452,24 @@ nuPlan DB-city check
 ### Phase A：纠正旧输出
 
 ```text
-1. 用新 inspect_nuplan_db_cities 检查 train/val/test
-2. 用新 inspect_nuplan_map_crs 重建四城 georeference
-3. 用新 prepare_osm_from_pbf 重建四城 OSM GeoJSON
-4. Boston raw 用新 normalizer 重跑
+1. 先把 nuPlan map package 改成官方 devkit hierarchy：maps/nuplan-maps-v1.0.json + maps/<map>/<version>/map.gpkg
+2. 用新 inspect_nuplan_db_cities 检查 train/val/test
+3. 用新 inspect_nuplan_map_crs 重建四城 georeference
+4. 用新 validate_georeference_alignment 做真正的 CRS/extent overlap check
+5. 四城 OSM PBF 可复用；必要时重跑 prepare_osm_from_pbf
+6. 重新归一化 Singapore LTA Footpath/Kerbline（旧版曾把 JSONL 写成 .geojson）
+7. Pittsburgh Current Payment Points 采用坐标质量 gate + --skip_invalid
 ```
 
-### Phase B：补推荐公共层
+### Phase B：补/纠正推荐公共层
 
 ```text
-5. fetch_recommended_public_sources.py
-6. 若 WPRDC/LTA 自动失败，按 report.manual_fallback 手工下载
-7. USGS 手工下载 3DEP Boston/Pittsburgh/Vegas
-8. Copernicus 手工下载 Singapore N01_E103 GLO-30 DGED
-9. sample_raster_dem.py
+8. fetch_recommended_public_sources.py
+9. 若 WPRDC/LTA 自动失败，按 report.manual_fallback 手工下载
+10. USGS 用 YAML AOI 重新检查/补齐 Boston/Pittsburgh/Vegas tiles，先 validate_dem_tiles
+11. Copernicus 下载完整 Singapore N01_E103 GLO-30 DGED，先 validate_dem_tiles
+12. sample_raster_dem.py 必须传对应 PASS 的 --tile_validation_report
+13. bootstrap 时准备 example fleet；paper 时替换为 audited fleet
 ```
 
 ### Phase C：bootstrap 数据集
@@ -1538,3 +1632,18 @@ python scripts/audit_dataset_quality.py \
 - Pittsburgh `Sidewalks and Steps` 必须是 LineString/MultiLineString；如果下载成 blockgroup/tract 统计几何，归一化会直接 FAIL。
 - Pittsburgh Address Points 自动入口改为当前 PASDA Allegheny County ArcGIS layer 32，自动查询使用 `outSR=4326`。若使用 PASDA 静态 NAD83 GeoJSON 快照，可在 normalizer 中显式传 `--input_crs EPSG:4269`。
 - USGS 多个 1m TIFF 不要求物理合并；先跑 `validate_dem_tiles.py`，采样器会稳定排序 tiles 并保留 `source_tile` provenance。
+- `sample_raster_dem.py` 支持 `--tile_validation_report`；推荐把 AOI coverage PASS 作为采样前置条件，避免“少量 candidate points 全命中”造成假 PASS。
+- `external_validation.py` 的 OSM semantic gate 不再只检查前 500 个 feature，避免 Vegas/Singapore 线要素排在后面时误判无 pedestrian topology。
+- LTA `Footpath/Kerbline` 输出已改为真正 GeoJSON FeatureCollection；DEM candidate collector 同时识别 `{city}_sidewalks.geojson`。
+- `download_arcgis_layer.py` 对超长 `objectIds` 自动改 POST，避免 PASDA/ArcGIS 大图层 GET 404/414。
+- nuPlan map CRS 检查现在要求官方 manifest + devkit 目录结构；递归找到一个 GPKG 不再算 PASS。
+- paper-mode 会拒绝 example/unverified fleet，并硬检查 T4 same-scene same-OD 七轴 counterfactual coverage。
+
+
+### 2026-08-12 additional correctness fixes
+
+17. 保留 nuPlan 官方 DB split，不在真实 train/val/test 内再次随机切分；merge 禁止 fallback 复制 episode。
+18. paper-mode PUDO eligibility 只接受显式审计 flags，不再从“字段非空”弱推断。
+19. paper-mode vehicle interface 要求核心字段在原始 fleet row 中显式提供，默认值不能充当证据。
+20. counterfactual quality gate 对每个 episode 检查七个 axis，而不是只检查 pair 数量。
+21. bootstrap quality audit 不再仅因为 `source_policy != paper` 而错误 FAIL；publication gate 仍只在 `--paper_mode` 下启用。

@@ -108,8 +108,14 @@ def _count_payload_records(payload: Any) -> int:
 
 
 
-def _record_view(payload: Any, *, limit: int = 500) -> List[Dict[str, Any]]:
-    """Return a bounded, schema-agnostic list of records for semantic checks."""
+def _record_view(payload: Any, *, limit: Optional[int] = 500) -> List[Dict[str, Any]]:
+    """Return a schema-agnostic list of records for semantic checks.
+
+    ``limit=None`` scans the complete already-loaded payload. Prepared OSM
+    FeatureCollections can contain hundreds of point features before their
+    first pedestrian LineString, so validating only the first 500 records can
+    create a false ``osm_has_no_routable_pedestrian_line_geometry`` failure.
+    """
     rows: List[Dict[str, Any]] = []
     if isinstance(payload, list):
         candidates = payload
@@ -126,7 +132,8 @@ def _record_view(payload: Any, *, limit: int = 500) -> List[Dict[str, Any]]:
             candidates = [payload]
     else:
         candidates = []
-    for item in candidates[:limit]:
+    selected = candidates if limit is None else candidates[:limit]
+    for item in selected:
         if not isinstance(item, dict):
             continue
         props = item.get("properties") if isinstance(item.get("properties"), dict) else {}
@@ -302,7 +309,7 @@ def inspect_source(path: str | Path | None, *, role: Optional[str] = None) -> So
                 payload = json.load(f)
             out.records = _count_payload_records(payload)
             out.content_kind, out.schema_variant, out.evidence_tier, out.authoritative = _metadata_from_payload(payload)
-            semantic_rows = _record_view(payload)
+            semantic_rows = _record_view(payload, limit=None if role == "osm" else 500)
         elif suffix in {".jsonl", ".ndjson", ".geojsonl"}:
             n = 0
             first_obj: Any = None

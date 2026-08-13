@@ -18,10 +18,20 @@ USER_AGENT = "CapPlan-AbilityBench/1.0 (research dataset preparation; ArcGIS RES
 def request_json(url: str, params: Dict[str, Any], retries: int = 5, timeout: int = 120) -> Dict[str, Any]:
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     full = f"{url}?{query}"
+    # ArcGIS object-id batches can easily exceed common proxy/web-server GET
+    # URL limits. ArcGIS REST query endpoints accept application/x-www-form-
+    # urlencoded POST with the same parameters, so switch automatically for
+    # long requests instead of retrying a deterministic HTTP 404/414 forever.
+    use_post = len(full) > 1800
     last: Optional[Exception] = None
     for attempt in range(retries):
         try:
-            req = urllib.request.Request(full, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+            headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+            if use_post:
+                headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+                req = urllib.request.Request(url, data=query.encode("utf-8"), headers=headers, method="POST")
+            else:
+                req = urllib.request.Request(full, headers=headers, method="GET")
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 body = r.read()
                 ctype = str(r.headers.get("Content-Type", "")).lower()
@@ -35,7 +45,8 @@ def request_json(url: str, params: Dict[str, Any], retries: int = 5, timeout: in
             last = exc
             if attempt + 1 < retries:
                 time.sleep(min(2 ** attempt, 20))
-    raise RuntimeError(f"request failed after {retries} attempts: {full}: {last}")
+    request_desc = f"POST {url} ({len(query)} encoded bytes)" if use_post else full
+    raise RuntimeError(f"request failed after {retries} attempts: {request_desc}: {last}")
 
 
 def _query_url(layer_url: str) -> str:

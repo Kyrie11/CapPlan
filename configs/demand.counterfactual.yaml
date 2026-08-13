@@ -1,0 +1,16 @@
+profile_mix:
+- basic_service_complete
+- cf_access_distance_strict
+- cf_step_free_required
+- cf_min_width_strict
+- cf_ramp_or_lift_required
+- cf_door_side_clearance_strict
+- cf_ride_motion_strict
+- cf_confidence_strict
+counterfactual_base_profile_id: basic_service_complete
+trip_purposes:
+- benchmark_counterfactual
+request_time_start_s: 28800
+request_time_span_s: 43200
+default_demand_weight: 1.0
+modifiers: {}

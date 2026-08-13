@@ -184,6 +184,15 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
     episode_ids = cfg.get("episode_ids") or _graph_episode_ids(graph_dir)
     profile_ids = [str(p["profile_id"]) for p in profiles]
     profile_mix = cfg.get("profile_mix") or profile_ids
+    profile_mix = [str(x) for x in profile_mix]
+    if len(set(profile_mix)) != len(profile_mix):
+        raise RuntimeError("profile_mix must contain unique profile ids; duplicate profiles would create duplicate passenger contracts within an episode")
+    if args.num_requests_per_episode > len(profile_mix):
+        raise RuntimeError(
+            f"num_requests_per_episode={args.num_requests_per_episode} exceeds the {len(profile_mix)} unique profiles in profile_mix. "
+            "Provide additional counterfactual capability profiles instead of repeating a profile id."
+        )
+    profile_by_id = {str(p["profile_id"]): p for p in profiles}
     purposes = cfg.get("trip_purposes") or ["medical", "work", "shopping", "social", "other"]
     request_time_start = float(cfg.get("request_time_start_s", 8 * 3600))
     request_time_span = float(cfg.get("request_time_span_s", 12 * 3600))
@@ -192,11 +201,24 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
     for eid in episode_ids:
         nodes = _load_nodes(graph_dir, str(eid))
         entrances = _entrance_nodes(nodes, allow_non_entrance_od=args.allow_non_entrance_od)
+        # AbilityBench counterfactuals intentionally keep the traffic scene and
+        # passenger OD fixed while changing only the capability contract. The
+        # previous code sampled a fresh OD for every profile, which made T4
+        # impossible to interpret and conflicted with build_dataset.py (which
+        # binds one OD per scene episode).
+        o, d = _choose_od(entrances, rng)
+        request_time_s = round(request_time_start + rng.random() * request_time_span, 3)
+        cf_group_id = f"{eid}:cf_od0"
+        base_profile_id = str(cfg.get("counterfactual_base_profile_id") or profile_mix[0])
         for i in range(args.num_requests_per_episode):
-            o, d = _choose_od(entrances, rng)
-            pid = str(profile_mix[(i + rng.randrange(len(profile_mix))) % len(profile_mix)])
+            pid = str(profile_mix[i])
             if pid not in profile_ids:
                 raise RuntimeError(f"demand config references missing profile id {pid}")
+            pmeta = profile_by_id[pid]
+            is_base = pid == base_profile_id
+            relation = str(pmeta.get("counterfactual_relation") or "stricter_or_equal")
+            if relation not in {"stricter_or_equal", "different_modality", "different_interface"}:
+                raise RuntimeError(f"profile {pid} has unsupported counterfactual_relation={relation!r}")
             rows.append({
                 "request_id": f"{eid}:req_{i:04d}",
                 "episode_id": str(eid),
@@ -204,13 +226,19 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
                 "destination_entrance_id": d.node_id,
                 "origin_confidence": o.confidence,
                 "destination_confidence": d.confidence,
-                "request_time_s": round(request_time_start + rng.random() * request_time_span, 3),
+                "request_time_s": request_time_s,
                 "passenger_profile_id": pid,
                 "trip_purpose": purposes[i % len(purposes)],
                 "party_size": 1,
                 "demand_weight": float(cfg.get("default_demand_weight", 1.0)),
                 "modifiers": dict(cfg.get("modifiers", {})),
                 "source": args.source_name,
+                "counterfactual_group_id": cf_group_id,
+                "counterfactual_role": "base" if is_base else "variant",
+                "counterfactual_base_profile_id": base_profile_id,
+                "counterfactual_axis": pmeta.get("counterfactual_axis") or ("base" if is_base else pmeta.get("archetype")),
+                "counterfactual_relation": relation,
+                "expected_monotonic": bool(pmeta.get("expected_monotonic", not is_base and relation == "stricter_or_equal")),
                 "bootstrap_non_entrance_od": bool(args.allow_non_entrance_od and o.kind not in {"entrance", "origin_entrance", "destination_entrance", "transit_stop"}),
             })
     return rows
@@ -241,8 +269,11 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
         if not args.output_capability_profiles_jsonl:
             # Sidecar default keeps old CLI compatible but makes generated passenger info reusable.
             args.output_capability_profiles_jsonl = str(Path(args.output_service_requests_jsonl).with_name("capability_profiles.generated.jsonl"))
-    if generated_profiles and args.output_capability_profiles_jsonl:
-        write_jsonl(args.output_capability_profiles_jsonl, generated_profiles)
+    if args.output_capability_profiles_jsonl:
+        # Materialize the exact profile set used by this build even when the
+        # source was YAML/JSONL supplied by the caller. This keeps downstream
+        # dataset manifests self-contained and reproducible.
+        write_jsonl(args.output_capability_profiles_jsonl, profiles)
 
     if args.service_requests_jsonl:
         rows = [validate_service_request(r) for r in _read_records(args.service_requests_jsonl, "service_requests")]
@@ -263,7 +294,7 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
         "fleet_episodes_checked": fleet_eps,
         "source": args.source_name,
         "mode": mode,
-        "generated_capability_profiles_jsonl": args.output_capability_profiles_jsonl if generated_profiles else None,
+        "materialized_capability_profiles_jsonl": args.output_capability_profiles_jsonl,
     }
     if args.report_json:
         dump_json(args.report_json, report)

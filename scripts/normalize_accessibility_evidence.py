@@ -446,7 +446,12 @@ def main() -> None:
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
-    geojson_profiles = {"boston_sidewalk", "boston_sidewalk_centerline", "boston_curb", "pittsburgh_sidewalks_steps", "pittsburgh_address_point", "government_entrance", "generic_city_gis"}
+    geojson_profiles = {
+        "boston_sidewalk", "boston_sidewalk_centerline", "boston_curb",
+        "pittsburgh_sidewalks_steps", "pittsburgh_address_point",
+        "lta_footpath", "lta_kerbline",
+        "government_entrance", "generic_city_gis",
+    }
     if args.profile in geojson_profiles:
         payload = {"type": "FeatureCollection", "features": rows, "properties": {"profile": args.profile, "source": args.source, "record_count": len(rows)}}
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")

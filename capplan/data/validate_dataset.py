@@ -59,6 +59,7 @@ def validate_dataset(dataset_dir: str | Path, strict: bool = False) -> Dict[str,
     passenger_edge_labels = read_jsonl(root / "passenger_edge_labels.jsonl")
     resource_labels = read_jsonl(root / "resource_labels.jsonl")
     pairs = read_jsonl(root / "counterfactual_pairs.jsonl")
+    service_requests = read_jsonl(root / "service_requests.jsonl") if (root / "service_requests.jsonl").exists() else []
     episode_ids = {e.get("episode_id") for e in episodes}
     scene_ids = {s.get("episode_id") for s in scenes}
     if episode_ids != scene_ids:
@@ -140,6 +141,10 @@ def validate_dataset(dataset_dir: str | Path, strict: bool = False) -> Dict[str,
             errors.append(f"passenger edge label feasible despite failed resources: {l.get('transition_id')} {l.get('passenger_id')}")
         if l.get("y_e_p") and any(float(v) < 0 for v in (l.get("margins") or {}).values()):
             errors.append(f"passenger edge label feasible despite negative margin: {l.get('transition_id')} {l.get('passenger_id')}")
+    requests_by_episode_profile: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for request in service_requests:
+        key = (str(request.get("episode_id")), str(request.get("passenger_profile_id")))
+        requests_by_episode_profile.setdefault(key, []).append(request)
     for pair in pairs:
         if pair.get("episode_id") not in episode_ids:
             errors.append(f"counterfactual pair references unknown episode {pair.get('episode_id')}")
@@ -147,6 +152,25 @@ def validate_dataset(dataset_dir: str | Path, strict: bool = False) -> Dict[str,
             errors.append(f"counterfactual pair references unknown passengers {pair}")
         if pair.get("weak_passenger_id", "").split(":p")[0] != pair.get("strict_passenger_id", "").split(":p")[0]:
             errors.append(f"counterfactual pair crosses episodes {pair}")
+        # New paper pairs carry explicit profile/group metadata.  When present,
+        # verify that the two service requests really share O/D/time.
+        wp = str(pair.get("weak_profile_id") or "")
+        sp = str(pair.get("strict_profile_id") or "")
+        if wp and sp and service_requests:
+            eid = str(pair.get("episode_id"))
+            weak_rows = requests_by_episode_profile.get((eid, wp), [])
+            strict_rows = requests_by_episode_profile.get((eid, sp), [])
+            if not weak_rows or not strict_rows:
+                errors.append(f"counterfactual pair missing service request profile binding {pair.get('pair_id')}")
+            else:
+                w, st = weak_rows[0], strict_rows[0]
+                w_key = (w.get("origin_entrance_id"), w.get("destination_entrance_id"), float(w.get("request_time_s", 0.0)))
+                s_key = (st.get("origin_entrance_id"), st.get("destination_entrance_id"), float(st.get("request_time_s", 0.0)))
+                if w_key != s_key:
+                    errors.append(f"counterfactual pair is not same-OD/time {pair.get('pair_id')}: {w_key} != {s_key}")
+                gid = pair.get("counterfactual_group_id")
+                if gid and (w.get("counterfactual_group_id") != gid or st.get("counterfactual_group_id") != gid):
+                    errors.append(f"counterfactual pair group mismatch {pair.get('pair_id')}")
     result = {
         "ok": not errors,
         "errors": errors,

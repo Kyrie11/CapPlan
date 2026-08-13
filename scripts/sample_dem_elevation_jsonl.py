@@ -126,6 +126,7 @@ def _iter_points_from_row(row: Dict[str, Any]) -> Iterator[Tuple[float, float]]:
 
 def _iter_candidate_paths(external_root: Path, city: str, include_city_gis: bool) -> Iterator[Path]:
     roots = [
+        external_root / "osm" / f"{city}_sidewalks.geojson",
         external_root / "osm" / f"{city}_sidewalks.json",
         external_root / "opensidewalks" / f"{city}.geojson",
         external_root / "entrances" / f"{city}.geojson",

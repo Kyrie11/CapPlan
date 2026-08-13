@@ -8,6 +8,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import importlib.util
+import json
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -105,14 +106,19 @@ def expand_nuplan_db_files(db_files: str | Sequence[str] | None) -> List[str]:
 
 def safe_call(obj: Any, names: List[str], default: Any = None) -> Any:
     for name in names:
-        if hasattr(obj, name):
+        try:
             attr = getattr(obj, name)
-            try:
-                return attr() if callable(attr) else attr
-            except TypeError:
-                continue
-            except Exception:
-                continue
+        except Exception:
+            # Some nuPlan properties (notably map_api) execute map-db loading
+            # during attribute access. ``hasattr`` would re-raise non-
+            # AttributeError failures before our safety wrapper can handle them.
+            continue
+        try:
+            return attr() if callable(attr) else attr
+        except TypeError:
+            continue
+        except Exception:
+            continue
     return default
 
 
@@ -187,6 +193,36 @@ class NuPlanAdapter:
         for db_path in self.db_files:
             if not Path(db_path).exists():
                 raise RuntimeError(f"scene_source=nuplan requested, but nuPlan DB file does not exist: {db_path}")
+        # Fail before scenario iteration with an actionable map-package error.
+        # GPKGMapsDB always reads <map_version>.json from map_root, and each
+        # manifest entry resolves to <location>/<version>/map.gpkg.
+        map_root = Path(str(self.map_root))
+        manifest_path = map_root / f"{self.map_version}.json"
+        if not manifest_path.exists():
+            raise RuntimeError(
+                f"nuPlan maps package is incomplete: missing {manifest_path}. "
+                f"Expected <map_root>/{self.map_version}.json plus <map_root>/<location>/<version>/map.gpkg; "
+                "do not nest the location folders under a nuplan-maps-v1.0/ directory."
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"nuPlan map manifest is not valid JSON: {manifest_path}: {exc}") from exc
+        if not isinstance(manifest, dict) or not manifest:
+            raise RuntimeError(f"nuPlan map manifest is empty or malformed: {manifest_path}")
+        missing_maps: List[str] = []
+        for location, meta in manifest.items():
+            if not isinstance(meta, dict) or not meta.get("version"):
+                continue
+            expected = map_root / str(location) / str(meta["version"]) / "map.gpkg"
+            if not expected.exists():
+                missing_maps.append(str(expected))
+        if missing_maps:
+            preview = ", ".join(missing_maps[:4])
+            raise RuntimeError(
+                f"nuPlan maps package does not match its manifest; missing map.gpkg files: {preview}. "
+                "Re-extract the official nuPlan maps archive directly into --nuplan_map_root."
+            )
         try:
             from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder  # type: ignore
         except Exception as e:  # pragma: no cover - depends on local devkit

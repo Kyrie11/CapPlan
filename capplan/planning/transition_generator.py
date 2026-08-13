@@ -129,11 +129,12 @@ class TransitionGenerator:
         peak_jerk = float(scene_context.get("peak_jerk_mps3", 1.8 + 0.08 * _pudo_index(do.anchor_id)))
         motion = float(scene_context.get("motion_exposure", max(0.8, route_length / 2000.0) + 0.1 * abs(_pudo_index(pu.anchor_id) - _pudo_index(do.anchor_id))))
         traffic_risk = float(scene_context.get("availability_risk", 0.04))
+        motion_source = str(scene_context.get("ride_motion_evidence_source") or "trajectory_heuristic")
         evidence = [
             ResourceEvidence("ride_time_s", "cumulative", ride_time, sigma=max(10.0, 0.05 * ride_time), confidence=0.93, source="route_corridor"),
-            ResourceEvidence("motion_exposure", "cumulative", motion, sigma=0.15, confidence=0.90, source="trajectory"),
-            ResourceEvidence("peak_accel_mps2", "upper", peak_accel, sigma=0.12, confidence=0.90, source="trajectory"),
-            ResourceEvidence("peak_jerk_mps3", "upper", peak_jerk, sigma=0.18, confidence=0.90, source="trajectory"),
+            ResourceEvidence("motion_exposure", "cumulative", motion, sigma=0.15, confidence=0.90, source=motion_source),
+            ResourceEvidence("peak_accel_mps2", "upper", peak_accel, sigma=0.12, confidence=0.90, source=motion_source),
+            ResourceEvidence("peak_jerk_mps3", "upper", peak_jerk, sigma=0.18, confidence=0.90, source=motion_source),
             ResourceEvidence("availability_risk", "probabilistic", traffic_risk, sigma=0.02, confidence=0.90, source="prediction"),
         ]
         tests = TransitionTests(True, True, True, True, True, traffic_risk < 0.85, ["traffic_unavailable"] if traffic_risk >= 0.85 else [])

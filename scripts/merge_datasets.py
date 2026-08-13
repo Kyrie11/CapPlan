@@ -82,18 +82,33 @@ def merge_datasets(input_dirs: List[Path], output_dir: Path, strict: bool = Fals
     for d in input_dirs:
         all_ids.extend(_episode_ids(d))
     all_ids = list(dict.fromkeys(all_ids))
+    merged_splits: Dict[str, List[str]] = {}
+    seen_split: Dict[str, str] = {}
     for split_name in ["train", "val", "test"]:
         merged: List[str] = []
         for d in input_dirs:
             f = d / "splits" / f"{split_name}_episodes.txt"
             if f.exists():
                 merged.extend(x.strip() for x in f.read_text(encoding="utf-8").splitlines() if x.strip())
-        if not merged and split_name == "train":
-            merged = all_ids
-        if not merged and all_ids:
-            merged = all_ids[-max(1, len(all_ids) // 10):]
         merged = list(dict.fromkeys(merged))
+        for eid in merged:
+            prev = seen_split.get(eid)
+            if prev is not None and prev != split_name:
+                raise RuntimeError(f"split leakage while merging: episode {eid} appears in both {prev} and {split_name}")
+            seen_split[eid] = split_name
+        merged_splits[split_name] = merged
         (split_dir / f"{split_name}_episodes.txt").write_text("\n".join(merged) + ("\n" if merged else ""), encoding="utf-8")
+    unassigned = sorted(set(all_ids) - set(seen_split))
+    if unassigned:
+        raise RuntimeError(
+            f"merge would leave {len(unassigned)} episodes unassigned to an upstream split; "
+            f"first examples: {unassigned[:5]}. Do not fabricate fallback split membership."
+        )
+    dump_json(split_dir / "split_manifest.json", {
+        "policy": "merge_preserved_upstream_splits",
+        "episode_counts": {k: len(v) for k, v in merged_splits.items()},
+        "overlap_checked": True,
+    })
 
     manifests = []
     for d in input_dirs:

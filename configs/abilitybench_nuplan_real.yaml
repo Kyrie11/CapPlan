@@ -8,7 +8,8 @@ num_workers: 0
 nuplan:
   # Official nuPlan layout:
   # data/nuplan/nuplan-v1.1/splits/{mini,trainval,test,...}/*.db
-  # data/nuplan/maps/nuplan-maps-v1.0/<map-name>/*.gpkg
+  # data/nuplan/maps/nuplan-maps-v1.0.json
+  # data/nuplan/maps/<map-name>/<location-version>/map.gpkg
   data_root: "{project_root}/data/nuplan"
   db_root: "{project_root}/data/nuplan/nuplan-v1.1/splits"
   map_root: "{project_root}/data/nuplan/maps"
@@ -32,8 +33,11 @@ quality:
   min_episode_pudo_coverage_rate: 0.80
 
 service:
-  # Counterfactual profiles should be increased for final experiments.
-  num_requests_per_episode: 6
+  # Eight same-scene/same-OD contracts: one base plus seven stricter variants
+  # covering the axes used by the paper's T4 counterfactual experiment.
+  capability_profiles: "{project_root}/configs/capability_profiles.counterfactual.yaml"
+  demand_sources_config: "{project_root}/configs/demand.counterfactual.yaml"
+  num_requests_per_episode: 8
 
 pudo:
   candidate_radius_m: 120

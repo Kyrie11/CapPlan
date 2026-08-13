@@ -420,6 +420,14 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     fleet_jsonl = _path(config["fleet_jsonl"])
     if "service" in stages or "all" in stages:
         _require_artifact(graph_dir, "accessibility graphs", dry_run)
+        if not dry_run and not fleet_jsonl.exists():
+            raise RuntimeError(
+                f"missing fleet interface file: {fleet_jsonl}. For bootstrap diagnostics you may copy "
+                "configs/fleet.abilitybench.example.jsonl to that path. Paper results require measured/verified fleet interface metadata."
+            )
+        service_cfg = config.get("service", {}) or {}
+        profile_source = _path(service_cfg["capability_profiles"]) if service_cfg.get("capability_profiles") else None
+        demand_cfg = _path(service_cfg["demand_sources_config"]) if service_cfg.get("demand_sources_config") else None
         _run(
             [
                 sys.executable,
@@ -432,8 +440,10 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(service_requests),
                 "--output_capability_profiles_jsonl",
                 str(capability_profiles),
+                *( ["--capability_profiles_jsonl", str(profile_source)] if profile_source else [] ),
+                *( ["--demand_sources_config", str(demand_cfg)] if demand_cfg else [] ),
                 "--num_requests_per_episode",
-                str(config.get("service", {}).get("num_requests_per_episode", 3)),
+                str(service_cfg.get("num_requests_per_episode", 3)),
                 "--source_name",
                 "abilitybench_calibrated_od" if source_policy == "paper" else "abilitybench_bootstrap_od_not_for_paper",
                 "--report_json",

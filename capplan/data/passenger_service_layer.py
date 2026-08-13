@@ -139,12 +139,21 @@ def load_fleet_interfaces(path: str | Path) -> Dict[str, List[VehicleInterface]]
         meta = dict(d.get("metadata") or {})
         if d.get("source"):
             meta["source"] = d.get("source")
+        # Preserve which interface fields were explicitly supplied by the source.
+        # Dataclass defaults are convenient for bootstrap use, but paper-mode must
+        # never mistake a default-filled field for measured/manufacturer evidence.
+        provided_fields = set(str(x) for x in (meta.get("provided_interface_fields") or []))
+        provided_fields.update(str(k) for k in d.keys())
         d["metadata"] = meta
         # Accept service-layer names as aliases.
         if "interface_spec_id" in d and "vehicle_id" not in d:
             d["vehicle_id"] = d["interface_spec_id"]
+            provided_fields.add("vehicle_id")
         if "vehicle_type" in d and "fleet_type" not in d:
             d["fleet_type"] = d["vehicle_type"]
+            provided_fields.add("fleet_type")
+        meta["provided_interface_fields"] = sorted(provided_fields)
+        d["metadata"] = meta
         allowed = set(VehicleInterface.__dataclass_fields__.keys())
         v = vehicle_from_dict({k: v for k, v in d.items() if k in allowed})
         by_ep.setdefault(v.episode_id, []).append(v)
