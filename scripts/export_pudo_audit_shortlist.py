@@ -55,6 +55,7 @@ def main() -> None:
     p.add_argument("--max_candidates_per_episode", type=int, default=4)
     p.add_argument("--dedup_radius_m", type=float, default=5.0)
     p.add_argument("--include_legal_negative", action="store_true", help="Also audit evidence-complete candidates that are independently illegal.")
+    p.add_argument("--report_json", default=None, help="Optional JSON report path for reproducible build diagnostics.")
     args = p.parse_args()
 
     rows = list(read_jsonl(args.pudo_evidence_jsonl))
@@ -110,7 +111,7 @@ def main() -> None:
         "audit_id", "city", "lon", "lat", "curb_height_m", "sidewalk_width_m",
         "deployment_clearance_m", "curb_ramp", "running_slope", "cross_slope",
         "surface", "legal_stop", "legal_basis", "service_class", "time_window",
-        "entrance_id", "observed_at", "auditor_id", "photo_ref", "notes",
+        "entrance_id", "entrance_lon", "entrance_lat", "observed_at", "auditor_id", "photo_ref", "notes",
         "protocol_version", "episode_ids", "candidate_anchor_ids", "candidate_sources",
         "evidence_status_before_audit", "adjacent_ped_node_ids",
     ]
@@ -142,6 +143,10 @@ def main() -> None:
         "output_csv": str(out),
         "interpretation": "PASS means an auditable shortlist was generated; it does not mean the dataset is publication-ready.",
     }
+    if args.report_json:
+        rp = Path(args.report_json)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True))
     print(f"PUDO_AUDIT_SHORTLIST_CHECK={report['status']}")
     if not clusters:

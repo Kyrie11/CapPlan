@@ -9,7 +9,7 @@ import argparse
 from pathlib import Path
 
 from capplan.data.accessibility_layer import load_accessibility_graph, synthetic_accessibility_graph
-from capplan.data.capability_contracts import default_contract
+from capplan.data.capability_contracts import contract_episode_id, default_contract
 from capplan.data.pudo_interface_layer import synthetic_pudo_anchors, synthetic_vehicle_interface
 from capplan.data.schemas import contract_from_dict, pudo_from_dict, transition_from_dict, vehicle_from_dict, to_dict
 from capplan.planning.planner import CapPlanPlanner, PlannerConfig
@@ -44,7 +44,7 @@ def main() -> None:
         contracts = [contract_from_dict(d) for d in read_jsonl(root / "capability_contracts.jsonl")]
         contract = next((c for c in contracts if c.passenger_id == (args.passenger_id or "")), None)
         if contract is None:
-            contract = next(c for c in contracts if c.passenger_id.split(":p")[0] == args.episode_id)
+            contract = next(c for c in contracts if contract_episode_id(c) == args.episode_id)
         graph = load_accessibility_graph(root, args.episode_id)
         pudo = [pudo_from_dict(d) for d in read_jsonl(root / "pudo_anchors.jsonl") if d.get("episode_id") == args.episode_id]
         vehicles = [vehicle_from_dict(d) for d in read_jsonl(root / "vehicle_interfaces.jsonl") if d.get("episode_id") == args.episode_id]

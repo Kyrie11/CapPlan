@@ -61,6 +61,10 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
         self.vocab = FeatureVocab(**vocab_payload) if isinstance(vocab_payload, dict) and vocab_payload else FeatureVocab()
         weights = self.checkpoint.get("weights", {}) if isinstance(self.checkpoint, dict) else {}
         self.weights = weights if isinstance(weights, dict) else {}
+        cfg = self.checkpoint.get("config", {}) if isinstance(self.checkpoint, dict) else {}
+        self.feature_policy = str(cfg.get("feature_policy", "legacy")) if isinstance(cfg, dict) else "legacy"
+        if self.feature_policy not in {"legacy", "paper_safe"}:
+            self.feature_policy = "legacy"
         self._torch_model = None
         if isinstance(self.checkpoint, dict) and self.checkpoint.get("torch_state_dict") is not None:
             self._init_torch_model()
@@ -102,7 +106,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
         tokens = []
         if isinstance(context, dict):
             tokens = context.get("tokens") or []
-        x = [float(v) for v in encode_transition_with_capability(transition, tokens, self.vocab)]
+        x = [float(v) for v in encode_transition_with_capability(transition, tokens, self.vocab, feature_policy=self.feature_policy)]
         mean = self.weights.get("mean")
         std = self.weights.get("std")
         if isinstance(mean, list) and isinstance(std, list) and len(mean) == len(x) and len(std) == len(x):

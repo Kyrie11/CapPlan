@@ -214,6 +214,11 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     outputs_root = _path(config.get("outputs_root", "{project_root}/data/outputs"))
     assert external_root is not None and outputs_root is not None
     prepared_root = outputs_root / "prepared" / split_name
+    # Keep compact, reviewable diagnostics under external/reports so a user can
+    # package only reports instead of the entire prepared/dataset tree.
+    reports_root = external_root / "reports" / "build" / split_name
+    if not dry_run:
+        reports_root.mkdir(parents=True, exist_ok=True)
     split_cfg = config["splits"][split_name]
     cities = split_cfg.get("cities") or list(config["cities"])
     if cities_override:
@@ -222,7 +227,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
         if unknown:
             raise RuntimeError(f"unknown city override(s): {unknown}")
         cities = wanted
-    max_per_city = int(max_scenarios_override or split_cfg.get("max_scenarios_per_city", 100))
+    max_per_city = int(split_cfg.get("max_scenarios_per_city", 100) if max_scenarios_override is None else max_scenarios_override)
     source_policy = _source_policy(config, source_policy_override)
     num_workers = int(config.get("num_workers", 0))
     seed = int(config.get("seed", 13))
@@ -287,7 +292,9 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
         )
 
     if stages.intersection({"preflight", "graphs", "pudo", "dataset", "all"}):
-        _write_source_preflight_report(config, cities, prepared_root, source_policy, dry_run)
+        preflight_report = _write_source_preflight_report(config, cities, prepared_root, source_policy, dry_run)
+        if not dry_run:
+            dump_json(reports_root / "external_source_preflight.json", preflight_report)
     if stages == {"preflight"}:
         return
 
@@ -357,11 +364,11 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 f"{city}_fused_external_accessibility",
                 "--fail_on_synthetic",
                 "--diagnostic_report_json",
-                str(prepared_root / "reports" / f"graph_spatial_diagnostics.{city}.json"),
+                str(reports_root / f"graph_spatial_diagnostics.{city}.json"),
                 "--source_report_json",
-                str(prepared_root / "reports" / f"graph_source.{city}.json"),
+                str(reports_root / f"graph_source.{city}.json"),
                 "--quality_report_json",
-                str(prepared_root / "reports" / f"graph_quality.{city}.json"),
+                str(reports_root / f"graph_quality.{city}.json"),
             ]
             if disable_tqdm:
                 cmd.append("--disable_tqdm")
@@ -397,7 +404,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--source_name",
                 f"{city}_city_curb_regulation_inventory" if source_policy == "paper" else f"{city}_bootstrap_osm_pudo_candidates",
                 "--report_json",
-                str(prepared_root / "pudo" / f"{city}.report.json"),
+                str(reports_root / f"pudo.{city}.json"),
             ]
             missing_pudo_sources: List[str] = []
             pudo_cmd += ["--georeference_json", str(_path(city_cfg["georeference_json"]))]
@@ -447,7 +454,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--source_name",
                 "abilitybench_calibrated_od" if source_policy == "paper" else "abilitybench_bootstrap_od_not_for_paper",
                 "--report_json",
-                str(prepared_root / "service_layer_report.json"),
+                str(reports_root / "service_layer.json"),
                 "--seed",
                 str(seed),
                 *( ["--allow_non_entrance_od"] if source_policy == "bootstrap" else [] ),
@@ -539,8 +546,19 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                     str(min_paper_eligible),
                     "--min_episode_pudo_coverage_rate",
                     str(min_episode_pudo_coverage),
+                    "--output",
+                    str(reports_root / f"dataset_quality.{city}.json"),
                 ]
                 _run(audit_cmd, dry_run)
+                _run([
+                    sys.executable,
+                    "scripts/diagnose_capplan_outputs.py",
+                    "--dataset_dir", str(city_dataset),
+                    "--accessibility_graph_dir", str(graph_dir),
+                    "--service_requests_jsonl", str(service_requests),
+                    "--pudo_evidence_jsonl", str(combined_pudo),
+                    "--output", str(reports_root / f"dataset_diagnostics.{city}.json"),
+                ], dry_run)
 
     merged_dataset = outputs_root / "datasets" / f"abilitybench_av_{split_name}"
     if "merge" in stages or "all" in stages:
@@ -569,7 +587,7 @@ def main() -> None:
     p.add_argument("--disable_tqdm", action="store_true", help="Disable city/stage and dataset progress bars.")
     p.add_argument("--source_policy", choices=["bootstrap", "paper"], default=None, help="bootstrap builds a real-data diagnostic dataset with fail-closed missing evidence; paper requires complete evidence categories; OSM and OpenSidewalks are alternatives, not both mandatory.")
     p.add_argument("--cities", default=None, help="Optional comma/plus-separated city subset for fast diagnostics, e.g. boston or boston+vegas.")
-    p.add_argument("--max_scenarios_per_city", type=int, default=None, help="Override config split max_scenarios_per_city for quick partial runs.")
+    p.add_argument("--max_scenarios_per_city", type=int, default=None, help="Override config split max_scenarios_per_city. For real nuPlan data, 0 means all matching scenarios.")
     args = p.parse_args()
     stages = {x.strip() for x in args.stages.split(",") if x.strip()}
     config = _load_config(args.config)

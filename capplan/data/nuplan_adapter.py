@@ -241,7 +241,10 @@ class NuPlanAdapter:
             raise RuntimeError(f"failed to initialize NuPlanScenarioBuilder: {e}") from e
 
     def iter_scenarios(self, max_scenarios: int = 4) -> Iterable[NuPlanScenarioRecord]:
+        """Iterate scenarios. For real nuPlan data, ``max_scenarios <= 0`` means all matching scenarios."""
         if self.scene_source == "synthetic":
+            if max_scenarios <= 0:
+                raise ValueError("synthetic scene generation requires max_scenarios > 0")
             yield from self._iter_synthetic(max_scenarios)
             return
         yield from self._iter_real_nuplan(max_scenarios)
@@ -294,6 +297,7 @@ class NuPlanAdapter:
 
     def _iter_real_nuplan(self, max_scenarios: int) -> Iterator[NuPlanScenarioRecord]:  # pragma: no cover - requires nuPlan installation/data
         assert self._builder is not None
+        scenario_limit = None if max_scenarios <= 0 else int(max_scenarios)
         try:
             from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter  # type: ignore
         except Exception as e:
@@ -306,7 +310,7 @@ class NuPlanAdapter:
                 log_names=self.log_names or None,
                 map_names=self.map_names or None,
                 num_scenarios_per_type=None,
-                limit_total_scenarios=max_scenarios,
+                limit_total_scenarios=scenario_limit,
                 timestamp_threshold_s=None,
                 ego_displacement_minimum_m=None,
                 expand_scenarios=False,
@@ -314,7 +318,7 @@ class NuPlanAdapter:
                 shuffle=False,
             )
         except TypeError:
-            scenario_filter = ScenarioFilter(self.scenario_types or None, None, self.log_names or None, self.map_names or None, None, max_scenarios, None, None, False, True, False)
+            scenario_filter = ScenarioFilter(self.scenario_types or None, None, self.log_names or None, self.map_names or None, None, scenario_limit, None, None, False, True, False)
         scenarios = None
         for method in ["get_scenarios", "get_scenario_tokens"]:
             if hasattr(self._builder, method):
@@ -329,7 +333,10 @@ class NuPlanAdapter:
                         continue
         if scenarios is None:
             raise RuntimeError("nuPlan scenario builder did not expose a usable get_scenarios API")
-        for idx, scenario in enumerate(list(scenarios)[:max_scenarios]):
+        scenario_list = list(scenarios)
+        if scenario_limit is not None:
+            scenario_list = scenario_list[:scenario_limit]
+        for idx, scenario in enumerate(scenario_list):
             yield self._extract_real_scenario(scenario, idx)
 
     def _extract_real_scenario(self, scenario: Any, idx: int) -> NuPlanScenarioRecord:  # pragma: no cover - requires nuPlan installation/data

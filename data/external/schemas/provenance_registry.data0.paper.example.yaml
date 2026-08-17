@@ -1,0 +1,163 @@
+schema_version: "1.1"
+# This template is deliberately fail-closed. build_provenance_manifest.py rejects
+# REPLACE/REVIEW/TODO/TBD/VERIFY placeholders. Record the exact portal licence/terms
+# and an offset-aware UTC timestamp after the final source snapshot is frozen.
+cities:
+  boston:
+    sources:
+      - role: osm_topology
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/osm_pbf/massachusetts-latest.osm.pbf"
+        source_url: "https://download.geofabrik.de/north-america/us/massachusetts.html"
+        license: "ODbL-1.0"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: B_community_mapped
+        authoritative: false
+      - role: city_accessibility_pwd
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/arcgis/boston"
+        source_url: "https://gisportal.boston.gov/ArcGIS/rest/services/PWD/Cartegraph_PWD_readonly/MapServer"
+        license: "VERIFY_EXACT_CITY_PORTAL_TERMS"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_authoritative_city_gis
+        authoritative: true
+      - role: dem
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/dem/boston"
+        source_url: "https://apps.nationalmap.gov/downloader/"
+        license: "US-Public-Domain"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_usgs_3dep
+        authoritative: true
+      - role: manual_pudo_audit
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/audits/boston/manual_audit_manifest.jsonl"
+        source_url: "local://abilitybench/manual-audit/boston"
+        license: "research-consent-and-data-management-plan"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_manual_audit
+        authoritative: true
+      - role: verified_fleet_interface
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/fleet/vehicle_interfaces.jsonl"
+        source_url: "local://abilitybench/verified-fleet-interface"
+        license: "research-data-management-plan"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_verified_vehicle_spec
+        authoritative: true
+
+  pittsburgh:
+    sources:
+      - role: osm_topology
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/osm_pbf/pennsylvania-latest.osm.pbf"
+        source_url: "https://download.geofabrik.de/north-america/us/pennsylvania.html"
+        license: "ODbL-1.0"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: B_community_mapped
+        authoritative: false
+      - role: city_sidewalks_steps
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/wprdc/pittsburgh/sidewalks_and_steps.zip"
+        source_url: "https://data.wprdc.org/dataset/sidewalk-to-street-walkability-ratio"
+        license: "VERIFY_EXACT_WPRDC_RESOURCE_LICENSE"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_city_regional_topology
+        authoritative: true
+      - role: parking_payment_point_candidates
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/wprdc/pittsburgh/payment_points_current.csv"
+        source_url: "https://data.wprdc.org/dataset/pittsburgh-parking-meters-and-payment-points"
+        license: "VERIFY_EXACT_WPRDC_RESOURCE_LICENSE"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: B_official_candidate_layer
+        authoritative: true
+      - role: dem
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/dem/pittsburgh"
+        source_url: "https://apps.nationalmap.gov/downloader/"
+        license: "US-Public-Domain"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_usgs_3dep
+        authoritative: true
+      - role: manual_pudo_audit
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/audits/pittsburgh/manual_audit_manifest.jsonl"
+        source_url: "local://abilitybench/manual-audit/pittsburgh"
+        license: "research-consent-and-data-management-plan"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_manual_audit
+        authoritative: true
+      - role: verified_fleet_interface
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/fleet/vehicle_interfaces.jsonl"
+        source_url: "local://abilitybench/verified-fleet-interface"
+        license: "research-data-management-plan"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_verified_vehicle_spec
+        authoritative: true
+
+  vegas:
+    sources:
+      - role: osm_topology
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/osm_pbf/nevada-latest.osm.pbf"
+        source_url: "https://download.geofabrik.de/north-america/us/nevada.html"
+        license: "ODbL-1.0"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: B_community_mapped
+        authoritative: false
+      - role: city_taxi_zone_candidates
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/arcgis/vegas/taxi_zones.geojson"
+        source_url: "https://mapdata.lasvegasnevada.gov/clvgis/rest/services/Transportation/CLV_ParkingServices_ParkingZones/MapServer/4"
+        license: "VERIFY_EXACT_CITY_GIS_TERMS"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: B_official_candidate_layer
+        authoritative: true
+      - role: dem
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/dem/vegas"
+        source_url: "https://apps.nationalmap.gov/downloader/"
+        license: "US-Public-Domain"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_usgs_3dep
+        authoritative: true
+      - role: manual_pudo_audit
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/audits/vegas/manual_audit_manifest.jsonl"
+        source_url: "local://abilitybench/manual-audit/vegas"
+        license: "research-consent-and-data-management-plan"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_manual_audit
+        authoritative: true
+      - role: verified_fleet_interface
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/fleet/vehicle_interfaces.jsonl"
+        source_url: "local://abilitybench/verified-fleet-interface"
+        license: "research-data-management-plan"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_verified_vehicle_spec
+        authoritative: true
+
+  singapore:
+    sources:
+      - role: osm_topology
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/osm_pbf/malaysia-singapore-brunei-latest.osm.pbf"
+        source_url: "https://download.geofabrik.de/asia/malaysia-singapore-brunei.html"
+        license: "ODbL-1.0"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: B_community_mapped
+        authoritative: false
+      - role: lta_static_geospatial
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/lta/singapore"
+        source_url: "https://datamall.lta.gov.sg/content/datamall/en/static-data.html"
+        license: "VERIFY_EXACT_LTA_DATAMALL_TERMS"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_official_transport_gis
+        authoritative: true
+      - role: dem
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/raw/dem/singapore"
+        source_url: "https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM"
+        license: "VERIFY_EXACT_COPERNICUS_DEM_LICENSE_AND_ATTRIBUTION"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_copernicus_dem
+        authoritative: true
+      - role: manual_pudo_audit
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/audits/singapore/manual_audit_manifest.jsonl"
+        source_url: "local://abilitybench/manual-audit/singapore"
+        license: "research-consent-and-data-management-plan"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_manual_audit
+        authoritative: true
+      - role: verified_fleet_interface
+        path: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/fleet/vehicle_interfaces.jsonl"
+        source_url: "local://abilitybench/verified-fleet-interface"
+        license: "research-data-management-plan"
+        retrieved_at: "REPLACE_WITH_UTC_TIMESTAMP"
+        evidence_tier: A_verified_vehicle_spec
+        authoritative: true

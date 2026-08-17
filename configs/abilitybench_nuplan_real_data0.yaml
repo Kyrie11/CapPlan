@@ -1,0 +1,151 @@
+# AbilityBench-AV real-data preparation config.
+# Data-root variant for the paper build.  Code remains under /home/senzeyu2/code/CapPlan,
+# while every large/downloaded/generated data artifact lives under:
+#   /data0/senzeyu2/dataset/CapPlan/data
+
+seed: 13
+num_workers: 0
+
+nuplan:
+  # Official nuPlan layout:
+  # data/nuplan/nuplan-v1.1/splits/{mini,trainval,test,...}/*.db
+  # data/nuplan/maps/nuplan-maps-v1.0.json
+  # data/nuplan/maps/<map-name>/<location-version>/map.gpkg
+  data_root: "/data0/senzeyu2/dataset/CapPlan/data/nuplan"
+  db_root: "/data0/senzeyu2/dataset/CapPlan/data/nuplan/nuplan-v1.1/splits"
+  map_root: "/data0/senzeyu2/dataset/CapPlan/data/nuplan/maps"
+  map_version: nuplan-maps-v1.0
+
+external_root: "/data0/senzeyu2/dataset/CapPlan/data/external"
+outputs_root: "/data0/senzeyu2/dataset/CapPlan/data/outputs"
+# Replace this with measured/verified vehicle interfaces for paper results.
+fleet_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/fleet/vehicle_interfaces.jsonl"
+
+quality:
+  # bootstrap: real nuPlan + pedestrian topology; missing attributes remain
+  # unknown/fail-closed.  Useful for pipeline bring-up, not main results.
+  # paper: keeps uncertain candidates instead of fabricating fields, but requires
+  # a minimum set of evidence-complete PUDO anchors per episode for main-result
+  # evaluation. This matches the paper's uncertainty semantics.
+  source_policy: bootstrap
+  min_graph_nodes: 100
+  min_graph_edges: 150
+  min_paper_eligible_pudos_per_episode: 2
+  min_episode_pudo_coverage_rate: 0.80
+
+service:
+  # Eight same-scene/same-OD contracts: one base plus seven stricter variants
+  # covering the axes used by the paper's T4 counterfactual experiment.
+  capability_profiles: "{project_root}/configs/capability_profiles.counterfactual.yaml"
+  demand_sources_config: "{project_root}/configs/demand.counterfactual.yaml"
+  num_requests_per_episode: 8
+
+pudo:
+  candidate_radius_m: 120
+
+overpass:
+  # Explicit `download` stage only; `all` never triggers online scraping.
+  endpoint: https://overpass-api.de/api/interpreter
+  timeout_s: 180
+  sleep_s: 12
+
+splits:
+  train:
+    cities: [boston, pittsburgh, vegas, singapore]
+    require_all_cities: true
+    db_dirs: [train_boston, train_pittsburgh, train_vegas, train_singapore]
+    max_scenarios_per_city: 1000
+  val:
+    # The official val DB directory may contain logs from multiple maps/cities.
+    # City separation is done by nuPlan ScenarioFilter(map_names=...), not by
+    # copying/moving DB files.
+    cities: [boston, pittsburgh, vegas, singapore]
+    db_dirs: [val]
+    max_scenarios_per_city: 250
+  test:
+    cities: [boston, pittsburgh, vegas, singapore]
+    db_dirs: [test]
+    max_scenarios_per_city: 250
+
+cities:
+  boston:
+    map_names: [us-ma-boston]
+    location_aliases: [us-ma-boston, boston]
+    bbox: [42.30, -71.15, 42.42, -70.98]
+    georeference_json: "/data0/senzeyu2/dataset/CapPlan/data/external/georeference/boston.json"
+    osm_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/osm/boston_sidewalks.geojson"
+    opensidewalks_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/opensidewalks/boston.geojson"
+    city_gis_dir: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/city_gis/boston"
+    city_gis_authoritative: true
+    city_gis_has_pedestrian_topology: true
+    curb_inventory_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_inventory/boston.jsonl"
+    curb_regulation_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_regulations/boston.jsonl"
+    entrance_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/entrances/boston.geojson"
+    elevation_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/dem/boston.jsonl"
+    manual_audit_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/audits/boston/manual_audit_manifest.jsonl"
+    provenance_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/manifests/boston.json"
+
+  pittsburgh:
+    map_names: [us-pa-pittsburgh-hazelwood]
+    location_aliases: [us-pa-pittsburgh-hazelwood, pittsburgh]
+    bbox: [40.38, -80.04, 40.48, -79.88]
+    georeference_json: "/data0/senzeyu2/dataset/CapPlan/data/external/georeference/pittsburgh.json"
+    osm_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/osm/pittsburgh_sidewalks.geojson"
+    opensidewalks_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/opensidewalks/pittsburgh.geojson"
+    city_gis_dir: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/city_gis/pittsburgh"
+    # Fail closed by default. Set true only after the directory contains official WPRDC/City layers or add a manual audit manifest.
+    city_gis_authoritative: false
+    # WPRDC Sidewalks and Steps supplies real pedestrian geometry, but not the
+    # physical width/slope ground truth required for boarding feasibility.
+    city_gis_has_pedestrian_topology: true
+    pudo_candidate_sources:
+      - "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/candidates/pittsburgh/payment_points_current.jsonl"
+    curb_inventory_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_inventory/pittsburgh.jsonl"
+    curb_regulation_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_regulations/pittsburgh.jsonl"
+    entrance_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/entrances/pittsburgh.geojson"
+    elevation_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/dem/pittsburgh.jsonl"
+    manual_audit_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/audits/pittsburgh/manual_audit_manifest.jsonl"
+    provenance_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/manifests/pittsburgh.json"
+
+  vegas:
+    # Expanded south from 36.07 to cover the full nuPlan Las Vegas map before spatial-alignment gating.
+    map_names: [us-nv-las-vegas-strip]
+    location_aliases: [us-nv-las-vegas-strip, las_vegas, las-vegas, vegas]
+    bbox: [36.055, -115.23, 36.20, -115.10]
+    georeference_json: "/data0/senzeyu2/dataset/CapPlan/data/external/georeference/vegas.json"
+    osm_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/osm/vegas_sidewalks.geojson"
+    opensidewalks_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/opensidewalks/vegas.geojson"
+    city_gis_dir: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/city_gis/vegas"
+    # Las Vegas official layers are authoritative for the attributes they actually contain; leave false until curated/mapped.
+    city_gis_authoritative: false
+    city_gis_has_pedestrian_topology: false
+    pudo_candidate_sources:
+      - "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/candidates/vegas/taxi_zones.jsonl"
+    curb_inventory_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_inventory/vegas.jsonl"
+    curb_regulation_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_regulations/vegas.jsonl"
+    entrance_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/entrances/vegas.geojson"
+    elevation_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/dem/vegas.jsonl"
+    manual_audit_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/audits/vegas/manual_audit_manifest.jsonl"
+    provenance_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/manifests/vegas.json"
+
+  singapore:
+    map_names: [sg-one-north]
+    location_aliases: [sg-one-north, singapore]
+    bbox: [1.27, 103.75, 1.33, 103.82]
+    georeference_json: "/data0/senzeyu2/dataset/CapPlan/data/external/georeference/singapore.json"
+    osm_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/osm/singapore_sidewalks.geojson"
+    opensidewalks_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/opensidewalks/singapore.geojson"
+    city_gis_dir: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/city_gis/singapore"
+    # OneMap/LTA layers must be curated and field-mapped before they count as authoritative accessibility evidence.
+    city_gis_authoritative: false
+    # Official LTA Footpath can provide pedestrian topology when downloaded.
+    city_gis_has_pedestrian_topology: true
+    pudo_candidate_sources:
+      - "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/candidates/singapore/passenger_pickup_bay.jsonl"
+      - "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/candidates/singapore/taxi_stand.jsonl"
+    curb_inventory_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_inventory/singapore.jsonl"
+    curb_regulation_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_regulations/singapore.jsonl"
+    entrance_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/entrances/singapore.geojson"
+    elevation_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/dem/singapore.jsonl"
+    manual_audit_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/audits/singapore/manual_audit_manifest.jsonl"
+    provenance_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/manifests/singapore.json"

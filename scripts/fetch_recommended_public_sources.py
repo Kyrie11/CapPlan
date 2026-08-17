@@ -24,6 +24,7 @@ from download_arcgis_layer import download_layer
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BOSTON_BASE = "https://gisportal.boston.gov/arcgis/rest/services/Infrastructure/OpenData/MapServer"
+BOSTON_PWD_BASE = "https://gisportal.boston.gov/ArcGIS/rest/services/PWD/Cartegraph_PWD_readonly/MapServer"
 VEGAS_TAXI = "https://mapdata.lasvegasnevada.gov/clvgis/rest/services/Transportation/CLV_ParkingServices_ParkingZones/MapServer/4"
 PASDA_ALLEGHENY_ADDRESS_POINTS = "https://mapservices.pasda.psu.edu/server/rest/services/pasda/AlleghenyCounty/MapServer/32"
 WPRDC = "https://data.wprdc.org"
@@ -121,6 +122,24 @@ def main() -> None:
                 normalize(rp, np, profile, f"City of Boston Infrastructure OpenData layer {layer_id}")
                 return np
             attempt("boston", label, work, f"Open {BOSTON_BASE}/{layer_id}, use Query with outSR=4326/f=geojson, save to {raw}/{label}.geojson")
+
+        # PWD Cartegraph publishes explicit per-record Width_unit/Slope_unit
+        # fields. Prefer these layers for paper physical accessibility attributes
+        # because normalization can convert units without guessing. They do not
+        # establish autonomous-mobility stopping legality or deployment clearance.
+        pwd_specs = [
+            ("pwd_ada_ramps", 0, "boston_pwd_ada_ramp", "pwd_ada_ramps.jsonl"),
+            ("pwd_sidewalks", 7, "boston_pwd_sidewalk", "pwd_sidewalks.geojson"),
+        ]
+        for label, layer_id, profile, norm_name in pwd_specs:
+            def pwd_work(label=label, layer_id=layer_id, profile=profile, norm_name=norm_name):
+                rp = raw / f"{label}.geojson"
+                if args.force or not rp.exists():
+                    download_layer(f"{BOSTON_PWD_BASE}/{layer_id}", rp, bbox=bbox)
+                np = norm / norm_name
+                normalize(rp, np, profile, f"City of Boston PWD Cartegraph layer {layer_id}")
+                return np
+            attempt("boston", label, pwd_work, f"Open {BOSTON_PWD_BASE}/{layer_id}, Query the Boston AOI with outSR=4326/f=geojson, save to {raw}/{label}.geojson")
 
     if "pittsburgh" in cities:
         raw = external / "raw" / "wprdc" / "pittsburgh"

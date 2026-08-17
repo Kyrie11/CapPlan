@@ -6,16 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from capplan.data.accessibility_layer import load_accessibility_graph
+from capplan.data.capability_contracts import contract_episode_id
 from capplan.data.schemas import contract_from_dict, pudo_from_dict, transition_from_dict, vehicle_from_dict, to_dict
 from capplan.evaluation.metrics import compute_all_metrics
 from capplan.planning.planner import CapPlanPlanner, PlannerConfig
 from capplan.semantics.capability_compiler import CapabilityCompiler
 from capplan.semantics.typed_resource_algebra import all_margins, satisfy_all
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
-
-
-def _contract_episode_id(passenger_id: str) -> str:
-    return passenger_id.split(":p")[0]
 
 
 def _cert_key(c: Dict[str, Any]) -> Tuple[str, str]:
@@ -110,7 +107,7 @@ class ClosedLoopRunner:
         contracts_by_episode: Dict[str, List[Any]] = {}
         for d in read_jsonl(dataset_dir / "capability_contracts.jsonl"):
             c = contract_from_dict(d)
-            contracts_by_episode.setdefault(_contract_episode_id(c.passenger_id), []).append(c)
+            contracts_by_episode.setdefault(contract_episode_id(c), []).append(c)
         transitions_by_episode: Dict[str, List[Any]] = {}
         for d in read_jsonl(dataset_dir / "candidate_transitions.jsonl"):
             t = transition_from_dict(d)

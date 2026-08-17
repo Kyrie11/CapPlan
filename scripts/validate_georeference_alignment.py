@@ -173,9 +173,19 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", default="configs/abilitybench_nuplan_real.yaml")
     p.add_argument("--cities", default="boston,pittsburgh,vegas,singapore")
-    p.add_argument("--min_map_aoi_overlap", type=float, default=0.20)
-    p.add_argument("--min_osm_aoi_overlap", type=float, default=0.20)
-    p.add_argument("--min_osm_map_overlap", type=float, default=0.05)
+    p.add_argument("--min_map_covered_by_aoi", type=float, default=0.95,
+                   help="Minimum fraction of the nuPlan map extent covered by the configured city AOI.")
+    p.add_argument("--min_aoi_covered_by_osm", type=float, default=0.95,
+                   help="Minimum fraction of the configured city AOI covered by the prepared OSM layer extent.")
+    p.add_argument("--min_map_covered_by_osm", type=float, default=0.95,
+                   help="Minimum fraction of the nuPlan map extent covered by the prepared OSM layer extent.")
+    # Deprecated aliases retained so older command files do not crash. The new
+    # containment metrics above are used for gating because AOIs/OSM extracts
+    # are intentionally much larger than a nuPlan map and therefore should not
+    # be expected to be covered by it.
+    p.add_argument("--min_map_aoi_overlap", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--min_osm_aoi_overlap", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--min_osm_map_overlap", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--write_georeference", action="store_true")
     p.add_argument("--report_json", default=None)
     args = p.parse_args()
@@ -208,13 +218,21 @@ def main() -> None:
             osm_wgs = geojson_bounds(osm_path)
             osm_local = transform_bounds(osm_wgs, local_crs)
 
-            map_aoi = fraction_covered(aoi_local, map_local)
-            osm_aoi = fraction_covered(aoi_wgs, osm_wgs)
-            osm_map = fraction_covered(osm_local, map_local)
+            # Containment semantics: the configured AOI and OSM extract are
+            # supersets around the nuPlan operational map.  The previous code
+            # divided the intersection by the much larger AOI/OSM area, which
+            # made correct alignment look like 1--10% overlap and fail.
+            map_by_aoi = fraction_covered(map_local, aoi_local)
+            aoi_by_osm = fraction_covered(aoi_wgs, osm_wgs)
+            map_by_osm = fraction_covered(map_local, osm_local)
+            # Keep reverse-direction diagnostics because they are useful when
+            # comparing report versions, but never gate on them.
+            aoi_by_map = fraction_covered(aoi_local, map_local)
+            osm_by_map = fraction_covered(osm_local, map_local)
             status = "PASS" if (
-                map_aoi >= args.min_map_aoi_overlap and
-                osm_aoi >= args.min_osm_aoi_overlap and
-                osm_map >= args.min_osm_map_overlap
+                map_by_aoi >= args.min_map_covered_by_aoi and
+                aoi_by_osm >= args.min_aoi_covered_by_osm and
+                map_by_osm >= args.min_map_covered_by_osm
             ) else "FAIL"
             if status != "PASS":
                 failures += 1
@@ -229,15 +247,19 @@ def main() -> None:
                 "map_local_bounds": map_local,
                 "osm_wgs84_bounds": osm_wgs,
                 "osm_local_bounds": osm_local,
-                "map_aoi_overlap_fraction": map_aoi,
-                "osm_aoi_overlap_fraction": osm_aoi,
-                "osm_map_overlap_fraction": osm_map,
-                "thresholds": {
-                    "min_map_aoi_overlap": args.min_map_aoi_overlap,
-                    "min_osm_aoi_overlap": args.min_osm_aoi_overlap,
-                    "min_osm_map_overlap": args.min_osm_map_overlap,
+                "map_covered_by_aoi_fraction": map_by_aoi,
+                "aoi_covered_by_osm_fraction": aoi_by_osm,
+                "map_covered_by_osm_fraction": map_by_osm,
+                "diagnostic_reverse_fractions": {
+                    "aoi_covered_by_map_fraction": aoi_by_map,
+                    "osm_covered_by_map_fraction": osm_by_map,
                 },
-                "validation_scope": "gross_map_aoi_and_external_osm_overlap",
+                "thresholds": {
+                    "min_map_covered_by_aoi": args.min_map_covered_by_aoi,
+                    "min_aoi_covered_by_osm": args.min_aoi_covered_by_osm,
+                    "min_map_covered_by_osm": args.min_map_covered_by_osm,
+                },
+                "validation_scope": "nuplan_map_containment_in_configured_aoi_and_external_osm",
                 "note": "Per-episode accessibility graph construction is the stronger scene-level alignment check.",
             }
             if status == "PASS" and args.write_georeference:

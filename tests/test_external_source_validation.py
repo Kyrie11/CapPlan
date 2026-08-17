@@ -44,7 +44,7 @@ def test_bootstrap_and_paper_preflight_are_separate(tmp_path: Path) -> None:
         "features": [{"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[-71.1, 42.3], [-71.0, 42.4]]}, "properties": {"highway": "footway"}}],
     })
     georef = ext / "georeference" / "boston.json"
-    _write_json(georef, {"wgs84_crs": "EPSG:4326", "local_crs": "EPSG:26919", "validated": True})
+    _write_json(georef, {"wgs84_crs": "EPSG:4326", "local_crs": "EPSG:26919", "validated": True, "spatial_alignment_validated": True})
     config = {"external_root": str(ext), "cities": {"boston": {}}}
 
     bootstrap = validate_external_config(config, ["boston"], policy="bootstrap", project_root=tmp_path)

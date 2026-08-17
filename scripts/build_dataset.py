@@ -556,7 +556,7 @@ def main() -> None:
     # Backward-compatible alias; mapped to nuplan_data_root only when provided.
     p.add_argument("--nuplan_root", default=None)
     p.add_argument("--split", default="mini")
-    p.add_argument("--max_scenarios", type=int, default=4)
+    p.add_argument("--max_scenarios", type=int, default=4, help="Maximum matching scenarios; for real nuPlan data, 0 means all.")
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
     p.add_argument("--paper_mode", action="store_true", help="Enable publication-grade data gates: no synthetic/proxy fallbacks, no missing core evidence, and real service/profile/fleet inputs required.")
     p.add_argument("--source_policy", choices=["bootstrap", "paper"], default="bootstrap", help="Dataset evidence policy recorded in the manifest. paper requires --paper_mode and complete audited evidence.")
@@ -641,7 +641,7 @@ def main() -> None:
 
     scenario_iter = adapter.iter_scenarios(args.max_scenarios)
     if not args.disable_tqdm:
-        scenario_iter = tqdm(scenario_iter, total=args.max_scenarios, desc=f"build {args.scene_source} dataset", unit="scenario")
+        scenario_iter = tqdm(scenario_iter, total=(None if args.max_scenarios <= 0 else args.max_scenarios), desc=f"build {args.scene_source} dataset", unit="scenario")
 
     for record in scenario_iter:
         scene = record.scene

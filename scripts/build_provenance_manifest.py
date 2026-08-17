@@ -14,6 +14,26 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+PLACEHOLDER_MARKERS = ("REPLACE", "REVIEW", "TODO", "TBD", "CHANGEME", "PLACEHOLDER", "VERIFY")
+
+
+def _is_placeholder(value: str) -> bool:
+    upper = str(value or "").strip().upper()
+    return (not upper) or any(marker in upper for marker in PLACEHOLDER_MARKERS)
+
+
+def _valid_retrieved_at(value: str) -> bool:
+    text = str(value or "").strip()
+    if _is_placeholder(text):
+        return False
+    try:
+        # Accept RFC3339/ISO-8601 timestamps; normalize the common Z suffix.
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
 def resolve(value: str) -> Path:
     text = str(value).format(project_root=str(PROJECT_ROOT))
     p = Path(text).expanduser()
@@ -56,10 +76,19 @@ def main() -> None:
         path = resolve(str(source.get("path") or ""))
         url = str(source.get("source_url") or "").strip()
         license_name = str(source.get("license") or "").strip()
+        retrieved_at = str(source.get("retrieved_at") or "").strip()
         if not url:
             blockers.append(f"{role}:missing_source_url")
+        elif _is_placeholder(url):
+            blockers.append(f"{role}:placeholder_source_url")
         if not license_name:
             blockers.append(f"{role}:missing_license")
+        elif _is_placeholder(license_name):
+            blockers.append(f"{role}:placeholder_license")
+        if not retrieved_at:
+            blockers.append(f"{role}:missing_retrieved_at")
+        elif not _valid_retrieved_at(retrieved_at):
+            blockers.append(f"{role}:invalid_or_placeholder_retrieved_at")
         files = expand_files(path)
         if not files:
             blockers.append(f"{role}:missing_or_empty_path:{path}")

@@ -47,6 +47,7 @@ def main() -> None:
     p.add_argument("--city", required=True, choices=["boston", "pittsburgh", "vegas", "singapore"])
     p.add_argument("--external_root", required=True, help=".../CapPlan/data/external")
     p.add_argument("--allow_anonymous_auditor", action="store_true")
+    p.add_argument("--report_json", default=None, help="Optional JSON report path under external/reports.")
     args = p.parse_args()
     root = Path(args.external_root)
     with Path(args.input_csv).open("r", encoding="utf-8-sig", newline="") as f:
@@ -131,7 +132,22 @@ def main() -> None:
         pth.parent.mkdir(parents=True, exist_ok=True)
         pth.write_text(json.dumps({"type": "FeatureCollection", "features": entrances, "properties": {"source": "manual_audit", "authoritative": True}}, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_jsonl(root / "audits" / args.city / "manual_audit_manifest.jsonl", manifest)
-    print(json.dumps({"city": args.city, "observations": len(manifest), "entrances": len(entrances), "external_root": str(root)}, indent=2))
+    report = {
+        "status": "PASS",
+        "city": args.city,
+        "observations": len(manifest),
+        "entrances": len(entrances),
+        "external_root": str(root),
+        "curb_inventory": str(root / "normalized" / "curb_inventory" / f"{args.city}.jsonl"),
+        "curb_regulations": str(root / "normalized" / "curb_regulations" / f"{args.city}.jsonl"),
+        "entrance_layer": str(root / "normalized" / "entrances" / f"{args.city}.geojson") if entrances else None,
+        "manual_audit_manifest": str(root / "audits" / args.city / "manual_audit_manifest.jsonl"),
+    }
+    if args.report_json:
+        rp = Path(args.report_json)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps(report, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

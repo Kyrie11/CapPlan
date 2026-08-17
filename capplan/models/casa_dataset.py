@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+from capplan.data.capability_contracts import contract_episode_id
 from capplan.data.schemas import contract_from_dict, transition_from_dict
 from capplan.models.casa_features import FeatureVocab, encode_transition_with_capability
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY
@@ -37,10 +38,25 @@ class CASADataset:
     paper idea: CASA should learn capability-conditioned service feasibility.
     """
 
-    def __init__(self, dataset_dir: str | Path, split: str = "train", vocab: FeatureVocab | None = None) -> None:
+    def __init__(
+        self,
+        dataset_dir: str | Path,
+        split: str = "train",
+        vocab: FeatureVocab | None = None,
+        *,
+        value_target: str = "skeleton",
+        feature_policy: str = "legacy",
+    ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.vocab = vocab or FeatureVocab()
         self.compiler = CapabilityCompiler()
+        self.value_target = value_target
+        self.feature_policy = feature_policy
+        if value_target not in {"skeleton", "offline_tsbs", "rollout", "legacy"}:
+            raise ValueError(f"unknown CASA completion-value target: {value_target}")
+        if feature_policy not in {"legacy", "paper_safe"}:
+            raise ValueError(f"unknown CASA feature policy: {feature_policy}")
+        self.split_file = self.dataset_dir / "splits" / f"{split}_episodes.txt"
         split_ids = self._read_split(split)
         transition_labels = {d["transition_id"]: d for d in read_jsonl(self.dataset_dir / "transition_labels.jsonl")}
         passenger_path = self.dataset_dir / "passenger_edge_labels.jsonl"
@@ -50,7 +66,7 @@ class CASADataset:
         if contracts_path.exists():
             for d in read_jsonl(contracts_path):
                 c = contract_from_dict(d)
-                eid = c.passenger_id.split(":p")[0] if ":p" in c.passenger_id else c.metadata.get("episode_id", "")
+                eid = contract_episode_id(c)
                 if split_ids and eid not in split_ids:
                     continue
                 contracts_by_episode.setdefault(eid, []).append(c)
@@ -59,6 +75,7 @@ class CASADataset:
         if skeleton_path.exists():
             for row in read_jsonl(skeleton_path):
                 skeleton_edges[(row.get("episode_id"), row.get("passenger_id"))] = set(row.get("transitions") or [])
+        explicit_value_targets = self._read_explicit_value_targets(value_target)
         self.samples: List[CASASample] = []
         for d in read_jsonl(self.dataset_dir / "candidate_transitions.jsonl"):
             t = transition_from_dict(d)
@@ -69,10 +86,18 @@ class CASADataset:
                 # Backward-compatible fallback for legacy transition-only data.
                 lab = transition_labels.get(t.transition_id, {})
                 y_edge = 1.0 if lab.get("z_e", t.tests.z_e) else 0.0
-                y_value = max(0.0, min(1.0, t.completion_value))
+                if value_target == "legacy":
+                    y_value = max(0.0, min(1.0, t.completion_value))
+                elif value_target == "skeleton":
+                    y_value = 0.0
+                else:
+                    key = (t.transition_id, "__transition_only__")
+                    if key not in explicit_value_targets:
+                        raise RuntimeError(f"missing {value_target} completion-value label for transition-only sample {key}")
+                    y_value = explicit_value_targets[key]
                 y_phase = self.vocab.phases.index(t.to_phase) if t.to_phase in self.vocab.phases else 0
                 yd, ym = self._demand_target(t)
-                self.samples.append(CASASample(t.transition_id, t.episode_id, "__transition_only__", encode_transition_with_capability(t, [], self.vocab), y_edge, y_value, y_phase, yd, ym, max(0.0, min(1.0, float(t.availability)))))
+                self.samples.append(CASASample(t.transition_id, t.episode_id, "__transition_only__", encode_transition_with_capability(t, [], self.vocab, feature_policy=self.feature_policy), y_edge, y_value, y_phase, yd, ym, max(0.0, min(1.0, float(t.availability)))))
                 continue
             for contract in contracts:
                 compiled = self.compiler.compile(contract, trip_context=contract.metadata.get("trip_modifiers", {}))
@@ -83,21 +108,56 @@ class CASADataset:
                     lab = transition_labels.get(t.transition_id, {})
                     y_edge = 1.0 if lab.get("z_e", t.tests.z_e) else 0.0
                 in_skeleton = t.transition_id in skeleton_edges.get((t.episode_id, contract.passenger_id), set())
-                if in_skeleton:
-                    y_value = 1.0
-                elif y_edge > 0.5:
-                    y_value = max(0.05, min(0.95, float(t.completion_value)))
+                if value_target == "skeleton":
+                    # Paper Eq. L_value explicitly allows expert/audited skeleton
+                    # supervision.  Use a pure binary target; do not blend in the
+                    # transition's hand-authored completion_value prior.
+                    y_value = 1.0 if in_skeleton else 0.0
+                elif value_target == "legacy":
+                    if in_skeleton:
+                        y_value = 1.0
+                    elif y_edge > 0.5:
+                        y_value = max(0.05, min(0.95, float(t.completion_value)))
+                    else:
+                        y_value = 0.0
                 else:
-                    y_value = 0.0
+                    key = (t.transition_id, contract.passenger_id)
+                    if key not in explicit_value_targets:
+                        raise RuntimeError(f"missing {value_target} completion-value label for {key}")
+                    y_value = explicit_value_targets[key]
                 y_phase = self.vocab.phases.index(t.to_phase) if t.to_phase in self.vocab.phases else 0
                 yd, ym = self._demand_target(t)
-                self.samples.append(CASASample(t.transition_id, t.episode_id, contract.passenger_id, encode_transition_with_capability(t, compiled.tokens, self.vocab), y_edge, y_value, y_phase, yd, ym, max(0.0, min(1.0, float(t.availability)))))
+                self.samples.append(CASASample(t.transition_id, t.episode_id, contract.passenger_id, encode_transition_with_capability(t, compiled.tokens, self.vocab, feature_policy=self.feature_policy), y_edge, y_value, y_phase, yd, ym, max(0.0, min(1.0, float(t.availability)))))
 
     def _read_split(self, split: str) -> set[str]:
         p = self.dataset_dir / "splits" / f"{split}_episodes.txt"
         if not p.exists():
             return set()
         return {line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+    def _read_explicit_value_targets(self, value_target: str) -> Dict[Tuple[str, str], float]:
+        if value_target not in {"offline_tsbs", "rollout"}:
+            return {}
+        path = self.dataset_dir / f"completion_value_labels.{value_target}.jsonl"
+        if not path.exists():
+            raise RuntimeError(
+                f"--value_target {value_target} requires explicit labels at {path}; "
+                "the previous implementation only checked the CLI flag and silently reused skeleton/heuristic priors"
+            )
+        out: Dict[Tuple[str, str], float] = {}
+        for row in read_jsonl(path):
+            tid = str(row.get("transition_id") or "")
+            pid = str(row.get("passenger_id") or "")
+            if not tid or not pid:
+                raise RuntimeError(f"invalid completion-value label row in {path}: transition_id and passenger_id are required")
+            raw = row.get("target", row.get("completion_value_target"))
+            if raw is None:
+                raise RuntimeError(f"invalid completion-value label row in {path}: target is required")
+            value = float(raw)
+            if not 0.0 <= value <= 1.0:
+                raise RuntimeError(f"invalid completion-value target {value} for {(tid, pid)}; expected [0,1]")
+            out[(tid, pid)] = value
+        return out
 
 
     def _demand_target(self, t) -> Tuple[List[float], List[float]]:

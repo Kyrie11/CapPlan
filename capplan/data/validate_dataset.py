@@ -1,6 +1,8 @@
 """Dataset validation for canonical CapPlan/AbilityBench-AV layout."""
 from __future__ import annotations
 
+from capplan.data.capability_contracts import contract_episode_id
+
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -97,7 +99,7 @@ def validate_dataset(dataset_dir: str | Path, strict: bool = False) -> Dict[str,
         try:
             c = contract_from_dict(d)
             contracts.append(c)
-            eid = c.passenger_id.split(":p")[0]
+            eid = contract_episode_id(c)
             if eid not in episode_ids:
                 errors.append(f"contract {c.passenger_id} references unknown episode {eid}")
         except Exception as e:
@@ -126,8 +128,9 @@ def validate_dataset(dataset_dir: str | Path, strict: bool = False) -> Dict[str,
     if missing_labels:
         errors.append(f"candidate transitions without transition labels: {len(missing_labels)}")
     passenger_ids = {c.passenger_id for c in contracts}
+    contract_episode_by_passenger = {c.passenger_id: contract_episode_id(c) for c in contracts}
     pel_pairs = {(l.get("transition_id"), l.get("passenger_id")) for l in passenger_edge_labels}
-    expected_edge_labels = {(t.transition_id, c.passenger_id) for t in transitions for c in contracts if c.passenger_id.split(":p")[0] == t.episode_id}
+    expected_edge_labels = {(t.transition_id, c.passenger_id) for t in transitions for c in contracts if contract_episode_id(c) == t.episode_id}
     missing_pel = expected_edge_labels - pel_pairs
     if missing_pel:
         errors.append(f"missing passenger edge labels: {len(missing_pel)}")
@@ -150,8 +153,17 @@ def validate_dataset(dataset_dir: str | Path, strict: bool = False) -> Dict[str,
             errors.append(f"counterfactual pair references unknown episode {pair.get('episode_id')}")
         if pair.get("weak_passenger_id") not in passenger_ids or pair.get("strict_passenger_id") not in passenger_ids:
             errors.append(f"counterfactual pair references unknown passengers {pair}")
-        if pair.get("weak_passenger_id", "").split(":p")[0] != pair.get("strict_passenger_id", "").split(":p")[0]:
+        weak_pid = str(pair.get("weak_passenger_id") or "")
+        strict_pid = str(pair.get("strict_passenger_id") or "")
+        weak_eid = contract_episode_by_passenger.get(weak_pid)
+        strict_eid = contract_episode_by_passenger.get(strict_pid)
+        if weak_eid is not None and strict_eid is not None and weak_eid != strict_eid:
             errors.append(f"counterfactual pair crosses episodes {pair}")
+        pair_eid = str(pair.get("episode_id") or "")
+        if weak_eid is not None and pair_eid and weak_eid != pair_eid:
+            errors.append(f"counterfactual pair weak contract episode mismatch {pair}")
+        if strict_eid is not None and pair_eid and strict_eid != pair_eid:
+            errors.append(f"counterfactual pair strict contract episode mismatch {pair}")
         # New paper pairs carry explicit profile/group metadata.  When present,
         # verify that the two service requests really share O/D/time.
         wp = str(pair.get("weak_profile_id") or "")

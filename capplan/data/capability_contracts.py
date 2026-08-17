@@ -163,6 +163,30 @@ def profile_to_contract(profile: Dict[str, Any]) -> CapabilityContract:
     return CapabilityContract(pid, clauses, metadata={"profile": profile.get("archetype"), "consent_scope": profile.get("consent_scope", "trip_planning"), "capability_version": profile.get("capability_version", "v1"), "trip_modifiers": profile.get("trip_modifiers", {})}, groups=groups, profile=profile)
 
 
+def contract_episode_id(contract_or_passenger: CapabilityContract | str, metadata: Dict[str, Any] | None = None) -> str:
+    """Return the episode bound to a capability contract.
+
+    New AbilityBench counterfactual contracts use ``<episode>:<profile_id>``
+    passenger IDs and store the authoritative binding in ``metadata.episode_id``.
+    Older datasets used ``<episode>:p0``.  Always prefer explicit metadata, then
+    fall back conservatively for legacy artifacts.
+    """
+    if isinstance(contract_or_passenger, CapabilityContract):
+        passenger_id = str(contract_or_passenger.passenger_id)
+        meta = dict(contract_or_passenger.metadata or {})
+    else:
+        passenger_id = str(contract_or_passenger)
+        meta = dict(metadata or {})
+    explicit = meta.get("episode_id")
+    if explicit not in (None, ""):
+        return str(explicit)
+    if ":p" in passenger_id:
+        return passenger_id.split(":p", 1)[0]
+    if ":" in passenger_id:
+        return passenger_id.rsplit(":", 1)[0]
+    return passenger_id
+
+
 def default_contract(passenger_id: str = "p0") -> CapabilityContract:
     return profile_to_contract(make_profile(passenger_id, "manual_wheelchair", seed=0))
 
@@ -339,6 +363,6 @@ def load_contracts_from_profiles(path: str | Path, service_requests_by_episode: 
         return out
     for row in rows:
         c = _contract_from_profile_record(row)
-        eid = str(row.get("episode_id") or c.metadata.get("episode_id") or c.passenger_id.split(":p")[0])
+        eid = str(row.get("episode_id") or c.metadata.get("episode_id") or contract_episode_id(c))
         out.setdefault(eid, []).append(c)
     return out

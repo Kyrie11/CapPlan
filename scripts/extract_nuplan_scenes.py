@@ -53,7 +53,7 @@ def main() -> None:
     p.add_argument('--nuplan_log_names', default=None)
     p.add_argument('--nuplan_root', default=None)
     p.add_argument('--split', default='train')
-    p.add_argument('--max_scenarios', type=int, default=50)
+    p.add_argument('--max_scenarios', type=int, default=50, help='Maximum matching scenarios; for real nuPlan data, 0 means all.')
     p.add_argument('--num_workers', type=int, default=0)
     p.add_argument('--seed', type=int, default=13)
     p.add_argument('--output_dir', required=True)

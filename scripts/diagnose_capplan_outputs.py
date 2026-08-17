@@ -205,7 +205,12 @@ def diagnose_dataset(dataset_dir: str | _Path, eval_dir: str | _Path | None = No
     contract_counts_by_episode: Counter[str] = Counter()
     for c in contracts:
         pid = str(c.get('passenger_id', ''))
-        eid = pid.split(':p')[0] if ':p' in pid else str(c.get('episode_id', 'unknown'))
+        meta = c.get('metadata') if isinstance(c.get('metadata'), dict) else {}
+        eid = str(meta.get('episode_id') or c.get('episode_id') or '')
+        if not eid:
+            # Legacy contract IDs used ``episode:pN``; current T4 IDs use
+            # ``episode:profile_id``.  rsplit preserves both without assuming :p.
+            eid = pid.split(':p', 1)[0] if ':p' in pid else (pid.rsplit(':', 1)[0] if ':' in pid else 'unknown')
         contract_counts_by_episode[eid] += 1
 
     service_profile_counts = Counter(str(r.get('passenger_profile_id')) for r in (service_request_records if 'service_request_records' in locals() else []))
@@ -242,8 +247,8 @@ def diagnose_dataset(dataset_dir: str | _Path, eval_dir: str | _Path | None = No
             warnings.append('episode_has_fewer_than_two_real_entrances')
         if any((v.get('node_kinds', {}).get('curb', 0) + v.get('node_kinds', {}).get('curb_ramp', 0)) == 0 for v in graph_topologies.values()):
             warnings.append('episode_has_no_curb_or_curb_ramp_nodes')
-    if service_profile_counts and len(service_profile_counts) < 3:
-        warnings.append('service_requests_do_not_cover_all_three_passenger_layers')
+    if service_profile_counts and len(service_profile_counts) < 8:
+        warnings.append('service_requests_do_not_cover_eight_t4_counterfactual_profiles')
     if pudos and _rate(pudo_legal, len(pudos) + len(external_pudo_evidence)) < 0.05:
         warnings.append('very_low_legal_pudo_rate_check_curb_regulation_alignment')
 

@@ -25,7 +25,7 @@ class FeatureVocab:
         return self.__dict__
 
 
-def encode_transition(t: CandidateTransition, vocab: FeatureVocab | None = None) -> List[float]:
+def encode_transition(t: CandidateTransition, vocab: FeatureVocab | None = None, feature_policy: str = "legacy") -> List[float]:
     vocab = vocab or FeatureVocab()
     action_id = vocab.actions.index(t.action) if t.action in vocab.actions else -1
     from_id = vocab.phases.index(t.from_phase) if t.from_phase in vocab.phases else -1
@@ -44,18 +44,27 @@ def encode_transition(t: CandidateTransition, vocab: FeatureVocab | None = None)
                 numeric_vals.append(float(ev.value))
         except Exception:
             pass
+    if feature_policy not in {"legacy", "paper_safe"}:
+        raise ValueError(f"unknown CASA feature policy: {feature_policy}")
+    # ``legacy`` retains the original smoke/CI feature vector.  It contains
+    # several values that are also direct training targets (z_e, availability,
+    # completion_value, transition demand aggregates), so it must not be used
+    # for publication claims.  ``paper_safe`` keeps the dimensionality stable
+    # but masks those oracle/label-derived slots.  This prevents exact target
+    # leakage while a richer graph/scene encoder is developed.
+    paper_safe = feature_policy == "paper_safe"
     return [
         float(action_id),
         float(from_id),
-        float(to_id),
-        float(t.availability),
-        float(t.map_confidence),
-        float(t.cost),
-        float(t.completion_value),
-        sum(numeric_vals) / len(numeric_vals) if numeric_vals else 0.0,
+        -1.0 if paper_safe else float(to_id),
+        0.0 if paper_safe else float(t.availability),
+        0.0 if paper_safe else float(t.map_confidence),
+        0.0 if paper_safe else float(t.cost),
+        0.0 if paper_safe else float(t.completion_value),
+        0.0 if paper_safe else (sum(numeric_vals) / len(numeric_vals) if numeric_vals else 0.0),
         sum(confidences) / len(confidences) if confidences else 0.0,
         missing,
-        1.0 if t.tests.z_e else 0.0,
+        0.0 if paper_safe else (1.0 if t.tests.z_e else 0.0),
     ]
 
 
@@ -93,6 +102,11 @@ def encode_capability_tokens(tokens: Sequence[Dict[str, Any]] | None, vocab: Fea
     ]
 
 
-def encode_transition_with_capability(t: CandidateTransition, tokens: Sequence[Dict[str, Any]] | None = None, vocab: FeatureVocab | None = None) -> List[float]:
+def encode_transition_with_capability(
+    t: CandidateTransition,
+    tokens: Sequence[Dict[str, Any]] | None = None,
+    vocab: FeatureVocab | None = None,
+    feature_policy: str = "legacy",
+) -> List[float]:
     vocab = vocab or FeatureVocab()
-    return encode_transition(t, vocab) + encode_capability_tokens(tokens, vocab)
+    return encode_transition(t, vocab, feature_policy=feature_policy) + encode_capability_tokens(tokens, vocab)

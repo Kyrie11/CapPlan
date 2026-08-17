@@ -29,6 +29,36 @@ def _softmax(z):
     return e / np.maximum(np.sum(e, axis=1, keepdims=True), 1e-9)
 
 
+
+
+def _balanced_sampling_probabilities(samples, *, profile_balanced: bool, action_balanced: bool):
+    """Return inverse-frequency sampling probabilities for enabled strata.
+
+    Profile is derived from the passenger binding suffix and action from the first
+    stable feature slot (the action vocabulary index).  Enabling both samplers
+    multiplies the two inverse-frequency weights before normalization.
+    """
+    if not samples or not (profile_balanced or action_balanced):
+        return None, {"enabled": False}
+    from collections import Counter
+    profile_keys = [str(s.passenger_id).rsplit(":", 1)[-1] for s in samples]
+    action_keys = [int(round(float(s.x[0]))) if s.x else -1 for s in samples]
+    pc = Counter(profile_keys); ac = Counter(action_keys)
+    weights = np.ones(len(samples), dtype=np.float64)
+    if profile_balanced:
+        weights *= np.array([1.0 / max(pc[k], 1) for k in profile_keys], dtype=np.float64)
+    if action_balanced:
+        weights *= np.array([1.0 / max(ac[k], 1) for k in action_keys], dtype=np.float64)
+    probs = weights / np.maximum(weights.sum(), 1e-12)
+    return probs.astype(np.float64), {
+        "enabled": True,
+        "profile_balanced": bool(profile_balanced),
+        "action_balanced": bool(action_balanced),
+        "num_profile_strata": len(pc),
+        "num_action_strata": len(ac),
+        "max_to_min_probability_ratio": float(probs.max() / max(probs.min(), 1e-12)),
+    }
+
 def _device_auto(device: str) -> str:
     if device != "auto":
         return device
@@ -77,7 +107,7 @@ def _metrics_from_predictions(edge_prob, y_edge, value_prob, y_value, phase_prob
     }
 
 
-def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device):
+def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device, sample_probs=None):
     input_dim = x.shape[1]
     mean = x.mean(axis=0)
     std = x.std(axis=0) + 1e-6
@@ -92,7 +122,10 @@ def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_ava
     W_availability = np.zeros(input_dim, dtype=np.float32); b_availability = np.float32(0.0)
     metrics_rows = []
     for epoch in range(1, args.epochs + 1):
-        idx = np.arange(len(xn)); np.random.shuffle(idx)
+        if sample_probs is None:
+            idx = np.arange(len(xn)); np.random.shuffle(idx)
+        else:
+            idx = np.random.choice(len(xn), size=len(xn), replace=True, p=sample_probs)
         for start in range(0, len(idx), max(1, args.batch_size)):
             batch = idx[start:start + max(1, args.batch_size)]
             xb = xn[batch]
@@ -137,7 +170,7 @@ def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_ava
     return metrics_rows, val_metrics, checkpoint
 
 
-def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device):
+def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device, sample_probs=None):
     import torch
     import torch.nn.functional as F
     from capplan.models.casa_torch import CASAHetGraphNet
@@ -156,7 +189,11 @@ def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_ava
     metrics_rows = []
     pos_weight = torch.tensor(float(edge_pos_weight), dtype=torch.float32, device=device)
     for epoch in range(1, args.epochs + 1):
-        idx = torch.randperm(X.shape[0], device=device)
+        if sample_probs is None:
+            idx = torch.randperm(X.shape[0], device=device)
+        else:
+            sampling_probs = torch.tensor(sample_probs, dtype=torch.float32, device=device)
+            idx = torch.multinomial(sampling_probs, X.shape[0], replacement=True)
         for start in range(0, len(idx), max(1, args.batch_size)):
             b = idx[start:start + max(1, args.batch_size)]
             outp = model(X[b])
@@ -230,28 +267,44 @@ def main() -> None:
         ]
         if missing_flags:
             raise RuntimeError("paper_mode CASA training requires explicit heads: " + ", ".join(missing_flags))
-        if args.value_target != "offline_tsbs":
-            raise RuntimeError("paper_mode CASA training requires --value_target offline_tsbs")
+        # The paper permits completion-value supervision from expert/audited
+        # skeletons, offline TSBS, or closed-loop rollouts.  The selected target
+        # must actually be materialized by CASADataset; offline/rollout modes now
+        # fail closed if their explicit label files are absent.
     random.seed(args.seed); np.random.seed(args.seed)
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     vocab = FeatureVocab()
-    train = CASADataset(args.dataset_dir, "train", vocab)
-    val = CASADataset(args.dataset_dir, "val", vocab)
+    feature_policy = "paper_safe" if args.paper_mode else "legacy"
+    # Persist the resolved policy in checkpoints so inference uses the exact
+    # same masking semantics as training.
+    args.feature_policy = feature_policy
+    train = CASADataset(args.dataset_dir, "train", vocab, value_target=args.value_target, feature_policy=feature_policy)
+    val = CASADataset(args.dataset_dir, "val", vocab, value_target=args.value_target, feature_policy=feature_policy)
     if not train.samples:
         raise RuntimeError(f"no CASA training samples found in {args.dataset_dir}")
+    if args.paper_mode and not train.split_file.exists():
+        raise RuntimeError(f"paper_mode requires an explicit train split file: {train.split_file}")
+    if args.paper_mode and (not val.split_file.exists() or not val.samples):
+        raise RuntimeError(
+            "paper_mode requires a non-empty, disjoint validation split in the same canonical dataset directory; "
+            "merge abilitybench_av_train + abilitybench_av_val (+ test) before training instead of silently validating on train"
+        )
     x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability = train.arrays_with_availability()
     xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability = val.arrays_with_availability() if val.samples else train.arrays_with_availability()
     device = _device_auto(args.device)
     pos = float(np.sum(y_edge >= 0.5)); neg = float(len(y_edge) - pos)
     edge_pos_weight = (neg / max(pos, 1.0)) if str(args.edge_pos_weight).lower() == "auto" else max(0.0, float(args.edge_pos_weight))
+    sample_probs, sampler_report = _balanced_sampling_probabilities(
+        train.samples, profile_balanced=args.profile_balanced_sampler, action_balanced=args.action_balanced_sampler
+    )
     if args.model_type == "linear_smoke":
-        metrics_rows, val_metrics, checkpoint = _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device)
+        metrics_rows, val_metrics, checkpoint = _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device, sample_probs=sample_probs)
     else:
-        metrics_rows, val_metrics, checkpoint = _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device)
+        metrics_rows, val_metrics, checkpoint = _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, edge_pos_weight, vocab, out, device, sample_probs=sample_probs)
     if args.paper_mode and (val_metrics.get("L_phase", 0.0) <= 0.0 or val_metrics.get("L_demand", 0.0) <= 0.0):
         raise RuntimeError(f"paper_mode requires non-zero L_phase and L_demand; got L_phase={val_metrics.get('L_phase')} L_demand={val_metrics.get('L_demand')}")
     dump_json(out / "vocab.json", vocab.to_dict())
-    dump_json(out / "config.json", {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight), "mode": args.casa_mode, "device_resolved": device, "input_dim": int(x.shape[1]), "num_train_samples": len(train.samples), "edge_train_positive_rate": float(np.mean(y_edge >= 0.5)), "model_type": checkpoint.get("model_type")})
+    dump_json(out / "config.json", {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight), "mode": args.casa_mode, "device_resolved": device, "input_dim": int(x.shape[1]), "feature_policy": feature_policy, "num_train_samples": len(train.samples), "edge_train_positive_rate": float(np.mean(y_edge >= 0.5)), "model_type": checkpoint.get("model_type"), "sampler_report": sampler_report})
     write_jsonl(out / "train_metrics.jsonl", metrics_rows)
     dump_json(out / "val_metrics.json", val_metrics)
     if args.save_calibration_report:

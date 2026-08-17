@@ -165,6 +165,40 @@ def slope_to_ratio(value: Any, unit: str) -> Optional[float]:
     return None
 
 
+def _source_length_unit(value: Any) -> str:
+    """Map an explicit source unit string to our normalized unit vocabulary.
+
+    Unknown labels stay unknown; this helper never guesses from magnitude.
+    """
+    key = _canon_key(value) if value not in (None, "") else ""
+    if key in {"m", "meter", "meters", "metre", "metres"}:
+        return "m"
+    if key in {"ft", "foot", "feet"}:
+        return "feet"
+    if key in {"in", "inch", "inches"}:
+        return "inches"
+    return "unknown"
+
+
+def _source_slope_unit(value: Any) -> str:
+    key = _canon_key(value) if value not in (None, "") else ""
+    if key in {"ratio", "rise_run", "rise_over_run", "decimal"}:
+        return "ratio"
+    if key in {"percent", "percentage", "pct"}:
+        return "percent"
+    if key in {"degree", "degrees", "deg"}:
+        return "degrees"
+    return "unknown"
+
+
+def source_length_to_m(value: Any, unit_value: Any) -> Optional[float]:
+    return length_to_m(value, _source_length_unit(unit_value))
+
+
+def source_slope_to_ratio(value: Any, unit_value: Any) -> Optional[float]:
+    return slope_to_ratio(value, _source_slope_unit(unit_value))
+
+
 def _geometry_from_text(value: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -256,6 +290,74 @@ def standard_feature(row: Dict[str, Any], updates: Dict[str, Any], *, source: st
 
 def normalize(profile: str, row: Dict[str, Any], index: int, source: str, args: argparse.Namespace) -> Dict[str, Any]:
     d = props(row)
+    if profile == "boston_pwd_sidewalk":
+        raw_width = first(d, "Width")
+        raw_width_unit = first(d, "Width_unit")
+        raw_slope = first(d, "Slope")
+        raw_slope_unit = first(d, "Slope_unit")
+        return standard_feature(row, {
+            "feature_id": str(first(d, "CartegraphID", "OBJECTID") or f"boston_pwd_sidewalk_{index}"),
+            "kind": "sidewalk",
+            "source_role": "physical_attribute_inventory",
+            "physical_attributes_authoritative": True,
+            "width_m": source_length_to_m(raw_width, raw_width_unit),
+            "sidewalk_width_m": source_length_to_m(raw_width, raw_width_unit),
+            "slope": source_slope_to_ratio(raw_slope, raw_slope_unit),
+            "surface": first(d, "SurfaceType"),
+            "inspection_date": first(d, "CurrentInspectionDate"),
+            "raw_fields": {
+                "Width": raw_width, "Width_unit": raw_width_unit,
+                "Slope": raw_slope, "Slope_unit": raw_slope_unit,
+            },
+            "unit_mapping": {
+                "Width": _source_length_unit(raw_width_unit),
+                "Slope": _source_slope_unit(raw_slope_unit),
+            },
+        }, source=source, authoritative=True, tier="A_authoritative_city_gis")
+
+    if profile == "boston_pwd_ada_ramp":
+        xy = representative_point(row)
+        if not xy:
+            raise ValueError("Boston PWD ADA ramp feature has no geometry")
+        clear_width = first(d, "ClearWidth")
+        clear_width_unit = first(d, "ClearWidth_unit")
+        width = first(d, "Width")
+        width_unit = first(d, "Width_unit")
+        slope = first(d, "Slope")
+        slope_unit = first(d, "Slope_unit")
+        cross_slope = first(d, "CrossSlope")
+        cross_slope_unit = first(d, "CrossSlope_unit")
+        rise = first(d, "Rise")
+        rise_unit = first(d, "Rise_unit")
+        return {
+            "id": str(first(d, "CartegraphID", "OBJECTID") or f"boston_pwd_ada_ramp_{index}"),
+            "lon": xy[0], "lat": xy[1], "frame": "wgs84",
+            "kind": "curb_ramp", "curb_ramp": True,
+            "clear_width_m": source_length_to_m(clear_width, clear_width_unit),
+            "ramp_width_m": source_length_to_m(width, width_unit),
+            "ramp_slope": source_slope_to_ratio(slope, slope_unit),
+            "cross_slope": source_slope_to_ratio(cross_slope, cross_slope_unit),
+            # PWD's Rise field is retained as ramp rise, not silently promoted
+            # to curb reveal/curb height without source documentation.
+            "ramp_rise_m": source_length_to_m(rise, rise_unit),
+            "curb_height_m": None,
+            "deployment_clearance_m": None,
+            "detectable_warning": first(d, "DetectableWarning"),
+            "condition": first(d, "ConditionGroup", "CurrentInspectionOCR"),
+            "inspection_date": first(d, "CurrentInspectionDate"),
+            "source": source, "authoritative": True,
+            "evidence_tier": "A_authoritative_city_gis", "confidence": 0.95,
+            "raw_fields": {
+                "ClearWidth": clear_width, "ClearWidth_unit": clear_width_unit,
+                "Width": width, "Width_unit": width_unit,
+                "Slope": slope, "Slope_unit": slope_unit,
+                "CrossSlope": cross_slope, "CrossSlope_unit": cross_slope_unit,
+                "Rise": rise, "Rise_unit": rise_unit,
+            },
+            "requires_manual_deployment_clearance_audit": True,
+            "requires_independent_pudo_legality_audit": True,
+        }
+
     if profile == "boston_sidewalk":
         raw_w = first(d, "SWK_WIDTH")
         raw_s = first(d, "SWK_SLOPE")
@@ -420,7 +522,7 @@ def main() -> None:
     p.add_argument("--output", required=True)
     p.add_argument("--layer", default=None, help="Layer name for multi-layer GPKG or ZIP archives containing multiple shapefiles.")
     p.add_argument("--profile", required=True, choices=[
-        "boston_sidewalk", "boston_sidewalk_centerline", "boston_curb", "boston_ramp", "pittsburgh_sidewalks_steps", "pittsburgh_address_point",
+        "boston_sidewalk", "boston_sidewalk_centerline", "boston_curb", "boston_ramp", "boston_pwd_sidewalk", "boston_pwd_ada_ramp", "pittsburgh_sidewalks_steps", "pittsburgh_address_point",
         "pittsburgh_street_closure", "vegas_parking_zone", "pittsburgh_parking_meter", "lta_taxi_stand", "lta_passenger_pickup_bay",
         "lta_footpath", "lta_kerbline", "generic_pudo_candidate", "government_entrance", "generic_city_gis",
     ])
@@ -447,7 +549,7 @@ def main() -> None:
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     geojson_profiles = {
-        "boston_sidewalk", "boston_sidewalk_centerline", "boston_curb",
+        "boston_sidewalk", "boston_sidewalk_centerline", "boston_curb", "boston_pwd_sidewalk",
         "pittsburgh_sidewalks_steps", "pittsburgh_address_point",
         "lta_footpath", "lta_kerbline",
         "government_entrance", "generic_city_gis",

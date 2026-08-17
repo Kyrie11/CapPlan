@@ -480,7 +480,11 @@ def validate_city_sources(
     requirements = {
         "pedestrian_topology": topology_ok,
         "georeference_parseable": inspections["georeference_json"].valid,
-        "georeference_validated": inspections["georeference_json"].valid and bool(georef_payload.get("validated", False)),
+        "georeference_validated": (
+            inspections["georeference_json"].valid
+            and bool(georef_payload.get("validated", False))
+            and bool(georef_payload.get("spatial_alignment_validated", False))
+        ),
         "curb_physical_inventory": inspections["curb_inventory_jsonl"].valid,
         "curb_legality_or_regulation": inspections["curb_regulation_jsonl"].valid,
         "entrance_layer": inspections["entrance_source"].valid,
