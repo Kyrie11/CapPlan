@@ -70,8 +70,10 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
     service_requests = _safe_read(root / "service_requests.jsonl")
     vehicles = _safe_read(root / "vehicle_interfaces.jsonl")
     counterfactual_pairs = _safe_read(root / "counterfactual_pairs.jsonl")
+    excluded_episodes = _safe_read(root / "excluded_episodes.jsonl")
 
     graph_node_counts: List[int] = []
+    endpoint_coverage_by_episode: Dict[str, Dict[str, Any]] = {}
     graph_edge_counts: List[int] = []
     graph_edge_sources: Counter[str] = Counter()
     graph_metadata_sources: Counter[str] = Counter()
@@ -87,7 +89,10 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
         if meta_path.exists():
             for row in _safe_read(meta_path):
                 if isinstance(row, dict) and row.get("metadata"):
-                    graph_metadata_sources[str(row.get("metadata", {}).get("source"))] += 1
+                    meta = row.get("metadata", {})
+                    graph_metadata_sources[str(meta.get("source"))] += 1
+                    if isinstance(meta.get("paper_endpoint_pudo_coverage"), dict):
+                        endpoint_coverage_by_episode[str(eid)] = dict(meta.get("paper_endpoint_pudo_coverage") or {})
 
     transition_z_by_action: Dict[str, Counter[str]] = defaultdict(Counter)
     tid_to_action = {t.get("transition_id"): t.get("action") for t in transitions}
@@ -135,6 +140,28 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
     eligible_by_episode = {eid: sum(1 for row in rows if _pudo_eligible(row)) for eid, rows in pudo_by_episode.items()}
     complete_by_episode = {eid: sum(1 for row in rows if _pudo_complete(row)) for eid, rows in pudo_by_episode.items()}
     episode_ids = [str(ep.get("episode_id")) for ep in episodes]
+    required_paper_pudo_fields = {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp", "running_slope", "cross_slope", "surface", "legal_basis", "legal_stop_source", "legal_stop_tier", "site_id"}
+    eligible_missing_provenance = []
+    for row in pudos:
+        if not _pudo_eligible(row):
+            continue
+        missing = sorted(k for k in required_paper_pudo_fields if row.get(k) in (None, ""))
+        prov = row.get("field_provenance")
+        if not isinstance(prov, dict) or not prov:
+            missing.append("field_provenance")
+        if missing:
+            eligible_missing_provenance.append({"episode_id": row.get("episode_id"), "anchor_id": row.get("anchor_id"), "missing": sorted(set(missing))})
+    endpoint_missing = [eid for eid in episode_ids if eid not in endpoint_coverage_by_episode]
+    eligible_dynamic_noncausal = [
+        {
+            "episode_id": row.get("episode_id"),
+            "anchor_id": row.get("anchor_id"),
+            "dynamic_evidence_source": row.get("dynamic_evidence_source"),
+            "dynamic_input_causal": row.get("dynamic_input_causal"),
+        }
+        for row in pudos
+        if _pudo_eligible(row) and (row.get("dynamic_input_causal") is not True or not row.get("dynamic_evidence_source"))
+    ]
     episodes_meeting_pudo_gate = sum(1 for eid in episode_ids if eligible_by_episode.get(eid, 0) >= min_paper_eligible_pudos_per_episode)
     episode_pudo_coverage_rate = _rate(episodes_meeting_pudo_gate, len(episode_ids))
     certificate_phase_counts = Counter(str(c.get("phase") or "unknown") for c in certificates)
@@ -244,6 +271,12 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
         # readiness instead requires enough fully evidenced, legally usable PUDOs.
         if episode_pudo_coverage_rate < min_episode_pudo_coverage_rate:
             issues.append("paper_mode_insufficient_episode_pudo_evidence_coverage")
+        if eligible_missing_provenance:
+            issues.append("paper_mode_eligible_pudo_provenance_incomplete")
+        if endpoint_missing:
+            issues.append("paper_mode_endpoint_pudo_coverage_metadata_incomplete")
+        if eligible_dynamic_noncausal:
+            issues.append("paper_mode_pudo_dynamic_input_noncausal_or_unprovenanced")
         if passenger_labels and passenger_true_rate < min_edge_positive_rate: issues.append("paper_mode_passenger_edge_positive_rate_too_low")
         if (certificates or skeletons) and skeleton_rate < min_skeleton_positive_rate: issues.append("paper_mode_skeleton_positive_rate_too_low")
         if certificate_phase_diversity < min_failure_phase_diversity:
@@ -298,6 +331,7 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
             "skeleton_labels": len(skeletons),
             "certificate_labels": len(certificates),
             "service_requests": len(service_requests),
+            "excluded_episodes": len(excluded_episodes),
         },
         "provenance": {
             "scene_sources": _counter(scenes, "source"),
@@ -331,6 +365,27 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
             "episode_coverage_rate": episode_pudo_coverage_rate,
             "min_required_episode_coverage_rate": min_episode_pudo_coverage_rate if paper_mode else None,
             "note": "Missing fields on uncertain candidates are permitted; only evidence-complete legal interfaces count as paper_eligible.",
+        },
+        "paper_endpoint_coverage": {
+            "episodes_with_coverage_metadata": len(endpoint_coverage_by_episode),
+            "episodes_missing_coverage_metadata": endpoint_missing,
+            "coverage_by_episode": endpoint_coverage_by_episode,
+        },
+        "eligible_pudo_provenance": {
+            "required_fields": sorted(required_paper_pudo_fields),
+            "incomplete_count": len(eligible_missing_provenance),
+            "first_incomplete": eligible_missing_provenance[:20],
+        },
+        "dynamic_evidence_audit": {
+            "planner_input_policy": "causal_current_observation_only; future occupancy retained as label-only",
+            "eligible_noncausal_or_unprovenanced_count": len(eligible_dynamic_noncausal),
+            "first_noncausal_or_unprovenanced": eligible_dynamic_noncausal[:20],
+        },
+        "paper_subset_exclusions": {
+            "count": len(excluded_episodes),
+            "by_stage": dict(Counter(str(r.get("stage") or "unknown") for r in excluded_episodes)),
+            "first_examples": excluded_episodes[:20],
+            "note": "Expected coverage exclusions are allowed only when explicitly recorded; they are not imputed into the paper subset.",
         },
         "label_health": {
             "transition_z_by_action": {k: dict(v) for k, v in sorted(transition_z_by_action.items())},

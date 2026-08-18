@@ -31,6 +31,9 @@ quality:
   min_graph_nodes: 100
   min_graph_edges: 150
   min_paper_eligible_pudos_per_episode: 2
+  min_endpoint_paper_eligible_pudos: 1
+  paper_endpoint_max_path_m: 500.0
+  paper_ineligible_episode_policy: drop
   min_episode_pudo_coverage_rate: 0.80
 
 service:

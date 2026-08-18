@@ -692,8 +692,8 @@ class AccessibilityFusionBuilder:
                         edges.append(AccessibilityEdge(eid + ":rev", nid, previous, max(0.001, length), confidence=f.confidence, geometry=list(reversed(geom)), source=f.source, **ea))
                 previous = nid
 
-        self._snap_point_nodes(nodes, edges, target_kinds={"entrance"}, edge_kind="entrance_connector")
-        self._snap_point_nodes(nodes, edges, target_kinds={"curb", "curb_ramp"}, edge_kind="curb_connector")
+        self._snap_point_nodes(nodes, edges, node_extra, target_kinds={"entrance"}, edge_kind="entrance_connector")
+        self._snap_point_nodes(nodes, edges, node_extra, target_kinds={"curb", "curb_ramp"}, edge_kind="curb_connector")
         if scene.route_polyline:
             self._add_pudo_connector_metadata(nodes, node_extra, scene.route_polyline, pudo_connector_radius_m)
         edges = self._dedupe_edges(edges, nodes)
@@ -731,7 +731,7 @@ class AccessibilityFusionBuilder:
                 best, best_d = oid, d
         return best, best_d
 
-    def _snap_point_nodes(self, nodes: Dict[str, AccessibilityNode], edges: List[AccessibilityEdge], target_kinds: set[str], edge_kind: str) -> None:
+    def _snap_point_nodes(self, nodes: Dict[str, AccessibilityNode], edges: List[AccessibilityEdge], node_extra: Dict[str, Dict[str, Any]], target_kinds: set[str], edge_kind: str) -> None:
         for nid, n in list(nodes.items()):
             if n.kind not in target_kinds:
                 continue
@@ -740,21 +740,35 @@ class AccessibilityFusionBuilder:
                 o = nodes[other]
                 eid = f"{edge_kind}:{nid}:{other}"
                 geom = [[n.x, n.y], [o.x, o.y]]
+                a = node_extra.get(nid, {}) if isinstance(node_extra, dict) else {}
+                width = a.get("width_m") if a.get("width_m") is not None else a.get("sidewalk_width_m")
+                slope = a.get("slope") if a.get("slope") is not None else a.get("running_slope")
+                cross_slope = a.get("cross_slope")
+                surface = a.get("surface")
+                curb_ramp = a.get("curb_ramp")
+                if curb_ramp is None and n.kind == "curb_ramp":
+                    curb_ramp = True
+                step_free = a.get("step_free")
+                if step_free is None and n.kind == "curb_ramp":
+                    step_free = True
                 attrs = {
-                    "width_m": None,
-                    "slope": None,
-                    "cross_slope": None,
-                    "surface": None,
-                    "curb_ramp": n.kind == "curb_ramp" or None,
-                    "step_free": True if n.kind == "curb_ramp" else None,
-                    "obstacle": False,
-                    "lighting": None,
-                    "shelter": None,
+                    "width_m": width,
+                    "slope": slope,
+                    "cross_slope": cross_slope,
+                    "surface": surface,
+                    "curb_ramp": curb_ramp,
+                    "step_free": step_free,
+                    "obstacle": bool(a.get("obstacle") or a.get("permanent_obstruction")),
+                    "lighting": a.get("lighting"),
+                    "shelter": a.get("shelter"),
                     "crossing_type": edge_kind,
-                    "obstacle_state": None,
+                    "obstacle_state": "blocked" if bool(a.get("obstacle") or a.get("permanent_obstruction")) else a.get("obstacle_state"),
                 }
-                edges.append(AccessibilityEdge(eid, nid, other, max(0.001, d), confidence=min(n.confidence, o.confidence), geometry=geom, source=f"{n.source}+snap", **attrs))
-                edges.append(AccessibilityEdge(eid + ":rev", other, nid, max(0.001, d), confidence=min(n.confidence, o.confidence), geometry=list(reversed(geom)), source=f"{n.source}+snap", **attrs))
+                confidence = min(n.confidence, o.confidence)
+                # Missing approach attributes are not silently backfilled from the
+                # nearby sidewalk; the connector remains fail-closed.
+                edges.append(AccessibilityEdge(eid, nid, other, max(0.001, d), confidence=confidence, geometry=geom, source=f"{n.source}+snap", **attrs))
+                edges.append(AccessibilityEdge(eid + ":rev", other, nid, max(0.001, d), confidence=confidence, geometry=list(reversed(geom)), source=f"{n.source}+snap", **attrs))
 
     def _add_pudo_connector_metadata(self, nodes: Dict[str, AccessibilityNode], node_extra: Dict[str, Dict[str, Any]], route: List[List[float]], radius: float) -> None:
         for nid, n in nodes.items():

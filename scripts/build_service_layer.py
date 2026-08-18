@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from capplan.data.capability_contracts import load_profiles
 from capplan.data.passenger_service_layer import load_fleet_interfaces, validate_service_request
-from capplan.data.schemas import AccessibilityNode, node_from_dict
+from capplan.data.accessibility_layer import NoAccessiblePathError, shortest_accessible_path_stats
+from capplan.data.schemas import AccessibilityGraph, AccessibilityNode, edge_from_dict, node_from_dict
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 
 
@@ -69,6 +70,58 @@ def _load_nodes(graph_dir: Path, eid: str) -> List[AccessibilityNode]:
     if not f.exists():
         raise FileNotFoundError(f"missing nodes JSONL for {eid} in {graph_dir}")
     return [node_from_dict(x) for x in read_jsonl(f)]
+
+
+def _load_graph(graph_dir: Path, eid: str) -> AccessibilityGraph:
+    nf = graph_dir / f"{eid}.nodes.jsonl"
+    ef = graph_dir / f"{eid}.edges.jsonl"
+    if not nf.exists(): nf = graph_dir / "nodes.jsonl"
+    if not ef.exists(): ef = graph_dir / "edges.jsonl"
+    if not nf.exists():
+        raise FileNotFoundError(f"missing nodes JSONL for {eid} in {graph_dir}")
+    # Node-only graphs remain sufficient for bootstrap OD sampling. Paper-mode
+    # endpoint support uses shortest paths, so an empty edge set naturally
+    # yields no supported endpoints and is then failed/dropped explicitly.
+    edges = [edge_from_dict(x) for x in read_jsonl(ef)] if ef.exists() else []
+    return AccessibilityGraph(str(eid), [node_from_dict(x) for x in read_jsonl(nf)], edges, {})
+
+
+def _pudo_by_episode(path: str | None, paper_only: bool) -> Dict[str, List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    if not path:
+        return out
+    for r in read_jsonl(path):
+        if paper_only and not bool(r.get("paper_eligible")):
+            continue
+        eid = str(r.get("episode_id") or "")
+        if eid:
+            out.setdefault(eid, []).append(r)
+    return out
+
+
+def _endpoint_pudo_support(graph: AccessibilityGraph, entrances: Sequence[AccessibilityNode], pudos: Sequence[Dict[str, Any]], max_path_m: float, require_observed_path: bool) -> Dict[str, List[str]]:
+    support: Dict[str, List[str]] = {}
+    graph_nodes = {n.node_id for n in graph.nodes}
+    for ent in entrances:
+        ids: List[str] = []
+        for p in pudos:
+            ped = str(p.get("adjacent_ped_node_id") or p.get("ped_node_id") or "")
+            if not ped or ped not in graph_nodes:
+                continue
+            try:
+                stats = shortest_accessible_path_stats(graph, ent.node_id, ped)
+            except NoAccessiblePathError:
+                continue
+            if stats.get("distance") is None or float(stats["distance"]) > max_path_m:
+                continue
+            if require_observed_path and stats.get("missing_fields"):
+                continue
+            if stats.get("obstacle"):
+                continue
+            ids.append(str(p.get("anchor_id") or p.get("pudo_id") or ""))
+        if ids:
+            support[ent.node_id] = sorted(set(x for x in ids if x))
+    return support
 
 
 def _entrance_nodes(nodes: Sequence[AccessibilityNode], allow_non_entrance_od: bool = False) -> List[AccessibilityNode]:
@@ -198,15 +251,36 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
     request_time_span = float(cfg.get("request_time_span_s", 12 * 3600))
     rng = random.Random(args.seed)
     rows: List[Dict[str, Any]] = []
+    pudo_index = _pudo_by_episode(args.pudo_evidence_jsonl, paper_only=args.paper_mode)
     for eid in episode_ids:
-        nodes = _load_nodes(graph_dir, str(eid))
+        graph = _load_graph(graph_dir, str(eid))
+        nodes = graph.nodes
         entrances = _entrance_nodes(nodes, allow_non_entrance_od=args.allow_non_entrance_od)
         # AbilityBench counterfactuals intentionally keep the traffic scene and
         # passenger OD fixed while changing only the capability contract. The
         # previous code sampled a fresh OD for every profile, which made T4
         # impossible to interpret and conflicted with build_dataset.py (which
         # binds one OD per scene episode).
-        o, d = _choose_od(entrances, rng)
+        endpoint_support: Dict[str, List[str]] = {}
+        if args.pudo_evidence_jsonl:
+            endpoint_support = _endpoint_pudo_support(
+                graph, entrances, pudo_index.get(str(eid), []),
+                max_path_m=args.endpoint_max_path_m, require_observed_path=args.paper_mode,
+            )
+        if args.paper_mode:
+            supported = [e for e in entrances if e.node_id in endpoint_support]
+            if len(supported) < 2:
+                reason = (
+                    f"paper service OD sampling found only {len(supported)} entrances with a fully observed pedestrian path "
+                    f"to at least one paper-eligible PUDO within {args.endpoint_max_path_m:.1f} m"
+                )
+                if args.unsupported_episode_policy == "drop":
+                    args._excluded_episodes.append({"episode_id": str(eid), "stage": "service_od", "reason": reason})
+                    continue
+                raise RuntimeError(f"{reason} for {eid}; audit entrances/PUDOs or use --unsupported_episode_policy drop for a reported paper subset.")
+            o, d = _choose_od(supported, rng)
+        else:
+            o, d = _choose_od(entrances, rng)
         request_time_s = round(request_time_start + rng.random() * request_time_span, 3)
         cf_group_id = f"{eid}:cf_od0"
         base_profile_id = str(cfg.get("counterfactual_base_profile_id") or profile_mix[0])
@@ -240,6 +314,9 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
                 "counterfactual_relation": relation,
                 "expected_monotonic": bool(pmeta.get("expected_monotonic", not is_base and relation == "stricter_or_equal")),
                 "bootstrap_non_entrance_od": bool(args.allow_non_entrance_od and o.kind not in {"entrance", "origin_entrance", "destination_entrance", "transit_stop"}),
+                "paper_origin_candidate_pudo_ids": endpoint_support.get(o.node_id, []),
+                "paper_destination_candidate_pudo_ids": endpoint_support.get(d.node_id, []),
+                "endpoint_support_policy": "fully_observed_path_to_paper_pudo" if args.paper_mode else "bootstrap_or_unchecked",
             })
     return rows
 
@@ -261,6 +338,7 @@ def _validate_refs(rows: List[Dict[str, Any]], profiles: List[Dict[str, Any]], f
 
 def build(args: argparse.Namespace) -> Dict[str, Any]:
     generated_profiles: List[Dict[str, Any]] = []
+    args._excluded_episodes = []
     if args.capability_profiles_jsonl:
         profiles = load_profiles(args.capability_profiles_jsonl)
     else:
@@ -295,6 +373,10 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
         "source": args.source_name,
         "mode": mode,
         "materialized_capability_profiles_jsonl": args.output_capability_profiles_jsonl,
+        "unsupported_episode_policy": args.unsupported_episode_policy,
+        "excluded_episode_count": len(args._excluded_episodes),
+        "excluded_episodes": list(args._excluded_episodes),
+        "interpretation": "Paper-mode drops, when enabled, are explicit eligibility exclusions rather than imputation; retain this report with the dataset.",
     }
     if args.report_json:
         dump_json(args.report_json, report)
@@ -310,6 +392,10 @@ def main() -> None:
     p.add_argument("--capability_profiles_jsonl", default=None, help="Existing capability profiles. If omitted, the three AbilityBench layers are generated.")
     p.add_argument("--output_capability_profiles_jsonl", default=None, help="Where to write generated three-layer profiles when --capability_profiles_jsonl is omitted.")
     p.add_argument("--fleet_jsonl", default=None)
+    p.add_argument("--pudo_evidence_jsonl", default=None, help="PUDO evidence used to choose endpoint-supported OD pairs; required in --paper_mode.")
+    p.add_argument("--paper_mode", action="store_true", help="Choose only OD entrances with fully observed paths to paper-eligible PUDOs.")
+    p.add_argument("--unsupported_episode_policy", choices=["fail", "drop"], default="fail", help="Paper OD support policy. drop retains only explicitly supported episodes and records every exclusion in the service report; fail is useful for small audits/tests.")
+    p.add_argument("--endpoint_max_path_m", type=float, default=500.0)
     p.add_argument("--output_service_requests_jsonl", required=True)
     p.add_argument("--num_requests_per_episode", type=int, default=3)
     p.add_argument("--seed", type=int, default=13)
@@ -317,6 +403,8 @@ def main() -> None:
     p.add_argument("--allow_non_entrance_od", action="store_true", help="Bootstrap-only: sample OD from sidewalk/curb nodes if entrance nodes are absent. Not valid for paper-mode datasets.")
     p.add_argument("--report_json", default=None)
     args = p.parse_args()
+    if args.paper_mode and not args.pudo_evidence_jsonl:
+        raise RuntimeError("--paper_mode requires --pudo_evidence_jsonl for endpoint-aware OD sampling")
     print(json.dumps(build(args), indent=2, sort_keys=True))
 
 

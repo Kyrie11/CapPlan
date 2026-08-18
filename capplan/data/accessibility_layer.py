@@ -188,30 +188,23 @@ def _synthetic_overlay_enabled(graph: AccessibilityGraph) -> bool:
 
 
 def attach_pudo_nodes_to_graph(graph: AccessibilityGraph, anchors: List[PUDOAnchor], connector_width_default_m: float = 1.2) -> tuple[AccessibilityGraph, List[PUDOAnchor]]:
-    """Ensure PUDO anchors are routable nodes in the pedestrian graph.
+    """Attach each PUDO as a distinct curb-interface node.
 
-    nuPlan lane-derived PUDO points live in the same map frame as the scene,
-    while the accessibility spine may not already contain a node with exactly
-    the same anchor id.  This helper inserts a pedestrian PUDO node at each curb
-    pose and connects it to the nearest existing sidewalk/entrance node.
+    ``adjacent_ped_node_id`` identifies the pedestrian-side neighbour; it must
+    not alias the PUDO itself.  Keeping the curb node distinct ensures every
+    access/egress path traverses an explicit curb-interface edge, so curb-ramp
+    evidence cannot be skipped by routing directly to the sidewalk node.
 
-    Evidence policy:
-    * Real/prepared accessibility graphs remain fail-closed: missing connector
-      attributes stay missing.
-    * The repository's ``synthetic_local``/``synthetic_map_overlay`` mode is a
-      controlled proxy benchmark.  In that mode only, connector attributes and
-      wait lighting/shelter may be inherited from the nearest synthetic
-      accessibility edge and are marked with an explicit synthetic proxy source.
-      This prevents a degenerate all-failure benchmark while keeping provenance
-      auditable.
+    Real/prepared graphs remain fail-closed.  Synthetic overlay mode may inherit
+    connector attributes from the nearest synthetic accessibility edge, but the
+    source is explicitly marked as proxy evidence.
     """
     node_ids = {n.node_id for n in graph.nodes}
     updated: List[PUDOAnchor] = []
     use_synthetic_proxy = _synthetic_overlay_enabled(graph)
 
     def nearest_existing(x: float, y: float, exclude: set[str]) -> AccessibilityNode | None:
-        best = None
-        best_d = float("inf")
+        best = None; best_d = float("inf")
         for node in graph.nodes:
             if node.node_id in exclude or node.kind == "pudo":
                 continue
@@ -222,8 +215,10 @@ def attach_pudo_nodes_to_graph(graph: AccessibilityGraph, anchors: List[PUDOAnch
 
     for anchor0 in anchors:
         anchor = anchor0
-        ped_id = anchor.adjacent_ped_node_id or anchor.anchor_id
-        context_edge = _nearest_accessibility_evidence_edge(graph, anchor.curb_pose.x, anchor.curb_pose.y, prefer_synthetic=use_synthetic_proxy) if use_synthetic_proxy else None
+        pudo_id = anchor.anchor_id
+        context_edge = _nearest_accessibility_evidence_edge(
+            graph, anchor.curb_pose.x, anchor.curb_pose.y, prefer_synthetic=use_synthetic_proxy
+        ) if use_synthetic_proxy else None
         proxy_source = "synthetic_accessibility_proxy_to_nuplan_pudo" if context_edge is not None and anchor.source.startswith("nuplan_route") else anchor.source
 
         if use_synthetic_proxy and context_edge is not None and (anchor.lighting is None or anchor.shelter is None):
@@ -233,71 +228,74 @@ def attach_pudo_nodes_to_graph(graph: AccessibilityGraph, anchors: List[PUDOAnch
                 shelter=context_edge.shelter if anchor.shelter is None else anchor.shelter,
             )
 
-        if ped_id not in node_ids:
+        if pudo_id not in node_ids:
             graph.nodes.append(AccessibilityNode(
-                ped_id,
-                anchor.curb_pose.x,
-                anchor.curb_pose.y,
-                "pudo",
-                anchor.map_confidence,
-                timestamp_s=anchor.timestamp_s,
-                source=anchor.source,
-                pose=anchor.curb_pose,
+                pudo_id, anchor.curb_pose.x, anchor.curb_pose.y, "pudo", anchor.map_confidence,
+                timestamp_s=anchor.timestamp_s, source=anchor.source, pose=anchor.curb_pose,
             ))
-            node_ids.add(ped_id)
-        # Add a connector only if one does not already touch this PUDO node.
-        if not any(e.from_node == ped_id or e.to_node == ped_id for e in graph.edges):
-            near = nearest_existing(anchor.curb_pose.x, anchor.curb_pose.y, {ped_id})
-            if near is not None:
-                length = math.hypot(anchor.curb_pose.x - near.x, anchor.curb_pose.y - near.y)
-                if use_synthetic_proxy and context_edge is not None:
-                    width = anchor.sidewalk_width_m if anchor.sidewalk_width_m is not None else context_edge.width_m
-                    slope = context_edge.slope
-                    cross_slope = context_edge.cross_slope
-                    surface = context_edge.surface
-                    curb_ramp = context_edge.curb_ramp
-                    step_free = context_edge.step_free
-                    lighting = anchor.lighting if anchor.lighting is not None else context_edge.lighting
-                    shelter = anchor.shelter if anchor.shelter is not None else context_edge.shelter
-                    confidence = min(anchor.map_confidence, anchor.dynamic_confidence, context_edge.confidence)
-                    edge_source = proxy_source
-                else:
-                    width = anchor.sidewalk_width_m if anchor.sidewalk_width_m is not None else (connector_width_default_m if anchor.source.startswith("synthetic") else None)
-                    slope = None
-                    cross_slope = None
-                    surface = "unknown"
-                    curb_ramp = None
-                    step_free = None
-                    lighting = anchor.lighting
-                    shelter = anchor.shelter
-                    confidence = min(anchor.map_confidence, anchor.dynamic_confidence)
-                    edge_source = anchor.source
-                graph.edges.append(AccessibilityEdge(
-                    f"{near.node_id}_to_{ped_id}",
-                    near.node_id,
-                    ped_id,
-                    max(0.1, length),
-                    width,
-                    slope,
-                    cross_slope,
-                    surface,
-                    curb_ramp,
-                    step_free,
-                    anchor.blockage_risk >= 0.85,
-                    lighting,
-                    shelter,
-                    confidence,
-                    [[near.x, near.y], [anchor.curb_pose.x, anchor.curb_pose.y]],
-                    crossing_type="curb",
-                    obstacle_state="blocked" if anchor.blockage_risk >= 0.85 else None,
-                    timestamp_s=anchor.timestamp_s,
-                    source=edge_source,
-                ))
+            node_ids.add(pudo_id)
+
+        # Use a claimed adjacent pedestrian node only when it is real and not the
+        # PUDO itself; otherwise find the nearest pre-existing pedestrian node.
+        ped_id = anchor.adjacent_ped_node_id
+        if not ped_id or ped_id == pudo_id or ped_id not in node_ids:
+            near = nearest_existing(anchor.curb_pose.x, anchor.curb_pose.y, {pudo_id})
+            ped_id = near.node_id if near is not None else None
+        ped_node = next((n for n in graph.nodes if n.node_id == ped_id), None) if ped_id else None
+
+        if ped_node is not None and not any(
+            {e.from_node, e.to_node} == {pudo_id, ped_id} and (e.crossing_type == "curb" or "pudo_connector" in e.edge_id)
+            for e in graph.edges
+        ):
+            length = math.hypot(anchor.curb_pose.x - ped_node.x, anchor.curb_pose.y - ped_node.y)
+            if use_synthetic_proxy and context_edge is not None:
+                width = anchor.sidewalk_width_m if anchor.sidewalk_width_m is not None else context_edge.width_m
+                slope = anchor.running_slope if anchor.running_slope is not None else context_edge.slope
+                cross_slope = anchor.cross_slope if anchor.cross_slope is not None else context_edge.cross_slope
+                surface = anchor.surface if anchor.surface is not None else context_edge.surface
+                curb_ramp = anchor.curb_ramp if anchor.curb_ramp is not None else context_edge.curb_ramp
+                step_free = anchor.step_free if anchor.step_free is not None else (anchor.curb_ramp if anchor.curb_ramp is not None else context_edge.step_free)
+                lighting = anchor.lighting if anchor.lighting is not None else context_edge.lighting
+                shelter = anchor.shelter if anchor.shelter is not None else context_edge.shelter
+                confidence = min(anchor.map_confidence, anchor.dynamic_confidence, context_edge.confidence)
+                edge_source = proxy_source
+            else:
+                width = anchor.sidewalk_width_m if anchor.sidewalk_width_m is not None else (connector_width_default_m if anchor.source.startswith("synthetic") else None)
+                slope = anchor.running_slope
+                cross_slope = anchor.cross_slope
+                surface = anchor.surface
+                curb_ramp = anchor.curb_ramp
+                step_free = anchor.step_free if anchor.step_free is not None else anchor.curb_ramp
+                lighting = anchor.lighting
+                shelter = anchor.shelter
+                confidence = min(anchor.map_confidence, anchor.dynamic_confidence)
+                edge_source = anchor.source
+            attrs = dict(
+                width_m=width, slope=slope, cross_slope=cross_slope, surface=surface,
+                curb_ramp=curb_ramp, step_free=step_free, obstacle=anchor.blockage_risk >= 0.85,
+                lighting=lighting, shelter=shelter, confidence=confidence,
+                crossing_type="curb", obstacle_state="blocked" if anchor.blockage_risk >= 0.85 else None,
+                timestamp_s=anchor.timestamp_s, source=edge_source,
+            )
+            geom = [[ped_node.x, ped_node.y], [anchor.curb_pose.x, anchor.curb_pose.y]]
+            graph.edges.append(AccessibilityEdge(
+                f"pudo_connector:{ped_id}:to:{pudo_id}", ped_id, pudo_id, max(0.1, length),
+                geometry=geom, **attrs,
+            ))
+            graph.edges.append(AccessibilityEdge(
+                f"pudo_connector:{pudo_id}:to:{ped_id}", pudo_id, ped_id, max(0.1, length),
+                geometry=list(reversed(geom)), **attrs,
+            ))
         if anchor.adjacent_ped_node_id != ped_id:
             anchor = replace(anchor, adjacent_ped_node_id=ped_id)
         updated.append(anchor)
-    graph.metadata = {**graph.metadata, "pudo_nodes_attached": True, "pudo_connector_policy": "synthetic_proxy" if use_synthetic_proxy else "fail_closed"}
+    graph.metadata = {
+        **graph.metadata, "pudo_nodes_attached": True,
+        "pudo_connector_policy": "synthetic_proxy" if use_synthetic_proxy else "fail_closed",
+        "pudo_anchor_is_distinct_curb_node": True,
+    }
     return graph, updated
+
 
 def _adjacency(graph: AccessibilityGraph) -> Dict[str, List[Tuple[str, AccessibilityEdge]]]:
     adj: Dict[str, List[Tuple[str, AccessibilityEdge]]] = {}
@@ -399,7 +397,9 @@ def shortest_accessible_path_stats(graph: AccessibilityGraph, start_node: str, e
         "width": _agg_optional(width_vals, "min"),
         "slope": _agg_optional(slope_vals, "max"),
         "cross_slope": _agg_optional(cross_vals, "max"),
-        "curb_ramp": _agg_optional(curb_vals, "all", True if not curb_vals else None),
+        # No curb-context edge means no curb-ramp evidence.  Treat it as
+        # unknown rather than silently assuming an accessible curb interface.
+        "curb_ramp": _agg_optional(curb_vals, "all", None),
         "step_free": _agg_optional(step_vals, "all"),
         "surface": _agg_optional(surface_vals, "first"),
         "obstacle": any(e.obstacle for e in edges),

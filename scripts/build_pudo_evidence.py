@@ -11,31 +11,65 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from capplan.data.gis_fusion import CoordinateTransformer, distance_to_polyline, nearest_route_side, read_scene_contexts
+from capplan.data.evidence_policy import is_tier_a, is_proxy_or_candidate, legal_evidence_is_independent, physical_field_is_paper_grade, source_tier
 from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, AccessibilityNode, edge_from_dict, node_from_dict
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 
 CORE = ["curb_height_m", "deployment_clearance_m", "sidewalk_width_m"]
+PAPER_PHYSICAL = [*CORE, "curb_ramp", "running_slope", "cross_slope", "surface"]
+
+
+def _field_grade(row: Dict[str, Any], field: str) -> bool:
+    prov = row.get("field_provenance") if isinstance(row.get("field_provenance"), dict) else {}
+    p = prov.get(field) if isinstance(prov, dict) else None
+    if isinstance(p, dict):
+        # Evaluate the field evidence independently from candidate semantics.
+        # A candidate PUDO may become publication-grade after a Tier-A field
+        # measurement is bound to it; inheriting candidate_only here would
+        # incorrectly reject that independent measurement.
+        rec = {**p, field: row.get(field)}
+        if not rec.get("source"):
+            rec["source"] = row.get(f"{field}_source")
+        if not rec.get("evidence_tier"):
+            rec["evidence_tier"] = row.get(f"{field}_tier")
+        return physical_field_is_paper_grade(rec, field)
+    src = row.get(f"{field}_source")
+    tier = row.get(f"{field}_tier")
+    if src and tier:
+        return physical_field_is_paper_grade({"source": src, "evidence_tier": tier, field: row.get(field)}, field)
+    # Backward compatibility for normalized Tier-A inventory records where the
+    # source/tier apply to all mapped physical fields.
+    return physical_field_is_paper_grade(row, field)
 
 
 def _paper_evidence_flags(row: Dict[str, Any]) -> Tuple[bool, bool, str]:
-    core_complete = all(row.get(k) is not None for k in CORE)
+    physical_ok = all(row.get(k) is not None and _field_grade(row, k) for k in PAPER_PHYSICAL)
     has_ped_binding = bool(row.get("adjacent_ped_node_id"))
-    legality_source = str(row.get("legal_stop_source") or "").lower()
-    has_legality_evidence = bool(legality_source) and legality_source not in {"unknown", "none"} and "no_matching_regulation" not in legality_source and "heuristic" not in legality_source and "no_legality_evidence" not in legality_source
-    source = str(row.get("source") or "").lower()
-    interface_source = str(row.get("curb_inventory_source") or row.get("interface_evidence_source") or "").lower()
-    trustworthy_source = not (source.startswith("synthetic") or source in {"toy", "mock", "unknown", ""})
-    has_interface_evidence = bool(interface_source) and not (interface_source.startswith("synthetic") or "proxy" in interface_source or interface_source in {"toy", "mock", "unknown"})
-    evidence_complete = core_complete and has_ped_binding and has_legality_evidence and trustworthy_source and has_interface_evidence
+    legal_rec = {
+        "legal_stop": row.get("legal_stop"),
+        "legal_basis": row.get("legal_basis"),
+        "source": row.get("legal_stop_source"),
+        "evidence_tier": row.get("legal_stop_tier") or row.get("curb_regulation_tier") or row.get("evidence_tier"),
+        "authoritative": row.get("legal_stop_authoritative", row.get("authoritative")),
+        "audited": row.get("legal_stop_audited", row.get("audited")),
+        "candidate_only": row.get("legal_stop_candidate_only", False),
+        "requires_manual_legality_audit": row.get("requires_manual_legality_audit", False),
+    }
+    legality_ok = legal_evidence_is_independent(legal_rec)
+    evidence_complete = physical_ok and has_ped_binding and legality_ok
     eligible = evidence_complete and bool(row.get("legal_stop"))
-    missing = [k for k in CORE if row.get(k) is None]
     reasons = []
-    if missing: reasons.append("missing:" + ",".join(missing))
-    if not has_ped_binding: reasons.append("no_pedestrian_binding")
-    if not has_legality_evidence: reasons.append("no_independent_legality_evidence")
-    if not trustworthy_source: reasons.append("non_auditable_candidate_source")
-    if not has_interface_evidence: reasons.append("no_auditable_interface_evidence")
-    if evidence_complete and not bool(row.get("legal_stop")): reasons.append("legality_negative")
+    for k in PAPER_PHYSICAL:
+        if row.get(k) is None:
+            reasons.append(f"missing:{k}")
+        elif not _field_grade(row, k):
+            reasons.append(f"non_tier_a:{k}")
+    if not has_ped_binding:
+        reasons.append("no_pedestrian_binding")
+    if not legality_ok:
+        reasons.append("no_independent_tier_a_legality")
+    if evidence_complete and not bool(row.get("legal_stop")):
+        reasons.append("legality_negative")
     return evidence_complete, eligible, "paper_ready" if eligible else ("evidence_complete_negative" if evidence_complete else ";".join(reasons) or "candidate_uncertain")
 
 
@@ -261,6 +295,19 @@ def _nearest_edge_attrs(x: float, y: float, graph: AccessibilityGraph) -> Dict[s
     return {"sidewalk_width_m": best_e.width_m, "lighting": best_e.lighting, "shelter": best_e.shelter, "surface": best_e.surface, "distance_to_ped_edge_m": best_d}
 
 
+def _regulation_view(reg: Dict[str, Any]) -> Dict[str, Any]:
+    d = _row_view(reg)
+    return {
+        **d,
+        "source": d.get("source") or d.get("regulation_id"),
+        "evidence_tier": d.get("evidence_tier") or d.get("source_tier"),
+        "authoritative": d.get("authoritative"),
+        "audited": d.get("audited"),
+        "candidate_only": d.get("candidate_only"),
+        "requires_manual_legality_audit": d.get("requires_manual_legality_audit"),
+    }
+
+
 def _regulation_match(x: float, y: float, regs: List[Dict[str, Any]], tolerance: float, transformer: Optional[CoordinateTransformer] = None) -> Optional[Dict[str, Any]]:
     best, best_d = None, float("inf")
     for r in regs:
@@ -277,21 +324,29 @@ def _as_inventory_record(row: Dict[str, Any], transformer: Optional[CoordinateTr
     xy = _xy_from_row(row, transformer)
     if not xy:
         return None
+    d = _row_view(row)
     source = _first_present(row, ["source", "evidence_source", "dataset", "name"]) or "curb_inventory"
     if _source_bad(source):
         return None
     rec: Dict[str, Any] = {
-        "x": xy[0],
-        "y": xy[1],
-        "source": str(source),
+        "x": xy[0], "y": xy[1], "source": str(source),
+        "evidence_tier": d.get("evidence_tier") or d.get("source_tier"),
+        "authoritative": d.get("authoritative"), "audited": d.get("audited"),
+        "field_provenance": d.get("field_provenance") if isinstance(d.get("field_provenance"), dict) else {},
         "confidence": _as_float(_first_present(row, ["confidence", "map_confidence", "score"])) or 0.75,
         "curb_height_m": _as_float(_first_present(row, ["curb_height_m", "curb_height", "curb:height", "kerb:height", "kerb_height_m"])),
-        "deployment_clearance_m": _as_float(_first_present(row, ["deployment_clearance_m", "clearance_m", "clear_width_m", "landing_width_m", "landing_width", "ramp_clearance_m"])),
+        "deployment_clearance_m": _as_float(_first_present(row, ["deployment_clearance_m", "clearance_m", "landing_width_m", "ramp_clearance_m"])),
         "sidewalk_width_m": _as_float(_first_present(row, ["sidewalk_width_m", "sidewalk_width", "width_m", "width", "sidewalk:width"])),
         "side": _first_present(row, ["side", "curb_side", "route_side"]),
         "surface": _first_present(row, ["surface", "material"]),
-        "curb_ramp": _bool(_first_present(row, ["curb_ramp", "ramp", "has_ramp", "kerb_ramp"]), False),
+        "running_slope": _as_float(_first_present(row, ["running_slope", "slope", "ramp_slope", "landing_slope"])),
+        "cross_slope": _as_float(_first_present(row, ["cross_slope"])),
+        "curb_ramp": None,
+        "observed_at": d.get("observed_at") or d.get("inspection_date"),
     }
+    raw_ramp = _first_present(row, ["curb_ramp", "ramp", "has_ramp", "kerb_ramp"])
+    if raw_ramp is not None:
+        rec["curb_ramp"] = _bool(raw_ramp, False)
     return rec
 
 
@@ -315,17 +370,53 @@ def _coalesce(*values: Any) -> Any:
     return None
 
 
-def _blockage_from_agents(x: float, y: float, scene: Dict[str, Any], radius: float = 6.0) -> float:
-    count = 0
-    for step in scene.get("agent_history", []) or []:
+def _blockage_from_agents(x: float, y: float, scene: Dict[str, Any], radius: float = 6.0) -> Dict[str, Any]:
+    """Build a *causal* curb-occupancy feature plus a future-only audit label.
+
+    The old implementation pooled every future nuPlan iteration and fed that
+    aggregate back to the planner as ``blockage_risk``.  That leaks future
+    log-play state into the planning input.  The planner-facing risk below uses
+    only the earliest available observation.  Later frames are retained only as
+    a separate label for offline prediction/evaluation and must never be copied
+    into raw planner features.
+    """
+    steps = sorted(
+        [s for s in (scene.get("agent_history", []) or []) if isinstance(s, dict)],
+        key=lambda r: int(r.get("iteration", 0) or 0),
+    )
+    valid = [s for s in steps if s.get("observation_available", True) is not False]
+
+    def occupied(step: Dict[str, Any]) -> bool:
         for obj in step.get("objects", []) or []:
             try:
                 d = math.hypot(float(obj.get("x")) - x, float(obj.get("y")) - y)
             except Exception:
                 continue
             if d <= radius:
-                count += 1
-    return min(0.95, count / 10.0)
+                return True
+        return False
+
+    if not valid:
+        return {
+            "blockage_risk": 1.0,
+            "dynamic_confidence": 0.0,
+            "dynamic_evidence_source": "nuplan_agent_history_missing_fail_closed",
+            "dynamic_evidence_samples": 0,
+            "future_blockage_rate_label": None,
+            "dynamic_input_causal": True,
+        }
+    current = valid[0]
+    current_blocked = occupied(current)
+    future = valid[1:]
+    future_rate = (sum(1 for s in future if occupied(s)) / len(future)) if future else None
+    return {
+        "blockage_risk": 1.0 if current_blocked else 0.0,
+        "dynamic_confidence": 1.0,
+        "dynamic_evidence_source": "nuplan_agent_history_current_observation",
+        "dynamic_evidence_samples": 1,
+        "future_blockage_rate_label": future_rate,
+        "dynamic_input_causal": True,
+    }
 
 
 def _candidate_nodes(graph: AccessibilityGraph, route: List[List[float]], radius: float) -> List[AccessibilityNode]:
@@ -389,12 +480,15 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
             attrs = _nearest_edge_attrs(x, y, graph) if ped_id else {}
             reg = _regulation_match(x, y, regs, args.regulation_snap_tolerance_m, transformer)
             inv = _nearest_inventory_match(x, y, global_inventory, args.inventory_snap_tolerance_m)
-            legal = _bool((reg or {}).get("legal_stop", (reg or {}).get("stopping_allowed", (reg or {}).get("regulation"))), False)
-            blockage = _blockage_from_agents(x, y, scene.metadata if scene else {})
+            reg_view = _regulation_view(reg or {}) if reg else {}
+            legal = _bool(reg_view.get("legal_stop", reg_view.get("stopping_allowed", reg_view.get("regulation"))), False)
+            dynamic_ev = _blockage_from_agents(x, y, scene.metadata if scene else {})
+            blockage = float(dynamic_ev["blockage_risk"])
             candidate_view = _row_view(candidate)
             candidate_source = str(candidate_view.get("source") or args.source_name)
             candidate_id = str(candidate_view.get("regulation_id") or candidate_view.get("anchor_id") or candidate_view.get("id") or f"external_{cidx:05d}")
-            width = _coalesce((inv or {}).get("sidewalk_width_m"), attrs.get("sidewalk_width_m"))
+            inv_width = (inv or {}).get("sidewalk_width_m")
+            width = _coalesce(inv_width, attrs.get("sidewalk_width_m"))
             row = {
                 "anchor_id": f"{eid}:candidate:{candidate_id}",
                 "pudo_id": f"{eid}:candidate:{candidate_id}",
@@ -404,14 +498,44 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "x": x, "y": y,
                 "side": str(_coalesce(candidate_view.get("side"), (inv or {}).get("side"), nearest_route_side([x, y], route) if route else "unknown")),
                 "legal_stop": legal,
-                "legal_stop_source": str((reg or {}).get("source") or (reg or {}).get("regulation_id") or "no_matching_regulation_fail_closed"),
+                "legal_stop_source": str(reg_view.get("source") or "no_matching_regulation_fail_closed"),
+                "legal_stop_tier": source_tier(reg_view) if reg_view else "unknown",
+                "legal_basis": reg_view.get("legal_basis"),
+                "legal_stop_authoritative": reg_view.get("authoritative"),
+                "legal_stop_audited": reg_view.get("audited"),
+                "legal_stop_candidate_only": reg_view.get("candidate_only"),
+                "site_id": (inv or {}).get("site_id") or (inv or {}).get("id") or reg_view.get("site_id") or reg_view.get("regulation_id"),
+                "observed_at": (inv or {}).get("observed_at") or reg_view.get("observed_at"),
+                "auditor_id": (inv or {}).get("auditor_id") or reg_view.get("auditor_id"),
+                "evidence_time_semantics": (inv or {}).get("evidence_time_semantics") or reg_view.get("evidence_time_semantics"),
                 "adjacent_ped_node_id": ped_id,
                 "curb_height_m": (inv or {}).get("curb_height_m"),
                 "sidewalk_width_m": width,
                 "deployment_clearance_m": (inv or {}).get("deployment_clearance_m"),
+                "curb_ramp": (inv or {}).get("curb_ramp"),
+                "running_slope": (inv or {}).get("running_slope"),
+                "cross_slope": (inv or {}).get("cross_slope"),
+                "surface": _coalesce((inv or {}).get("surface"), attrs.get("surface")),
+                "field_provenance": (inv or {}).get("field_provenance") or {},
+                "evidence_tier": (inv or {}).get("evidence_tier"),
+                "authoritative": (inv or {}).get("authoritative"),
+                "audited": (inv or {}).get("audited"),
+                "sidewalk_width_m_source": (inv or {}).get("source") if inv_width is not None else f"pedestrian_graph:{attrs.get('source') or 'nearest_edge'}",
+                "sidewalk_width_m_tier": source_tier(inv or {}) if inv_width is not None else "B_pedestrian_graph",
+                "curb_height_m_source": (inv or {}).get("source"), "curb_height_m_tier": source_tier(inv or {}) if (inv or {}).get("curb_height_m") is not None else "unknown",
+                "deployment_clearance_m_source": (inv or {}).get("source"), "deployment_clearance_m_tier": source_tier(inv or {}) if (inv or {}).get("deployment_clearance_m") is not None else "unknown",
+                "curb_ramp_source": (inv or {}).get("source"), "curb_ramp_tier": source_tier(inv or {}) if (inv or {}).get("curb_ramp") is not None else "unknown",
+                "running_slope_source": (inv or {}).get("source"), "running_slope_tier": source_tier(inv or {}) if (inv or {}).get("running_slope") is not None else "unknown",
+                "cross_slope_source": (inv or {}).get("source"), "cross_slope_tier": source_tier(inv or {}) if (inv or {}).get("cross_slope") is not None else "unknown",
+                "surface_source": (inv or {}).get("source") if (inv or {}).get("surface") is not None else f"pedestrian_graph:{attrs.get('source') or 'nearest_edge'}",
+                "surface_tier": source_tier(inv or {}) if (inv or {}).get("surface") is not None else "B_pedestrian_graph",
                 "blockage_risk": blockage,
-                "map_confidence": min(float(candidate_view.get("confidence", 0.6) or 0.6), float((inv or {}).get("confidence", 1.0) or 1.0), float((reg or {}).get("confidence", 1.0) or 1.0)),
-                "dynamic_confidence": 1.0 - blockage,
+                "map_confidence": min(float(candidate_view.get("confidence", 0.6) or 0.6), float((inv or {}).get("confidence", 1.0) or 1.0), float(reg_view.get("confidence", 1.0) or 1.0)),
+                "dynamic_confidence": float(dynamic_ev["dynamic_confidence"]),
+                "dynamic_evidence_source": dynamic_ev.get("dynamic_evidence_source"),
+                "dynamic_evidence_samples": dynamic_ev.get("dynamic_evidence_samples"),
+                "future_blockage_rate_label": dynamic_ev.get("future_blockage_rate_label"),
+                "dynamic_input_causal": True,
                 "lighting": attrs.get("lighting"), "shelter": attrs.get("shelter"),
                 "candidate_source": candidate_source,
                 "candidate_only": True,
@@ -432,14 +556,19 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
             meta_attrs = graph.metadata.get("node_attributes", {}) if isinstance(graph.metadata, dict) else {}
             nattrs = meta_attrs.get(n.node_id, {}) if isinstance(meta_attrs, dict) else {}
             reg = _regulation_match(n.x, n.y, regs, args.regulation_snap_tolerance_m, transformer)
+            reg_view = _regulation_view(reg or {}) if reg else {}
             inv = _nearest_inventory_match(n.x, n.y, global_inventory, args.inventory_snap_tolerance_m)
-            legal = _bool((reg or {}).get("legal_stop", (reg or {}).get("stopping_allowed", (reg or {}).get("regulation"))), False)
+            legal = _bool(reg_view.get("legal_stop", reg_view.get("stopping_allowed", reg_view.get("regulation"))), False)
             nearest_ped, _ = _nearest_node(n.x, n.y, graph.nodes, {"sidewalk", "crossing", "entrance"})
-            blockage = _blockage_from_agents(n.x, n.y, scene.metadata if scene else {})
-            width = _coalesce(nattrs.get("width_m"), attrs.get("sidewalk_width_m"), (inv or {}).get("sidewalk_width_m"))
-            clearance = _coalesce(nattrs.get("deployment_clearance_m"), (inv or {}).get("deployment_clearance_m"))
-            curb_height = _coalesce(nattrs.get("curb_height_m"), (inv or {}).get("curb_height_m"))
-            confidence_terms = [float(n.confidence), float((reg or {}).get("confidence", 1.0) or 1.0)]
+            dynamic_ev = _blockage_from_agents(n.x, n.y, scene.metadata if scene else {})
+            blockage = float(dynamic_ev["blockage_risk"])
+            inv_width = (inv or {}).get("sidewalk_width_m")
+            inv_clearance = (inv or {}).get("deployment_clearance_m")
+            inv_height = (inv or {}).get("curb_height_m")
+            width = _coalesce(inv_width, nattrs.get("width_m"), attrs.get("sidewalk_width_m"))
+            clearance = _coalesce(inv_clearance, nattrs.get("deployment_clearance_m"))
+            curb_height = _coalesce(inv_height, nattrs.get("curb_height_m"))
+            confidence_terms = [float(n.confidence), float(reg_view.get("confidence", 1.0) or 1.0)]
             if inv:
                 confidence_terms.append(float(inv.get("confidence", 1.0) or 1.0))
             row = {
@@ -453,14 +582,49 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "y": n.y,
                 "side": str(_coalesce(nattrs.get("route_side"), (inv or {}).get("side"), nearest_route_side([n.x, n.y], route) if route else "unknown")),
                 "legal_stop": legal,
-                "legal_stop_source": str((reg or {}).get("source") or (reg or {}).get("regulation_id") or "no_matching_regulation_fail_closed"),
+                "legal_stop_source": str(reg_view.get("source") or "no_matching_regulation_fail_closed"),
+                "legal_stop_tier": source_tier(reg_view) if reg_view else "unknown",
+                "legal_basis": reg_view.get("legal_basis"),
+                "legal_stop_authoritative": reg_view.get("authoritative"),
+                "legal_stop_audited": reg_view.get("audited"),
+                "legal_stop_candidate_only": reg_view.get("candidate_only"),
+                "site_id": (inv or {}).get("site_id") or (inv or {}).get("id") or reg_view.get("site_id") or reg_view.get("regulation_id"),
+                "observed_at": (inv or {}).get("observed_at") or reg_view.get("observed_at"),
+                "auditor_id": (inv or {}).get("auditor_id") or reg_view.get("auditor_id"),
+                "evidence_time_semantics": (inv or {}).get("evidence_time_semantics") or reg_view.get("evidence_time_semantics"),
                 "adjacent_ped_node_id": nearest_ped.node_id if nearest_ped else None,
                 "curb_height_m": curb_height,
                 "sidewalk_width_m": width,
                 "deployment_clearance_m": clearance,
+                "curb_ramp": _coalesce((inv or {}).get("curb_ramp"), nattrs.get("curb_ramp")),
+                "running_slope": _coalesce((inv or {}).get("running_slope"), nattrs.get("running_slope"), nattrs.get("slope")),
+                "cross_slope": _coalesce((inv or {}).get("cross_slope"), nattrs.get("cross_slope")),
+                "surface": _coalesce((inv or {}).get("surface"), nattrs.get("surface"), attrs.get("surface")),
+                "field_provenance": (inv or {}).get("field_provenance") or {},
+                "evidence_tier": (inv or {}).get("evidence_tier"),
+                "authoritative": (inv or {}).get("authoritative"),
+                "audited": (inv or {}).get("audited"),
+                "curb_height_m_source": (inv or {}).get("source") if inv_height is not None else f"accessibility_graph:{n.source}",
+                "curb_height_m_tier": source_tier(inv or {}) if inv_height is not None else "B_pedestrian_graph",
+                "sidewalk_width_m_source": (inv or {}).get("source") if inv_width is not None else f"accessibility_graph:{n.source}",
+                "sidewalk_width_m_tier": source_tier(inv or {}) if inv_width is not None else "B_pedestrian_graph",
+                "deployment_clearance_m_source": (inv or {}).get("source") if inv_clearance is not None else f"accessibility_graph:{n.source}",
+                "deployment_clearance_m_tier": source_tier(inv or {}) if inv_clearance is not None else "B_pedestrian_graph",
+                "curb_ramp_source": (inv or {}).get("source") if (inv or {}).get("curb_ramp") is not None else f"accessibility_graph:{n.source}",
+                "curb_ramp_tier": source_tier(inv or {}) if (inv or {}).get("curb_ramp") is not None else "B_pedestrian_graph",
+                "running_slope_source": (inv or {}).get("source") if (inv or {}).get("running_slope") is not None else f"accessibility_graph:{n.source}",
+                "running_slope_tier": source_tier(inv or {}) if (inv or {}).get("running_slope") is not None else "B_pedestrian_graph",
+                "cross_slope_source": (inv or {}).get("source") if (inv or {}).get("cross_slope") is not None else f"accessibility_graph:{n.source}",
+                "cross_slope_tier": source_tier(inv or {}) if (inv or {}).get("cross_slope") is not None else "B_pedestrian_graph",
+                "surface_source": (inv or {}).get("source") if (inv or {}).get("surface") is not None else f"accessibility_graph:{n.source}",
+                "surface_tier": source_tier(inv or {}) if (inv or {}).get("surface") is not None else "B_pedestrian_graph",
                 "blockage_risk": blockage,
                 "map_confidence": min(confidence_terms),
-                "dynamic_confidence": 1.0 - blockage,
+                "dynamic_confidence": float(dynamic_ev["dynamic_confidence"]),
+                "dynamic_evidence_source": dynamic_ev.get("dynamic_evidence_source"),
+                "dynamic_evidence_samples": dynamic_ev.get("dynamic_evidence_samples"),
+                "future_blockage_rate_label": dynamic_ev.get("future_blockage_rate_label"),
+                "dynamic_input_causal": True,
                 "lighting": attrs.get("lighting"),
                 "shelter": attrs.get("shelter"),
                 "curb_inventory_source": (inv or {}).get("source"),
@@ -492,6 +656,7 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
     out_rows = [_annotate_paper_flags(r) for r in out_rows]
     total = max(1, len(out_rows))
     missing = {k: sum(1 for r in out_rows if r.get(k) is None) for k in CORE}
+    missing_paper = {k: sum(1 for r in out_rows if r.get(k) is None) for k in PAPER_PHYSICAL}
     if args.fail_on_missing_core_evidence:
         bad = {k: v / total for k, v in missing.items() if v / total > args.max_core_missing_rate}
         if bad:
@@ -506,11 +671,13 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
     report = {
         "status": "PASS", "rows": len(out_rows), "missing_core_counts": missing,
         "missing_core_rates": {k: v / total for k, v in missing.items()},
+        "missing_paper_physical_counts": missing_paper,
+        "missing_paper_physical_rates": {k: v / total for k, v in missing_paper.items()},
         "paper_evidence_complete": sum(int(bool(r.get("paper_evidence_complete"))) for r in out_rows),
         "paper_eligible": sum(int(bool(r.get("paper_eligible"))) for r in out_rows),
         "episodes": by_episode, "source": args.source_name,
         "mode": "pudo_generator" if args.accessibility_graph_dir else "pudo_validator",
-        "interpretation": "Unknown candidates are retained. paper_eligible requires independent legality, pedestrian binding, and all three core interface fields.",
+        "interpretation": "Unknown candidates are retained. paper_eligible requires pedestrian binding, Tier-A field-level curb height/sidewalk width/deployment clearance/curb-ramp/running-slope/cross-slope/surface evidence, and independent Tier-A stopping legality with legal_basis.",
     }
     if args.report_json:
         dump_json(args.report_json, report)

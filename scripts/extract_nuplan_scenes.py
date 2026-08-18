@@ -80,6 +80,8 @@ def main() -> None:
     episodes = []
     map_counts = {}
     type_counts = {}
+    absolute_timestamp_scenes = 0
+    time_source_counts = {}
     for rec in adapter.iter_scenarios(args.max_scenarios):
         s = to_dict(rec.scene)
         e = to_dict(rec.episode)
@@ -87,6 +89,11 @@ def main() -> None:
         episodes.append(e)
         map_counts[str(s.get('map_name'))] = map_counts.get(str(s.get('map_name')), 0) + 1
         type_counts[str(s.get('scenario_type'))] = type_counts.get(str(s.get('scenario_type')), 0) + 1
+        smeta = s.get('metadata') or {}
+        if smeta.get('absolute_timestamp_available') is True:
+            absolute_timestamp_scenes += 1
+        tsrc = str(smeta.get('time_source'))
+        time_source_counts[tsrc] = time_source_counts.get(tsrc, 0) + 1
     if not scenes:
         raise RuntimeError('no nuPlan scenes were extracted; check DB folders, map filters, and scenario filters')
     write_jsonl(out / 'scenes.jsonl', scenes)
@@ -97,6 +104,11 @@ def main() -> None:
         'num_scenes': len(scenes),
         'map_counts': map_counts,
         'scenario_type_counts': type_counts,
+        'time_quality': {
+            'absolute_timestamp_scenes': absolute_timestamp_scenes,
+            'absolute_timestamp_rate': absolute_timestamp_scenes / max(1, len(scenes)),
+            'time_source_counts': time_source_counts,
+        },
         'nuplan': {
             'data_root': args.nuplan_data_root or args.nuplan_root,
             'map_root': args.nuplan_map_root,

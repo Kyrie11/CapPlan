@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from capplan.data.accessibility_layer import PreparedAccessibilityBuilder, SyntheticAccessibilityBuilder, attach_pudo_nodes_to_graph, write_accessibility_graph
+from capplan.data.accessibility_layer import PreparedAccessibilityBuilder, SyntheticAccessibilityBuilder, attach_pudo_nodes_to_graph, shortest_accessible_path_stats, NoAccessiblePathError, write_accessibility_graph
 from capplan.data.capability_contracts import load_contracts_from_profiles, sample_contracts_with_pairs
 from capplan.data.label_oracle import IndependentLabelOracle
 from capplan.data.nuplan_adapter import NuPlanAdapter
@@ -159,6 +159,10 @@ def _enforce_paper_vehicle_quality(args: argparse.Namespace, eid: str, vehicles:
         )
 
 
+class PaperEpisodeIneligible(RuntimeError):
+    """Expected per-episode evidence/coverage exclusion in paper subset construction."""
+
+
 def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: Any, origin: EntranceAnchor, destination: EntranceAnchor, pudo: List[PUDOAnchor]) -> None:
     if getattr(args, "source_policy", "bootstrap") == "paper" and not getattr(args, "paper_mode", False):
         raise RuntimeError("--source_policy paper requires --paper_mode")
@@ -175,9 +179,9 @@ def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: An
         if _source_is_synthetic_or_proxy(graph.metadata.get("source")):
             raise RuntimeError(f"paper_mode rejects synthetic/proxy accessibility graph source for {eid}: {graph.metadata.get('source')}")
     if len(graph.nodes) < args.min_graph_nodes or len(graph.edges) < args.min_graph_edges:
-        raise RuntimeError(f"paper_mode graph for {eid} is too small: {len(graph.nodes)} nodes/{len(graph.edges)} edges; required {args.min_graph_nodes}/{args.min_graph_edges}")
+        raise PaperEpisodeIneligible(f"paper_mode graph for {eid} is too small: {len(graph.nodes)} nodes/{len(graph.edges)} edges; required {args.min_graph_nodes}/{args.min_graph_edges}")
     if not pudo:
-        raise RuntimeError(f"paper_mode requires PUDO candidates for {eid}")
+        raise PaperEpisodeIneligible(f"paper_mode requires PUDO candidates for {eid}")
     eligible = []
     evidence_complete = []
     for a in pudo:
@@ -195,12 +199,48 @@ def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: An
         if ok:
             eligible.append(a)
     if len(eligible) < args.min_paper_eligible_pudos_per_episode:
-        raise RuntimeError(
+        raise PaperEpisodeIneligible(
             f"paper_mode requires >= {args.min_paper_eligible_pudos_per_episode} paper-eligible PUDOs for {eid}; "
             f"found {len(eligible)} eligible / {len(evidence_complete)} evidence-complete / {len(pudo)} total. "
             "Unknown/incomplete candidates may remain in the dataset, but cannot be used as main-result service interfaces. "
             "Generate/refresh these flags with scripts/build_pudo_evidence.py after the manual curb, legality, and interface audit."
         )
+
+    # A global count is not enough: the selected service OD must be connected to
+    # independently audited service interfaces at both ends.  Otherwise an
+    # episode may pass the paper gate because two good curbs exist elsewhere in
+    # the crop while the requested origin/destination is unusable.
+    endpoint = {"origin": [], "destination": []}
+    for a in eligible:
+        for side, start, end in [
+            ("origin", origin.anchor_id, a.anchor_id),
+            ("destination", a.anchor_id, destination.anchor_id),
+        ]:
+            try:
+                stats = shortest_accessible_path_stats(graph, start, end)
+            except NoAccessiblePathError:
+                continue
+            if stats.get("distance") is None or float(stats["distance"]) > args.paper_endpoint_max_path_m:
+                continue
+            # Publication endpoint coverage requires a fully observed access path.
+            # Unknown evidence may remain as negative/inconclusive samples, but it
+            # cannot be the only endpoint support for a main-result episode.
+            if stats.get("missing_fields"):
+                continue
+            if stats.get("obstacle"):
+                continue
+            endpoint[side].append((a.anchor_id, float(stats["distance"])))
+    if len(endpoint["origin"]) < args.min_endpoint_paper_eligible_pudos or len(endpoint["destination"]) < args.min_endpoint_paper_eligible_pudos:
+        raise PaperEpisodeIneligible(
+            f"paper_mode endpoint coverage failed for {eid}: origin has {len(endpoint['origin'])}, "
+            f"destination has {len(endpoint['destination'])} fully observed reachable paper PUDOs; "
+            f"required {args.min_endpoint_paper_eligible_pudos} each within {args.paper_endpoint_max_path_m:.1f} m. "
+            "This is an OD/service-layer quality failure, not a reason to impute accessibility fields."
+        )
+    graph.metadata["paper_endpoint_pudo_coverage"] = {
+        "origin": endpoint["origin"], "destination": endpoint["destination"],
+        "max_path_m": args.paper_endpoint_max_path_m,
+    }
 
 
 def _make_accessibility_builder(args: argparse.Namespace):
@@ -239,7 +279,11 @@ def _apply_pudo_evidence_overrides(anchors: List[PUDOAnchor], evidence: Dict[tup
     fields = {
         "curb_height_m", "sidewalk_width_m", "deployment_clearance_m",
         "blockage_risk", "map_confidence", "dynamic_confidence",
-        "lighting", "shelter", "legal_stop", "side", "legal_stop_source", "source",
+        "dynamic_evidence_source", "dynamic_evidence_samples", "future_blockage_rate_label", "dynamic_input_causal",
+        "lighting", "shelter", "legal_stop", "side", "legal_stop_source", "legal_basis",
+        "legal_stop_tier", "site_id", "observed_at", "auditor_id", "evidence_time_semantics",
+        "curb_ramp", "running_slope", "cross_slope", "surface", "step_free",
+        "evidence_tier", "field_provenance", "source",
         "paper_evidence_complete", "paper_eligible", "evidence_status", "evidence_notes",
     }
     updated: List[PUDOAnchor] = []
@@ -325,6 +369,12 @@ def _pudo_anchors_from_evidence_rows(evidence: Dict[tuple[str | None, str], Dict
             side=str(row.get("side", "unknown")),
             legal_stop=_as_bool_field(row.get("legal_stop", row.get("vehicle_stop_feasible", False)), default=False),
             legal_stop_source=str(row.get("legal_stop_source") or row.get("regulation_id") or row.get("curb_regulation_source") or source),
+            legal_basis=row.get("legal_basis"),
+            legal_stop_tier=row.get("legal_stop_tier") or row.get("curb_regulation_tier"),
+            site_id=row.get("site_id") or row.get("curb_inventory_id") or row.get("regulation_id"),
+            observed_at=row.get("observed_at"),
+            auditor_id=row.get("auditor_id"),
+            evidence_time_semantics=row.get("evidence_time_semantics"),
             roadblock_id=row.get("roadblock_id"),
             lane_id=row.get("lane_id"),
             lane_connector_id=row.get("lane_connector_id"),
@@ -332,9 +382,22 @@ def _pudo_anchors_from_evidence_rows(evidence: Dict[tuple[str | None, str], Dict
             curb_height_m=row.get("curb_height_m"),
             sidewalk_width_m=row.get("sidewalk_width_m"),
             deployment_clearance_m=row.get("deployment_clearance_m"),
+            curb_ramp=_as_bool_field(row.get("curb_ramp"), default=False) if row.get("curb_ramp") is not None else None,
+            running_slope=row.get("running_slope"),
+            cross_slope=row.get("cross_slope"),
+            surface=row.get("surface"),
+            step_free=_as_bool_field(row.get("step_free"), default=False) if row.get("step_free") is not None else (
+                _as_bool_field(row.get("curb_ramp"), default=False) if row.get("curb_ramp") is not None else None
+            ),
+            evidence_tier=row.get("evidence_tier"),
+            field_provenance=row.get("field_provenance") if isinstance(row.get("field_provenance"), dict) else {},
             blockage_risk=float(row.get("blockage_risk", row.get("curb_occupancy", 0.0)) or 0.0),
             map_confidence=float(row.get("map_confidence", row.get("confidence", 1.0)) or 1.0),
             dynamic_confidence=float(row.get("dynamic_confidence", row.get("availability", 1.0)) or 1.0),
+            dynamic_evidence_source=row.get("dynamic_evidence_source"),
+            dynamic_evidence_samples=int(row.get("dynamic_evidence_samples")) if row.get("dynamic_evidence_samples") is not None else None,
+            future_blockage_rate_label=float(row.get("future_blockage_rate_label")) if row.get("future_blockage_rate_label") is not None else None,
+            dynamic_input_causal=_as_bool_field(row.get("dynamic_input_causal"), default=False) if row.get("dynamic_input_causal") is not None else None,
             lighting=row.get("lighting"),
             shelter=row.get("shelter"),
             timestamp_s=row.get("timestamp_s"),
@@ -559,6 +622,7 @@ def main() -> None:
     p.add_argument("--max_scenarios", type=int, default=4, help="Maximum matching scenarios; for real nuPlan data, 0 means all.")
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
     p.add_argument("--paper_mode", action="store_true", help="Enable publication-grade data gates: no synthetic/proxy fallbacks, no missing core evidence, and real service/profile/fleet inputs required.")
+    p.add_argument("--paper_ineligible_episode_policy", choices=["fail", "drop"], default="fail", help="Expected paper subset policy for per-episode evidence/endpoint gaps. drop records excluded_episodes.jsonl; source/provenance/schema errors still fail globally.")
     p.add_argument("--source_policy", choices=["bootstrap", "paper"], default="bootstrap", help="Dataset evidence policy recorded in the manifest. paper requires --paper_mode and complete audited evidence.")
     p.add_argument("--external_source_preflight_json", default=None, help="Optional preflight report from prepare_abilitybench_external.py copied into the dataset manifest for auditability.")
     p.add_argument("--require_validated_georeference", action="store_true", help="Paper-mode gate: fail if prepared graph metadata says georeference_validated=false.")
@@ -572,6 +636,8 @@ def main() -> None:
     p.add_argument("--min_graph_edges", type=int, default=150)
     p.add_argument("--max_core_pudo_missing_rate", type=float, default=1.0, help="Deprecated compatibility flag. Missing candidate evidence is allowed; use --min_paper_eligible_pudos_per_episode for paper-mode gating.")
     p.add_argument("--min_paper_eligible_pudos_per_episode", type=int, default=2, help="Paper-mode gate: minimum PUDOs per episode with independent legality evidence, pedestrian binding, and complete curb/interface fields.")
+    p.add_argument("--min_endpoint_paper_eligible_pudos", type=int, default=1, help="Paper-mode gate: minimum fully observed reachable paper PUDOs from the selected origin and to the selected destination.")
+    p.add_argument("--paper_endpoint_max_path_m", type=float, default=500.0, help="Maximum pedestrian path length used only for endpoint coverage gating; capability-specific tighter limits remain in the contract.")
     p.add_argument("--min_edge_positive_rate", type=float, default=0.10)
     p.add_argument("--min_skeleton_positive_rate", type=float, default=0.10)
     p.add_argument("--accessibility_source", choices=["synthetic_local", "synthetic", "prepared_jsonl", "geojson", "opensidewalks"], default="synthetic_local")
@@ -638,6 +704,7 @@ def main() -> None:
     certificate_labels: List[Dict[str, Any]] = []
     counterfactual_pairs: List[Dict[str, Any]] = []
     service_request_records: List[Dict[str, Any]] = []
+    excluded_episodes: List[Dict[str, Any]] = []
 
     scenario_iter = adapter.iter_scenarios(args.max_scenarios)
     if not args.disable_tqdm:
@@ -652,12 +719,11 @@ def main() -> None:
         if args.service_layer_source in {"real_jsonl", "calibrated_od"}:
             requests = service_requests_by_episode.get(eid, [])
             if not requests:
+                if args.paper_mode and args.paper_ineligible_episode_policy == "drop":
+                    excluded_episodes.append({"episode_id": eid, "stage": "service_request", "reason": "no paper service request after endpoint-support filtering"})
+                    continue
                 raise RuntimeError(f"{args.service_layer_source} service layer has no request for episode {eid}")
             request = requests[0]
-            # Persist every same-OD counterfactual request, not just the base
-            # request. Closed-loop evaluation uses these rows to recover the
-            # exact profile/request metadata for each contract.
-            service_request_records.extend(dict(r) for r in requests)
             graph = acc_builder.build(eid, seed=ep.seed)
             try:
                 origin, destination = bind_service_request_to_graph(request, graph)
@@ -677,10 +743,6 @@ def main() -> None:
             graph = acc_builder.build(eid, seed=ep.seed, origin=origin.pose, destination=destination.pose)
             ep.metadata = {**ep.metadata, "service_layer_source": args.service_layer_source}
 
-        entrances.extend([to_dict(origin), to_dict(destination)])
-        scenes.append(to_dict(scene))
-        episodes.append(to_dict(ep))
-
         vehicles = fleet_by_episode.get(eid)
         if vehicles is None and "*" in fleet_by_episode:
             vehicles = [replace(v, episode_id=eid) for v in fleet_by_episode["*"]]
@@ -688,7 +750,6 @@ def main() -> None:
             if args.paper_mode:
                 raise RuntimeError(f"paper_mode requires fleet_jsonl vehicles for episode {eid} or global episode_id='*'")
             vehicles = vehicle_interface_profiles(eid)
-        vehicle_records.extend(to_dict(v) for v in vehicles)
         requested_vehicle_id = (request or {}).get("vehicle_id") or (request or {}).get("fleet_vehicle_id")
         if requested_vehicle_id:
             primary_vehicle = next((v for v in vehicles if v.vehicle_id == requested_vehicle_id), None)
@@ -710,6 +771,9 @@ def main() -> None:
         if args.pudo_source == "evidence_jsonl":
             pudo = _pudo_anchors_from_evidence_rows(pudo_evidence_overrides, eid)
             if not pudo:
+                if args.paper_mode and args.paper_ineligible_episode_policy == "drop":
+                    excluded_episodes.append({"episode_id": eid, "stage": "pudo", "reason": "no PUDO evidence candidates bound to episode"})
+                    continue
                 raise RuntimeError(f"--pudo_source evidence_jsonl has no PUDO candidates for episode {eid}")
         else:
             pudo = pudo_gen.generate(
@@ -724,7 +788,22 @@ def main() -> None:
             )
             pudo = _apply_pudo_evidence_overrides(pudo, pudo_evidence_overrides)
         graph, pudo = attach_pudo_nodes_to_graph(graph, pudo)
-        _enforce_paper_episode_quality(args, eid, graph, origin, destination, pudo)
+        try:
+            _enforce_paper_episode_quality(args, eid, graph, origin, destination, pudo)
+        except PaperEpisodeIneligible as exc:
+            if args.paper_mode and args.paper_ineligible_episode_policy == "drop":
+                excluded_episodes.append({"episode_id": eid, "stage": "dataset_quality_gate", "reason": str(exc)})
+                continue
+            raise
+
+        # Commit episode-scoped rows only after all publication eligibility gates
+        # pass, preventing half-written records when an episode is excluded.
+        entrances.extend([to_dict(origin), to_dict(destination)])
+        scenes.append(to_dict(scene))
+        episodes.append(to_dict(ep))
+        vehicle_records.extend(to_dict(v) for v in vehicles)
+        if request is not None:
+            service_request_records.extend(dict(r) for r in requests)
         write_accessibility_graph(out, graph)
         pudo_records.extend(to_dict(x) for x in pudo)
 
@@ -792,6 +871,7 @@ def main() -> None:
     write_jsonl(out / "certificate_labels.jsonl", certificate_labels)
     write_jsonl(out / "counterfactual_pairs.jsonl", counterfactual_pairs)
     write_jsonl(out / "service_requests.jsonl", service_request_records)
+    write_jsonl(out / "excluded_episodes.jsonl", excluded_episodes)
     _write_splits(out, episodes, dataset_split=args.split, preserve_official_split=(args.scene_source == "nuplan"))
 
     preflight = load_json(args.external_source_preflight_json) if args.external_source_preflight_json else None
@@ -808,6 +888,9 @@ def main() -> None:
         "num_episodes": len(episodes),
         "num_contracts": len(contracts),
         "num_transitions": len(transitions),
+        "paper_ineligible_episode_policy": args.paper_ineligible_episode_policy,
+        "num_excluded_episodes": len(excluded_episodes),
+        "excluded_episodes_file": "excluded_episodes.jsonl",
     }
     dump_json(out / "dataset_manifest.json", manifest)
     validation = validate_dataset(out, strict=args.strict)
