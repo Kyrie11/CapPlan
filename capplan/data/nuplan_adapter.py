@@ -360,29 +360,18 @@ class NuPlanAdapter:
         agents = []
         tls = []
         times = []
-        time_sources: List[str] = []
-        absolute_time_flags: List[bool] = []
         for it in sample_iters:
             ego = scenario.get_ego_state_at_iteration(it) if hasattr(scenario, "get_ego_state_at_iteration") else None
             pose = self._pose_from_ego(ego)
-            t_s, time_source, absolute_time = self._ego_time_seconds(ego, float(it))
+            t_s = float(safe_call(ego, ["time_seconds"], it) or it)
             times.append(t_s)
-            time_sources.append(time_source)
-            absolute_time_flags.append(absolute_time)
             ego_hist.append({"iteration": it, "t": t_s, "x": pose.x, "y": pose.y, "heading": pose.heading, "v": self._ego_velocity(ego), "a": self._ego_accel(ego)})
             tracked = safe_call(scenario, ["get_tracked_objects_at_iteration"], None)
-            tracked_available = True
             try:
                 tracked = scenario.get_tracked_objects_at_iteration(it)
             except Exception:
                 tracked = None
-                tracked_available = False
-            agents.append({
-                "iteration": it,
-                "t": t_s,
-                "observation_available": tracked_available,
-                "objects": self._tracked_to_records(tracked),
-            })
+            agents.append({"iteration": it, "objects": self._tracked_to_records(tracked)})
             try:
                 tl = scenario.get_traffic_light_status_at_iteration(it)
             except Exception:
@@ -411,23 +400,9 @@ class NuPlanAdapter:
             traffic_light_history=tls,
             route_corridor={"roadblock_ids": list(route_ids), "length_m": route_len, "polyline": route_polyline, "polyline_source": "nuplan_map_api_baseline" if len(route_polyline) > 2 else "ego_to_mission_goal_fallback"},
             timestamps_s=times,
-            metadata={
-                "source": "nuplan",
-                "data_root": self.data_root,
-                "db_files": self.db_files,
-                "time_source": time_sources[0] if time_sources and len(set(time_sources)) == 1 else sorted(set(time_sources)),
-                "absolute_timestamp_available": bool(absolute_time_flags) and all(absolute_time_flags),
-                "scene_start_time_us": int(round(times[0] * 1_000_000.0)) if times and absolute_time_flags and absolute_time_flags[0] else None,
-            },
+            metadata={"source": "nuplan", "data_root": self.data_root, "db_files": self.db_files},
         )
-        time_meta = {
-            "source": "nuplan",
-            "route_corridor": scene.route_corridor,
-            "time_source": scene.metadata.get("time_source"),
-            "absolute_timestamp_available": scene.metadata.get("absolute_timestamp_available", False),
-            "scene_start_time_us": scene.metadata.get("scene_start_time_us"),
-        }
-        ep = EpisodeMetadata(eid, str(token), self.split, "origin", "destination", times[0] if times else 0.0, route_len, max(route_len * 0.9, 1.0), self.seed + idx, True, "nuplan", str(map_name), self.map_version, str(token), str(log_name), list(route_ids), time_meta)
+        ep = EpisodeMetadata(eid, str(token), self.split, "origin", "destination", times[0] if times else 0.0, route_len, max(route_len * 0.9, 1.0), self.seed + idx, True, "nuplan", str(map_name), self.map_version, str(token), str(log_name), list(route_ids), {"source": "nuplan", "route_corridor": scene.route_corridor})
         # Keep the map API only in the in-memory record.  The serializable SceneRecord
         # above intentionally stores only map identifiers and route metadata.
         return NuPlanScenarioRecord(ep, scene, ego_hist, agents, {"map_name": map_name, "map_version": self.map_version, "map_api": map_api}, scene.route_corridor)
@@ -451,52 +426,6 @@ class NuPlanAdapter:
             return Pose2D(0.0, 0.0, 0.0, "map")
         axle = safe_call(ego, ["rear_axle", "center"], ego)
         return NuPlanAdapter._pose_from_any(axle)
-
-    @staticmethod
-    def _ego_time_seconds(ego: Any, fallback_s: float) -> tuple[float, str, bool]:
-        """Return the nuPlan ego timestamp in seconds without inventing epoch time.
-
-        nuPlan ``EgoState`` exposes an absolute ``time_point.time_us``.  Older
-        scaffolding in CapPlan looked for a non-standard ``time_seconds``
-        attribute and silently fell back to the iteration index, which made
-        historical evidence alignment look valid while losing the scene clock.
-        This helper prefers the official TimePoint representation and records
-        whether an absolute timestamp was actually available.
-        """
-        if ego is None:
-            return float(fallback_s), "iteration_fallback", False
-
-        time_point = safe_call(ego, ["time_point"], None)
-        if time_point is not None:
-            time_us = safe_call(time_point, ["time_us"], None)
-            if time_us is not None:
-                try:
-                    return float(time_us) / 1_000_000.0, "ego_state.time_point.time_us", True
-                except Exception:
-                    pass
-            time_s = safe_call(time_point, ["time_s", "time_seconds"], None)
-            if time_s is not None:
-                try:
-                    return float(time_s), "ego_state.time_point.seconds", True
-                except Exception:
-                    pass
-
-        # Compatibility only: some test/forked EgoState objects expose a direct
-        # second-valued clock.  Treat this as absolute only when it exists; never
-        # infer epoch time from an iteration index.
-        direct_s = safe_call(ego, ["time_seconds", "time_s"], None)
-        if direct_s is not None:
-            try:
-                return float(direct_s), "ego_state.seconds", True
-            except Exception:
-                pass
-        direct_us = safe_call(ego, ["time_us"], None)
-        if direct_us is not None:
-            try:
-                return float(direct_us) / 1_000_000.0, "ego_state.time_us", True
-            except Exception:
-                pass
-        return float(fallback_s), "iteration_fallback", False
 
     @staticmethod
     def _ego_velocity(ego: Any) -> float:

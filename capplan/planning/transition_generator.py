@@ -60,9 +60,7 @@ class TransitionGenerator:
 
     def _access_transition(self, episode_id: str, graph: AccessibilityGraph, origin_anchor: str, pu: PUDOAnchor) -> CandidateTransition:
         start = origin_anchor
-        # Route to the explicit PUDO curb-interface node so the path must
-        # traverse the curb connector and consume curb-ramp/interface evidence.
-        end = pu.anchor_id
+        end = pu.adjacent_ped_node_id or pu.anchor_id
         try:
             path = shortest_accessible_path_stats(graph, start, end)
             tests = TransitionTests(True, True, True, True, True, not path.get("obstacle", False), ["obstacle_on_path"] if path.get("obstacle") else [])
@@ -180,8 +178,7 @@ class TransitionGenerator:
         )
 
     def _egress_transition(self, episode_id: str, graph: AccessibilityGraph, do: PUDOAnchor, destination_anchor: str, pickup_id: str) -> CandidateTransition:
-        # Egress starts at the explicit curb-interface node for the same reason.
-        start = do.anchor_id
+        start = do.adjacent_ped_node_id or do.anchor_id
         end = destination_anchor
         try:
             path = shortest_accessible_path_stats(graph, start, end)

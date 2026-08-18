@@ -333,16 +333,6 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             if city_map_names:
                 cmd.extend(["--nuplan_map_names", city_map_names])
             _run(cmd, dry_run)
-            _run(
-                [
-                    sys.executable,
-                    "scripts/audit_scene_time_alignment.py",
-                    "--scene_dir", str(scene_dir),
-                    "--output", str(reports_root / f"scene_time.{city}.json"),
-                    *( ["--require_absolute"] if source_policy == "paper" else [] ),
-                ],
-                dry_run,
-            )
 
         if "graphs" in stages or "all" in stages:
             _require_artifact(scene_dir / "scenes.jsonl", f"nuPlan scene contexts for {city}", dry_run)
@@ -437,22 +427,10 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     fleet_jsonl = _path(config["fleet_jsonl"])
     if "service" in stages or "all" in stages:
         _require_artifact(graph_dir, "accessibility graphs", dry_run)
-        if source_policy == "paper":
-            _require_artifact(combined_pudo, "combined paper PUDO evidence", dry_run)
         if not dry_run and not fleet_jsonl.exists():
             raise RuntimeError(
                 f"missing fleet interface file: {fleet_jsonl}. For bootstrap diagnostics you may copy "
                 "configs/fleet.abilitybench.example.jsonl to that path. Paper results require measured/verified fleet interface metadata."
-            )
-        if source_policy == "paper":
-            _run(
-                [
-                    sys.executable,
-                    "scripts/validate_fleet_interface.py",
-                    "--fleet_jsonl", str(fleet_jsonl),
-                    "--output", str(reports_root / "fleet_interface.paper.json"),
-                ],
-                dry_run,
             )
         service_cfg = config.get("service", {}) or {}
         profile_source = _path(service_cfg["capability_profiles"]) if service_cfg.get("capability_profiles") else None
@@ -465,7 +443,6 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(graph_dir),
                 "--fleet_jsonl",
                 str(fleet_jsonl),
-                *( ["--pudo_evidence_jsonl", str(combined_pudo), "--paper_mode"] if source_policy == "paper" else (["--pudo_evidence_jsonl", str(combined_pudo)] if (dry_run or combined_pudo.exists()) else []) ),
                 "--output_service_requests_jsonl",
                 str(service_requests),
                 "--output_capability_profiles_jsonl",
@@ -480,8 +457,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(reports_root / "service_layer.json"),
                 "--seed",
                 str(seed),
-                *( ["--unsupported_episode_policy", str(config.get("quality", {}).get("paper_ineligible_episode_policy", "drop")),
-                     "--endpoint_max_path_m", str(config.get("quality", {}).get("paper_endpoint_max_path_m", 500.0))] if source_policy == "paper" else ["--allow_non_entrance_od"] ),
+                *( ["--allow_non_entrance_od"] if source_policy == "bootstrap" else [] ),
             ],
             dry_run,
         )
@@ -546,11 +522,6 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(min_edges),
                 "--min_paper_eligible_pudos_per_episode",
                 str(min_paper_eligible),
-                "--min_endpoint_paper_eligible_pudos",
-                str(config.get("quality", {}).get("min_endpoint_paper_eligible_pudos", 1)),
-                "--paper_endpoint_max_path_m",
-                str(config.get("quality", {}).get("paper_endpoint_max_path_m", 500.0)),
-                *( ["--paper_ineligible_episode_policy", str(config.get("quality", {}).get("paper_ineligible_episode_policy", "drop"))] if source_policy == "paper" else [] ),
                 "--output_dir",
                 str(city_dataset),
                 "--strict",

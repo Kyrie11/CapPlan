@@ -48,7 +48,7 @@ def _priority(row: Dict[str, Any]) -> Tuple[int, int, float]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--pudo_evidence_jsonl", required=True, action="append", help="Repeat for train/val/test candidate files; all inputs are de-duplicated by physical location.")
+    p.add_argument("--pudo_evidence_jsonl", required=True)
     p.add_argument("--georeference_json", required=True)
     p.add_argument("--city", required=True, choices=["boston", "pittsburgh", "vegas", "singapore"])
     p.add_argument("--output_csv", required=True)
@@ -58,9 +58,7 @@ def main() -> None:
     p.add_argument("--report_json", default=None, help="Optional JSON report path for reproducible build diagnostics.")
     args = p.parse_args()
 
-    rows: List[Dict[str, Any]] = []
-    for input_path in args.pudo_evidence_jsonl:
-        rows.extend(read_jsonl(input_path))
+    rows = list(read_jsonl(args.pudo_evidence_jsonl))
     transformer = CoordinateTransformer.from_file(args.georeference_json)
 
     by_episode: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -110,25 +108,12 @@ def main() -> None:
     out = Path(args.output_csv)
     out.parent.mkdir(parents=True, exist_ok=True)
     fields = [
-        "audit_id", "city", "lon", "lat",
-        "curb_height_m", "curb_height_m_source", "curb_height_m_tier",
-        "sidewalk_width_m", "sidewalk_width_m_source", "sidewalk_width_m_tier",
-        "deployment_clearance_m", "deployment_clearance_m_source", "deployment_clearance_m_tier",
-        "curb_ramp", "curb_ramp_source", "curb_ramp_tier",
-        "running_slope", "running_slope_source", "running_slope_tier",
-        "cross_slope", "cross_slope_source", "cross_slope_tier",
-        "surface", "surface_source", "surface_tier",
-        "permanent_obstruction", "lighting", "shelter",
-        "legal_stop", "legal_stop_source", "legal_stop_tier", "legal_basis", "service_class", "time_window",
-        "entrance_id", "entrance_lon", "entrance_lat", "entrance_source", "entrance_tier",
-        "entrance_access_width_m", "entrance_access_width_m_source", "entrance_access_width_m_tier",
-        "entrance_running_slope", "entrance_running_slope_source", "entrance_running_slope_tier",
-        "entrance_cross_slope", "entrance_cross_slope_source", "entrance_cross_slope_tier",
-        "entrance_surface", "entrance_surface_source", "entrance_surface_tier",
-        "entrance_step_free", "entrance_step_free_source", "entrance_step_free_tier",
-        "observed_at", "auditor_id", "photo_ref", "notes", "audit_method", "manual_confirmed",
+        "audit_id", "city", "lon", "lat", "curb_height_m", "sidewalk_width_m",
+        "deployment_clearance_m", "curb_ramp", "running_slope", "cross_slope",
+        "surface", "legal_stop", "legal_basis", "service_class", "time_window",
+        "entrance_id", "entrance_lon", "entrance_lat", "observed_at", "auditor_id", "photo_ref", "notes",
         "protocol_version", "episode_ids", "candidate_anchor_ids", "candidate_sources",
-        "evidence_status_before_audit", "adjacent_ped_node_ids", "auto_residual_fields",
+        "evidence_status_before_audit", "adjacent_ped_node_ids",
     ]
     with out.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -139,9 +124,7 @@ def main() -> None:
                 "city": args.city,
                 "lon": f"{c['lon']:.8f}", "lat": f"{c['lat']:.8f}",
                 "service_class": "autonomous_mobility",
-                "protocol_version": "abilitybench_manual_audit_v2",
-                "audit_method": "unresolved_evidence_shortlist",
-                "manual_confirmed": "false",
+                "protocol_version": "abilitybench_manual_audit_v1",
                 "episode_ids": ";".join(sorted(x for x in c["episodes"] if x)),
                 "candidate_anchor_ids": ";".join(sorted(x for x in c["anchors"] if x)),
                 "candidate_sources": ";".join(sorted(c["sources"])),
@@ -153,7 +136,6 @@ def main() -> None:
     report = {
         "status": "PASS" if clusters else "FAIL",
         "city": args.city,
-        "input_paths": list(args.pudo_evidence_jsonl),
         "input_rows": len(rows),
         "unresolved_episodes": len(by_episode),
         "selected_rows_before_dedup": len(selected),

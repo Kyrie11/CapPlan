@@ -204,12 +204,6 @@ class PUDOAnchor:
     side: Literal["left", "right", "both", "unknown"]
     legal_stop: bool
     legal_stop_source: str = "synthetic_map"
-    legal_basis: str | None = None
-    legal_stop_tier: str | None = None
-    site_id: str | None = None
-    observed_at: str | None = None
-    auditor_id: str | None = None
-    evidence_time_semantics: str | None = None
     roadblock_id: str | None = None
     lane_id: str | None = None
     lane_connector_id: str | None = None
@@ -217,20 +211,9 @@ class PUDOAnchor:
     curb_height_m: float | None = None
     sidewalk_width_m: float | None = None
     deployment_clearance_m: float | None = None
-    curb_ramp: bool | None = None
-    running_slope: float | None = None
-    cross_slope: float | None = None
-    surface: str | None = None
-    step_free: bool | None = None
-    evidence_tier: str | None = None
-    field_provenance: Dict[str, Any] = field(default_factory=dict)
     blockage_risk: float = 0.0
     map_confidence: float = 1.0
     dynamic_confidence: float = 1.0
-    dynamic_evidence_source: str | None = None
-    dynamic_evidence_samples: int | None = None
-    future_blockage_rate_label: float | None = None
-    dynamic_input_causal: bool | None = None
     lighting: str | None = "day"
     shelter: bool | None = False
     timestamp_s: float | None = None

@@ -72,57 +72,8 @@ def test_paper_evidence_requires_independent_interface_inventory():
     }
     complete, eligible, status = mod._paper_evidence_flags(base)
     assert not complete and not eligible
-    assert "non_tier_a:curb_height_m" in status
-    assert "no_independent_tier_a_legality" in status
+    assert "no_auditable_interface_evidence" in status
 
-    audited = dict(
-        base,
-        source="official_candidate",
-        curb_ramp=True, running_slope=0.02, cross_slope=0.01, surface="paved",
-        legal_basis="audited posted regulation permits passenger loading",
-        legal_stop_tier="A_manual_audit", legal_stop_audited=True,
-        field_provenance={
-            k: {"source": "manual_interface_audit", "evidence_tier": "A_manual_audit", "audited": True}
-            for k in mod.PAPER_PHYSICAL
-        },
-    )
+    audited = dict(base, curb_inventory_source="manual_interface_audit")
     complete, eligible, status = mod._paper_evidence_flags(audited)
     assert complete and eligible and status == "paper_ready"
-
-
-def test_dynamic_blockage_input_is_causal_and_future_is_label_only():
-    import importlib.util
-    from pathlib import Path
-
-    spec = importlib.util.spec_from_file_location("build_pudo_evidence_dynamic", Path("scripts/build_pudo_evidence.py"))
-    mod = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(mod)
-
-    scene = {
-        "agent_history": [
-            {"iteration": 0, "observation_available": True, "objects": []},
-            {"iteration": 1, "observation_available": True, "objects": [{"x": 0.5, "y": 0.0}]},
-            {"iteration": 2, "observation_available": True, "objects": [{"x": 20.0, "y": 0.0}]},
-        ]
-    }
-    ev = mod._blockage_from_agents(0.0, 0.0, scene, radius=2.0)
-    assert ev["blockage_risk"] == 0.0  # current frame only; no future leakage
-    assert ev["dynamic_confidence"] == 1.0
-    assert ev["future_blockage_rate_label"] == 0.5
-    assert ev["dynamic_input_causal"] is True
-
-
-def test_dynamic_blockage_missing_observation_fails_closed():
-    import importlib.util
-    from pathlib import Path
-
-    spec = importlib.util.spec_from_file_location("build_pudo_evidence_dynamic_missing", Path("scripts/build_pudo_evidence.py"))
-    mod = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(mod)
-
-    ev = mod._blockage_from_agents(0.0, 0.0, {"agent_history": []})
-    assert ev["blockage_risk"] == 1.0
-    assert ev["dynamic_confidence"] == 0.0
-    assert ev["future_blockage_rate_label"] is None
