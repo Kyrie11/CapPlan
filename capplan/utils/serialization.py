@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Iterable, List
+from typing import Any, Iterable, Iterator, List
 
 
 def _default(obj: Any) -> Any:
@@ -34,9 +34,21 @@ def write_jsonl(path: str | Path, records: Iterable[Any]) -> None:
             f.write(json.dumps(r, sort_keys=True, default=_default) + "\n")
 
 
-def read_jsonl(path: str | Path) -> List[Any]:
+def iter_jsonl(path: str | Path) -> Iterator[Any]:
+    """Stream JSONL records without materializing the whole file in memory.
+
+    Full four-city nuPlan builds can contain many thousands of scene/PUDO rows;
+    callers that only need one pass should prefer this iterator over
+    :func:`read_jsonl`.
+    """
     p = Path(path)
     if not p.exists():
-        return []
+        return
     with p.open("r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
+
+
+def read_jsonl(path: str | Path) -> List[Any]:
+    return list(iter_jsonl(path))

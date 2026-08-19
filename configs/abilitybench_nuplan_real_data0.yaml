@@ -42,6 +42,11 @@ service:
 
 pudo:
   candidate_radius_m: 120
+  # Full-city graphs can contain hundreds of generic sidewalk vertices near one
+  # route. Keep every explicit curb/curb-ramp/public candidate, but spatially
+  # thin the generic fail-closed fallback before expensive evidence matching.
+  max_fallback_graph_candidates_per_episode: 128
+  fallback_candidate_spacing_m: 20.0
 
 overpass:
   # Explicit `download` stage only; `all` never triggers online scraping.
@@ -54,6 +59,12 @@ splits:
     cities: [boston, pittsburgh, vegas, singapore]
     require_all_cities: true
     db_dirs: [train_boston, train_pittsburgh, train_vegas, train_singapore]
+    # Avoid scanning all four train DB directories once per city.
+    db_dirs_by_city:
+      boston: [train_boston]
+      pittsburgh: [train_pittsburgh]
+      vegas: [train_vegas]
+      singapore: [train_singapore]
     max_scenarios_per_city: 1000
   val:
     # The official val DB directory may contain logs from multiple maps/cities.

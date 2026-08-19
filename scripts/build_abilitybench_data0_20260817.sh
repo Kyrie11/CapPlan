@@ -12,8 +12,19 @@ cd "$CAP_HOME"
 
 runlog() {
   local name="$1"; shift
-  echo "===== ${name} ====="
-  "$@" 2>&1 | tee "$REPORTS/commands/${name}.log"
+  local log="$REPORTS/commands/${name}.log"
+  local start end elapsed rc
+  mkdir -p "$REPORTS/commands"
+  start=$(date +%s)
+  echo "===== ${name} START $(date -Is) =====" | tee "$log"
+  echo "[CAPPLAN_PROGRESS] CAP_NUM_WORKERS=${CAP_NUM_WORKERS:-config-default} command=$*" | tee -a "$log"
+  set +e
+  "$@" 2>&1 | tee -a "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+  end=$(date +%s); elapsed=$((end-start))
+  echo "===== ${name} END rc=${rc} elapsed_s=${elapsed} $(date -Is) =====" | tee -a "$log"
+  return "$rc"
 }
 
 migrate() {
@@ -156,14 +167,68 @@ paper_pilot() {
 
 bootstrap_candidates_full() {
   # Pass 1: enumerate all matching nuPlan scenarios and build candidate
-  # accessibility/PUDO evidence. Do not create publication labels yet.
+  # accessibility/PUDO evidence. Progress is intentionally enabled for full runs.
+  # Set CAP_NUM_WORKERS (start with 4 or 8) to let nuPlan DB scenario discovery
+  # use more CPU; graph/PUDO stages remain memory-bounded and resumable.
   for split in train val test; do
+    echo "[CAPPLAN_PROGRESS] starting full bootstrap split=$split at $(date -Is)"
     runlog "bootstrap_candidates.${split}.all" python scripts/prepare_abilitybench_external.py \
       --config "$CONFIG" --split "$split" --source_policy bootstrap \
       --cities boston+pittsburgh+vegas+singapore --max_scenarios_per_city 0 \
-      --stages preflight,extract,graphs,pudo --disable_tqdm
+      --stages preflight,extract,graphs,pudo
   done
 }
+
+bootstrap_performance_snapshot() {
+  runlog "bootstrap_performance_snapshot" python scripts/summarize_bootstrap_performance.py \
+    --data_root "$DATA_ROOT" --external_root "$EXT" \
+    --output "$REPORTS/bootstrap_performance_snapshot.json"
+}
+
+bootstrap_candidates_full_parallel() {
+  # Optional throughput mode for a large multi-socket server. Cities are fully
+  # independent at candidate-build time, so run a bounded number concurrently.
+  # Start conservatively because Boston/Singapore GIS layers are large.
+  local jobs="${CAP_CITY_JOBS:-2}"
+  local -a cities=(boston pittsburgh vegas singapore)
+  local split city pid failed batch_count
+  [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "CAP_CITY_JOBS must be a positive integer" >&2; return 2; }
+  echo "[CAPPLAN_PROGRESS] parallel city mode CAP_CITY_JOBS=$jobs CAP_NUM_WORKERS=${CAP_NUM_WORKERS:-config-default}"
+  for split in train val test; do
+    runlog "bootstrap_preflight.${split}.parallel" python scripts/prepare_abilitybench_external.py \
+      --config "$CONFIG" --split "$split" --source_policy bootstrap \
+      --cities boston+pittsburgh+vegas+singapore --max_scenarios_per_city 0 --stages preflight
+    local -a batch_pids=()
+    local -a batch_names=()
+    batch_count=0
+    failed=0
+    for city in "${cities[@]}"; do
+      ( runlog "bootstrap_candidates.${split}.${city}.all" python scripts/prepare_abilitybench_external.py \
+          --config "$CONFIG" --split "$split" --source_policy bootstrap \
+          --cities "$city" --max_scenarios_per_city 0 --stages extract,graphs,pudo \
+          --skip_preflight --skip_pudo_concat ) &
+      pid=$!
+      batch_pids+=("$pid")
+      batch_names+=("$city")
+      batch_count=$((batch_count+1))
+      if (( batch_count >= jobs )); then
+        for pid in "${batch_pids[@]}"; do wait "$pid" || failed=1; done
+        batch_pids=(); batch_names=(); batch_count=0
+        (( failed == 0 )) || { echo "Parallel city batch failed for split=$split" >&2; return 1; }
+      fi
+    done
+    for pid in "${batch_pids[@]}"; do wait "$pid" || failed=1; done
+    (( failed == 0 )) || { echo "Parallel city batch failed for split=$split" >&2; return 1; }
+    runlog "bootstrap_candidates.${split}.concat" python scripts/concat_jsonl_files.py \
+      --inputs \
+        "$DATA_ROOT/outputs/prepared/$split/pudo/boston.jsonl" \
+        "$DATA_ROOT/outputs/prepared/$split/pudo/pittsburgh.jsonl" \
+        "$DATA_ROOT/outputs/prepared/$split/pudo/vegas.jsonl" \
+        "$DATA_ROOT/outputs/prepared/$split/pudo/singapore.jsonl" \
+      --output "$DATA_ROOT/outputs/prepared/$split/pudo_evidence.jsonl"
+  done
+}
+
 
 build_site_catalogs() {
   for city in boston pittsburgh vegas singapore; do
@@ -258,7 +323,7 @@ rebuild_paper_evidence_full() {
     runlog "paper_evidence.${split}.all" python scripts/prepare_abilitybench_external.py \
       --config "$CONFIG" --split "$split" --source_policy paper \
       --cities boston+pittsburgh+vegas+singapore --max_scenarios_per_city 0 \
-      --stages preflight,graphs,pudo --disable_tqdm
+      --stages preflight,graphs,pudo
   done
 }
 
@@ -400,6 +465,8 @@ Stages:
   bootstrap-preflight
   bootstrap-pilot
   bootstrap-candidates-full
+  bootstrap-performance-snapshot
+  bootstrap-candidates-full-parallel  # optional; set CAP_CITY_JOBS=2 first
   site-catalogs
   prefill-audits
   classify-audits
@@ -434,6 +501,8 @@ case "${1:-}" in
   bootstrap-preflight) bootstrap_preflight ;;
   bootstrap-pilot) bootstrap_pilot ;;
   bootstrap-candidates-full) bootstrap_candidates_full ;;
+  bootstrap-performance-snapshot) bootstrap_performance_snapshot ;;
+  bootstrap-candidates-full-parallel) bootstrap_candidates_full_parallel ;;
   site-catalogs) build_site_catalogs ;;
   prefill-audits) prefill_audit_worklists ;;
   classify-audits) classify_audits ;;

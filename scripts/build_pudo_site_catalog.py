@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.data.gis_fusion import CoordinateTransformer
-from capplan.utils.serialization import read_jsonl
+from capplan.utils.serialization import iter_jsonl
 
 SPLIT_PRIORITY = {"train": 0, "val": 1, "test": 2}
 
@@ -42,18 +42,25 @@ def _xy(row: Dict[str, Any]) -> Tuple[float, float] | None:
             return None
 
 
-def _priority(row: Dict[str, Any]) -> Tuple[int, int, int, float]:
-    # First prefer a real pedestrian binding, then candidates with a public
-    # source, then evidence-complete negatives (valuable T5 examples), finally
-    # confidence.  Do not prefer 'legal' when legality has no independent source.
+def _priority(row: Dict[str, Any]) -> Tuple[int, int, int, float, float]:
+    # Prefer candidates with an actual pedestrian binding and explicit/public
+    # curb semantics. Generic fallback sidewalk vertices remain available but
+    # do not crowd out curb-ramp or independently sourced candidate locations.
     ped = int(bool(row.get("adjacent_ped_node_id")))
-    source = int(bool(row.get("candidate_source") or row.get("source")))
+    selection = str(row.get("candidate_selection") or "").lower()
+    node_kind = str(row.get("candidate_node_kind") or "").lower()
+    semantic = 3 if selection == "external" or bool(row.get("candidate_only")) else 2 if selection == "explicit" or node_kind in {"curb", "curb_ramp"} else 0
     complete_negative = int(bool(row.get("paper_evidence_complete")) and not bool(row.get("paper_eligible")))
+    try:
+        route_distance = float(row.get("candidate_route_distance_m"))
+    except Exception:
+        route_distance = float("inf")
     try:
         conf = float(row.get("map_confidence") or 0.0)
     except Exception:
         conf = 0.0
-    return ped, source, complete_negative, conf
+    # reverse=True below: smaller route distance is better, hence negative.
+    return ped, semantic, complete_negative, -route_distance, conf
 
 
 def _parse_input(spec: str) -> Tuple[str, Path]:
@@ -86,7 +93,7 @@ def main() -> None:
     for split, path in inputs:
         if not path.exists():
             raise FileNotFoundError(path)
-        for row in read_jsonl(path):
+        for row in iter_jsonl(path):
             input_counts[split] += 1
             if bool(row.get("paper_eligible")) and not args.include_paper_eligible:
                 continue

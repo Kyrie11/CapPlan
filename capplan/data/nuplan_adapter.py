@@ -333,10 +333,13 @@ class NuPlanAdapter:
                         continue
         if scenarios is None:
             raise RuntimeError("nuPlan scenario builder did not expose a usable get_scenarios API")
-        scenario_list = list(scenarios)
-        if scenario_limit is not None:
-            scenario_list = scenario_list[:scenario_limit]
-        for idx, scenario in enumerate(scenario_list):
+        # Do not materialize/copy the complete scenario iterable here.  In full
+        # four-city builds the builder may expose many thousands of scenarios;
+        # a second ``list(...)`` copy adds avoidable peak memory and delays the
+        # first visible progress update.
+        for idx, scenario in enumerate(scenarios):
+            if scenario_limit is not None and idx >= scenario_limit:
+                break
             yield self._extract_real_scenario(scenario, idx)
 
     def _extract_real_scenario(self, scenario: Any, idx: int) -> NuPlanScenarioRecord:  # pragma: no cover - requires nuPlan installation/data
@@ -400,7 +403,15 @@ class NuPlanAdapter:
             traffic_light_history=tls,
             route_corridor={"roadblock_ids": list(route_ids), "length_m": route_len, "polyline": route_polyline, "polyline_source": "nuplan_map_api_baseline" if len(route_polyline) > 2 else "ego_to_mission_goal_fallback"},
             timestamps_s=times,
-            metadata={"source": "nuplan", "data_root": self.data_root, "db_files": self.db_files},
+            # Never duplicate the complete split DB-path list into every scene.
+            # The expanded list is already recorded once in the extraction
+            # manifest.  Repeating thousands of paths per episode made full
+            # builds needlessly large and expensive to serialize/read.
+            metadata={
+                "source": "nuplan",
+                "data_root": self.data_root,
+                "db_files_count": len(self.db_files) if isinstance(self.db_files, list) else None,
+            },
         )
         ep = EpisodeMetadata(eid, str(token), self.split, "origin", "destination", times[0] if times else 0.0, route_len, max(route_len * 0.9, 1.0), self.seed + idx, True, "nuplan", str(map_name), self.map_version, str(token), str(log_name), list(route_ids), {"source": "nuplan", "route_corridor": scene.route_corridor})
         # Keep the map API only in the in-memory record.  The serializable SceneRecord

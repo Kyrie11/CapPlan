@@ -28,7 +28,7 @@ except Exception:  # pragma: no cover - yaml is project dependency but keep robu
     yaml = None
 
 from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, AccessibilityNode, Pose2D, to_dict
-from capplan.utils.serialization import load_json, read_jsonl
+from capplan.utils.serialization import iter_jsonl, load_json, read_jsonl
 
 EARTH_RADIUS_M = 6_378_137.0
 
@@ -529,6 +529,75 @@ def _dist_point_segment(px: float, py: float, ax: float, ay: float, bx: float, b
     return math.hypot(px - cx, py - cy)
 
 
+
+def _geometry_intersects_bbox(geometry: Sequence[Sequence[float]], bbox: Tuple[float, float, float, float]) -> bool:
+    """Return whether a point/polyline geometry intersects an axis-aligned box.
+
+    The previous crop accepted a line only when one of its vertices was inside
+    the scene box, which could drop a long sidewalk segment that crosses the box
+    with both endpoints outside.  This exact segment/rectangle test fixes that
+    correctness issue while the feature-bounds index avoids scanning every city
+    feature for every episode.
+    """
+    if not geometry:
+        return False
+    xmin, ymin, xmax, ymax = bbox
+    for p in geometry:
+        if xmin <= float(p[0]) <= xmax and ymin <= float(p[1]) <= ymax:
+            return True
+    # Liang-Barsky clipping for each polyline segment.
+    for a, b in zip(geometry[:-1], geometry[1:]):
+        x0, y0 = float(a[0]), float(a[1])
+        x1, y1 = float(b[0]), float(b[1])
+        dx, dy = x1 - x0, y1 - y0
+        pvals = (-dx, dx, -dy, dy)
+        qvals = (x0 - xmin, xmax - x0, y0 - ymin, ymax - y0)
+        u1, u2 = 0.0, 1.0
+        ok = True
+        for pp, qq in zip(pvals, qvals):
+            if abs(pp) <= 1e-15:
+                if qq < 0:
+                    ok = False; break
+                continue
+            t = qq / pp
+            if pp < 0:
+                if t > u2: ok = False; break
+                u1 = max(u1, t)
+            else:
+                if t < u1: ok = False; break
+                u2 = min(u2, t)
+        if ok and u1 <= u2:
+            return True
+    return False
+
+
+class GISFeatureSpatialIndex:
+    """Vectorized feature-bounds index for repeated per-scene GIS crops."""
+
+    def __init__(self, features: Sequence[GISFeature]) -> None:
+        import numpy as np
+        self.features = features
+        bounds = np.empty((len(features), 4), dtype=np.float64)
+        for i, f in enumerate(features):
+            if not f.geometry:
+                bounds[i] = (np.inf, np.inf, -np.inf, -np.inf)
+                continue
+            xs = [float(p[0]) for p in f.geometry]
+            ys = [float(p[1]) for p in f.geometry]
+            bounds[i] = (min(xs), min(ys), max(xs), max(ys))
+        self.bounds = bounds
+
+    def query(self, bbox: Tuple[float, float, float, float]) -> List[GISFeature]:
+        import numpy as np
+        if len(self.features) == 0:
+            return []
+        xmin, ymin, xmax, ymax = bbox
+        b = self.bounds
+        mask = (b[:, 0] <= xmax) & (b[:, 2] >= xmin) & (b[:, 1] <= ymax) & (b[:, 3] >= ymin)
+        idxs = np.flatnonzero(mask)
+        return [self.features[int(i)] for i in idxs if _geometry_intersects_bbox(self.features[int(i)].geometry, bbox)]
+
+
 def distance_to_polyline(point: Sequence[float], polyline: Sequence[Sequence[float]]) -> float:
     if not polyline:
         return float("inf")
@@ -565,30 +634,56 @@ def _in_bbox(pt: Sequence[float], bbox: Tuple[float, float, float, float]) -> bo
     return bbox[0] <= float(pt[0]) <= bbox[2] and bbox[1] <= float(pt[1]) <= bbox[3]
 
 
-def read_scene_contexts(scene_dataset_dir: str | Path | None, episode_ids: Sequence[str], buffer_m: float) -> List[SceneContext]:
-    contexts: List[SceneContext] = []
+def iter_scene_contexts(scene_dataset_dir: str | Path | None, episode_ids: Sequence[str], buffer_m: float) -> Iterator[SceneContext]:
+    """Stream scene contexts instead of loading full nuPlan scene JSONL into RAM."""
+    wanted = set(episode_ids) if episode_ids and set(episode_ids) != {"shared"} else None
+    emitted = 0
     if scene_dataset_dir:
         root = Path(scene_dataset_dir)
         for file in [root / "scenes.jsonl", root / "scenes.json", root / "episodes.jsonl"]:
-            if file.exists():
-                rows = read_jsonl(file) if file.suffix == ".jsonl" else _read_any(file)
-                for row in rows:
-                    eid = str(row.get("episode_id") or row.get("scenario_id") or "shared")
-                    rc = row.get("route_corridor") or row.get("metadata", {}).get("route_corridor") or {}
-                    poly = rc.get("polyline") or row.get("route_polyline") or []
-                    if not poly:
-                        p0 = row.get("initial_ego_pose") or {}
-                        pg = row.get("mission_goal") or {}
-                        if p0 and pg:
-                            poly = [[p0.get("x", 0.0), p0.get("y", 0.0)], [pg.get("x", 0.0), pg.get("y", 0.0)]]
-                    poly = [[float(p[0]), float(p[1])] for p in poly if isinstance(p, (list, tuple)) and len(p) >= 2]
-                    contexts.append(SceneContext(eid, row.get("map_name"), poly, _bbox(poly, buffer_m) if poly else None, row))
-                break
-    if contexts:
-        wanted = set(episode_ids) if episode_ids else None
-        return [c for c in contexts if wanted is None or c.episode_id in wanted] or contexts
-    ids = list(episode_ids) or ["shared"]
-    return [SceneContext(eid) for eid in ids]
+            if not file.exists():
+                continue
+            rows = iter_jsonl(file) if file.suffix == ".jsonl" else iter(_read_any(file))
+            for row in rows:
+                eid = str(row.get("episode_id") or row.get("scenario_id") or "shared")
+                if wanted is not None and eid not in wanted:
+                    continue
+                rc = row.get("route_corridor") or row.get("metadata", {}).get("route_corridor") or {}
+                poly = rc.get("polyline") or row.get("route_polyline") or []
+                if not poly:
+                    p0 = row.get("initial_ego_pose") or {}
+                    pg = row.get("mission_goal") or {}
+                    if p0 and pg:
+                        poly = [[p0.get("x", 0.0), p0.get("y", 0.0)], [pg.get("x", 0.0), pg.get("y", 0.0)]]
+                poly = [[float(p[0]), float(p[1])] for p in poly if isinstance(p, (list, tuple)) and len(p) >= 2]
+                emitted += 1
+                yield SceneContext(eid, row.get("map_name"), poly, _bbox(poly, buffer_m) if poly else None, row)
+            break
+    if emitted:
+        return
+    if wanted:
+        for eid in sorted(wanted):
+            yield SceneContext(eid)
+    elif not scene_dataset_dir:
+        yield SceneContext("shared")
+
+
+def read_scene_contexts(scene_dataset_dir: str | Path | None, episode_ids: Sequence[str], buffer_m: float) -> List[SceneContext]:
+    return list(iter_scene_contexts(scene_dataset_dir, episode_ids, buffer_m))
+
+
+def scene_context_count(scene_dataset_dir: str | Path | None) -> Optional[int]:
+    """Return a cheap expected scene count from the extraction manifest."""
+    if not scene_dataset_dir:
+        return None
+    manifest = Path(scene_dataset_dir) / "scene_context_manifest.json"
+    if not manifest.exists():
+        return None
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        return int(payload.get("num_scenes")) if payload.get("num_scenes") is not None else None
+    except Exception:
+        return None
 
 
 def _node_attrs_from_feature(f: GISFeature) -> Dict[str, Any]:
@@ -633,6 +728,8 @@ class AccessibilityFusionBuilder:
         self.transformer = transformer
         self.snap_tolerance_m = float(snap_tolerance_m)
         self.source_name = source_name
+        self._feature_index: GISFeatureSpatialIndex | None = None
+        self._feature_index_source_id: int | None = None
 
     def build_for_scene(self, scene: SceneContext, features: List[GISFeature], min_nodes: int = 0, min_edges: int = 0, add_bidirectional: bool = True, pudo_connector_radius_m: float = 75.0) -> AccessibilityGraph:
         feats = self._crop(features, scene)
@@ -705,6 +802,7 @@ class AccessibilityFusionBuilder:
             "snap_tolerance_m": self.snap_tolerance_m,
             "pudo_connector_radius_m": pudo_connector_radius_m,
             "node_attributes": node_extra,
+            "features_cropped": len(feats),
             "skipped_non_routable_linear_features": skipped_linear_kinds,
         })
         if len(graph.nodes) < min_nodes or len(graph.edges) < min_edges:
@@ -714,11 +812,10 @@ class AccessibilityFusionBuilder:
     def _crop(self, features: List[GISFeature], scene: SceneContext) -> List[GISFeature]:
         if scene.bbox is None:
             return features
-        out = []
-        for f in features:
-            if any(_in_bbox(p, scene.bbox) for p in f.geometry):
-                out.append(f)
-        return out
+        if self._feature_index is None or self._feature_index_source_id != id(features):
+            self._feature_index = GISFeatureSpatialIndex(features)
+            self._feature_index_source_id = id(features)
+        return self._feature_index.query(scene.bbox)
 
     def _nearest_ped_node(self, nid: str, nodes: Dict[str, AccessibilityNode], exclude_kinds: set[str]) -> Tuple[Optional[str], float]:
         n = nodes[nid]
@@ -732,11 +829,31 @@ class AccessibilityFusionBuilder:
         return best, best_d
 
     def _snap_point_nodes(self, nodes: Dict[str, AccessibilityNode], edges: List[AccessibilityEdge], target_kinds: set[str], edge_kind: str) -> None:
+        # Point-to-pedestrian snapping only needs neighbors inside the connector
+        # threshold.  A uniform metric grid preserves the exact nearest choice
+        # within that radius while avoiding O(num_target * num_nodes) scans.
+        max_d = max(25.0, self.snap_tolerance_m * 4)
+        cell = max_d
+        exclude = target_kinds | {"poi"}
+        grid: Dict[Tuple[int, int], List[str]] = {}
+        for oid, o in nodes.items():
+            if o.kind in exclude:
+                continue
+            key = (math.floor(o.x / cell), math.floor(o.y / cell))
+            grid.setdefault(key, []).append(oid)
         for nid, n in list(nodes.items()):
             if n.kind not in target_kinds:
                 continue
-            other, d = self._nearest_ped_node(nid, nodes, exclude_kinds=target_kinds | {"poi"})
-            if other and d <= max(25.0, self.snap_tolerance_m * 4):
+            cx, cy = math.floor(n.x / cell), math.floor(n.y / cell)
+            other, d = None, float("inf")
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for oid in grid.get((cx + dx, cy + dy), []):
+                        o = nodes[oid]
+                        dd = math.hypot(n.x - o.x, n.y - o.y)
+                        if dd < d:
+                            other, d = oid, dd
+            if other and d <= max_d:
                 o = nodes[other]
                 eid = f"{edge_kind}:{nid}:{other}"
                 geom = [[n.x, n.y], [o.x, o.y]]

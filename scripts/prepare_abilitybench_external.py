@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover - tqdm is optional in bare environments
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from capplan.data.external_validation import inspect_source, validate_external_config
-from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
+from capplan.utils.serialization import dump_json, iter_jsonl
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -55,9 +55,16 @@ def _split_csv(value: str | Iterable[str] | None) -> str | None:
 
 def _run(cmd: List[str], dry_run: bool) -> None:
     rendered = " ".join(shlex.quote(x) for x in cmd)
-    print(rendered)
-    if not dry_run:
+    print(rendered, flush=True)
+    if dry_run:
+        return
+    started = time.perf_counter()
+    try:
         subprocess.check_call(cmd, cwd=PROJECT_ROOT)
+    finally:
+        elapsed = time.perf_counter() - started
+        tool = Path(cmd[1] if len(cmd) > 1 and Path(cmd[0]).name.startswith("python") else cmd[0]).name
+        print(f"[CAPPLAN_TIMING] tool={tool} elapsed_s={elapsed:.3f}", flush=True)
 
 
 def _progress(items: Iterable[str], desc: str, disable: bool = False):
@@ -133,10 +140,46 @@ def _download_overpass(query_file: Path, output_file: Path, endpoint: str, dry_r
 
 
 def _concat_jsonl(inputs: Iterable[Path], output: Path) -> None:
-    rows: List[Dict[str, Any]] = []
-    for p in inputs:
-        rows.extend(read_jsonl(p))
-    write_jsonl(output, rows)
+    """Stream-concatenate city PUDO files without materializing all rows."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    part = output.with_suffix(output.suffix + ".part")
+    part.unlink(missing_ok=True)
+    count = 0
+    with part.open("w", encoding="utf-8") as dst:
+        for p in inputs:
+            for row in iter_jsonl(p):
+                dst.write(json.dumps(row, sort_keys=True) + "\n")
+                count += 1
+    part.replace(output)
+    print(f"[CAPPLAN_PROGRESS] concatenated_pudo_rows={count} output={output}", flush=True)
+
+
+def _resolve_city_db_dirs(split_cfg: Dict[str, Any], city_cfg: Dict[str, Any], city: str) -> List[str]:
+    """Resolve the minimum DB-directory set needed for one city.
+
+    Full train data is stored in four city-specific directories.  The previous
+    pipeline passed all four directories to *every* city extraction and then
+    filtered by map name, causing the complete train DB inventory to be scanned
+    four times.  Prefer an explicit db_dirs_by_city mapping; otherwise infer a
+    unique city-named directory for backward compatibility.
+    """
+    by_city = split_cfg.get("db_dirs_by_city") or {}
+    if isinstance(by_city, dict) and by_city.get(city):
+        value = by_city[city]
+        return [x for x in (_split_csv(value) or "").split("+") if x]
+    if city_cfg.get("db_dirs"):
+        return [x for x in (_split_csv(city_cfg.get("db_dirs")) or "").split("+") if x]
+    split_dirs = [x for x in (_split_csv(split_cfg.get("db_dirs")) or "").split("+") if x]
+    if len(split_dirs) <= 1:
+        return split_dirs
+    aliases = {
+        "boston": ("boston",),
+        "pittsburgh": ("pittsburgh",),
+        "vegas": ("vegas", "las_vegas", "las-vegas"),
+        "singapore": ("singapore",),
+    }.get(city, (city,))
+    matches = [d for d in split_dirs if any(alias in Path(d).name.lower() for alias in aliases)]
+    return matches if len(matches) == 1 else split_dirs
 
 
 def _city_source(city: str, city_cfg: Dict[str, Any], key: str, default_root: Path, default_name: str) -> Path:
@@ -208,7 +251,7 @@ def _require_artifact(path: Path, label: str, dry_run: bool) -> None:
         raise RuntimeError(f"{label} is missing or invalid: {path}; errors={report.errors}")
 
 
-def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dry_run: bool, disable_tqdm: bool = False, source_policy_override: str | None = None, cities_override: str | None = None, max_scenarios_override: int | None = None, episode_allowlist_override: str | None = None) -> None:
+def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dry_run: bool, disable_tqdm: bool = False, source_policy_override: str | None = None, cities_override: str | None = None, max_scenarios_override: int | None = None, episode_allowlist_override: str | None = None, skip_preflight: bool = False, skip_pudo_concat: bool = False) -> None:
     nuplan = config["nuplan"]
     external_root = _path(config.get("external_root", "{project_root}/data/external"))
     outputs_root = _path(config.get("outputs_root", "{project_root}/data/outputs"))
@@ -232,7 +275,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     episode_allowlist = _path(episode_allowlist_override) if episode_allowlist_override else None
     if episode_allowlist is not None and not dry_run and not episode_allowlist.exists():
         raise FileNotFoundError(episode_allowlist)
-    num_workers = int(config.get("num_workers", 0))
+    num_workers = int(os.environ.get("CAP_NUM_WORKERS", config.get("num_workers", 0)))
     seed = int(config.get("seed", 13))
     min_nodes = int(config.get("quality", {}).get("min_graph_nodes", 100))
     min_edges = int(config.get("quality", {}).get("min_graph_edges", 150))
@@ -294,7 +337,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             dry_run,
         )
 
-    if stages.intersection({"preflight", "graphs", "pudo", "dataset", "all"}):
+    if stages.intersection({"preflight", "graphs", "pudo", "dataset", "all"}) and not skip_preflight:
         preflight_report = _write_source_preflight_report(config, cities, prepared_root, source_policy, dry_run)
         if not dry_run:
             dump_json(reports_root / "external_source_preflight.json", preflight_report)
@@ -305,7 +348,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
         city_cfg = config["cities"][city]
         scene_dir = prepared_root / "scene_contexts" / city
         scene_dirs[city] = scene_dir
-        city_db_dirs = split_cfg.get("db_dirs") or city_cfg.get("db_dirs")
+        city_db_dirs = _resolve_city_db_dirs(split_cfg, city_cfg, city)
         city_map_names = _split_csv(city_cfg.get("map_names"))
 
         if "extract" in stages or "all" in stages:
@@ -326,7 +369,6 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 split_name,
                 "--max_scenarios",
                 str(max_per_city),
-                *( ["--episode_allowlist", str(episode_allowlist)] if episode_allowlist else [] ),
                 "--num_workers",
                 str(num_workers),
                 "--seed",
@@ -336,6 +378,9 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             ]
             if city_map_names:
                 cmd.extend(["--nuplan_map_names", city_map_names])
+            if disable_tqdm:
+                cmd.append("--disable_tqdm")
+            print(f"[CAPPLAN_PROGRESS] split={split_name} city={city} stage=extract db_dirs={city_db_dirs} workers={num_workers}", flush=True)
             _run(cmd, dry_run)
 
         if "graphs" in stages or "all" in stages:
@@ -373,6 +418,12 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(reports_root / f"graph_source.{city}.json"),
                 "--quality_report_json",
                 str(reports_root / f"graph_quality.{city}.json"),
+                "--timing_report_json",
+                str(reports_root / f"graph_timing.{city}.json"),
+                "--compact_storage",
+                "--resume",
+                "--num_workers",
+                str(num_workers),
             ]
             if disable_tqdm:
                 cmd.append("--disable_tqdm")
@@ -409,6 +460,13 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 f"{city}_city_curb_regulation_inventory" if source_policy == "paper" else f"{city}_bootstrap_osm_pudo_candidates",
                 "--report_json",
                 str(reports_root / f"pudo.{city}.json"),
+                "--timing_report_json",
+                str(reports_root / f"pudo_timing.{city}.json"),
+                "--max_fallback_graph_candidates_per_episode",
+                str(config.get("pudo", {}).get("max_fallback_graph_candidates_per_episode", 128)),
+                "--fallback_candidate_spacing_m",
+                str(config.get("pudo", {}).get("fallback_candidate_spacing_m", 20.0)),
+                "--resume",
             ]
             missing_pudo_sources: List[str] = []
             pudo_cmd += ["--georeference_json", str(_path(city_cfg["georeference_json"]))]
@@ -419,10 +477,13 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 _add_source_arg(pudo_cmd, "--pudo_candidate_source", candidate_path, dry_run, required=False, missing=missing_pudo_sources)
             if missing_pudo_sources:
                 raise RuntimeError("missing PUDO paper sources: " + "; ".join(missing_pudo_sources))
+            if disable_tqdm:
+                pudo_cmd.append("--disable_tqdm")
+            print(f"[CAPPLAN_PROGRESS] split={split_name} city={city} stage=pudo", flush=True)
             _run(pudo_cmd, dry_run)
 
     combined_pudo = prepared_root / "pudo_evidence.jsonl"
-    if ("pudo" in stages or "all" in stages) and not dry_run:
+    if ("pudo" in stages or "all" in stages) and not dry_run and not skip_pudo_concat:
         _concat_jsonl(pudo_city_files, combined_pudo)
         print(f"wrote {combined_pudo}")
 
@@ -472,7 +533,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
 
     for city in _progress(cities, f"{split_name}: dataset build", disable_tqdm):
         city_cfg = config["cities"][city]
-        city_db_dirs = split_cfg.get("db_dirs") or city_cfg.get("db_dirs")
+        city_db_dirs = _resolve_city_db_dirs(split_cfg, city_cfg, city)
         city_map_names = _split_csv(city_cfg.get("map_names"))
         city_dataset = outputs_root / "datasets" / f"abilitybench_av_{split_name}_{city}"
         dataset_city_dirs.append(city_dataset)
@@ -598,11 +659,13 @@ def main() -> None:
     p.add_argument("--cities", default=None, help="Optional comma/plus-separated city subset for fast diagnostics, e.g. boston or boston+vegas.")
     p.add_argument("--max_scenarios_per_city", type=int, default=None, help="Override config split max_scenarios_per_city. For real nuPlan data, 0 means all matching scenarios.")
     p.add_argument("--episode_allowlist", default=None, help="Optional split-level text/JSON episode allowlist produced from audited paper evidence. Applied to service and dataset stages; candidate extraction/graphs/PUDO remain complete.")
+    p.add_argument("--skip_preflight", action="store_true", help="Internal/advanced: skip automatic external-source preflight when a parent orchestration already ran it.")
+    p.add_argument("--skip_pudo_concat", action="store_true", help="Internal/advanced: leave per-city PUDO files unmerged for parallel city orchestration.")
     args = p.parse_args()
     stages = {x.strip() for x in args.stages.split(",") if x.strip()}
     config = _load_config(args.config)
     config["_config_path"] = args.config
-    build_pipeline(config, args.split, stages, args.dry_run, args.disable_tqdm, args.source_policy, args.cities, args.max_scenarios_per_city, args.episode_allowlist)
+    build_pipeline(config, args.split, stages, args.dry_run, args.disable_tqdm, args.source_policy, args.cities, args.max_scenarios_per_city, args.episode_allowlist, args.skip_preflight, args.skip_pudo_concat)
 
 
 if __name__ == "__main__":

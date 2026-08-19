@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -13,8 +14,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.data.gis_fusion import (
     AccessibilityFusionBuilder,
     CoordinateTransformer,
+    iter_scene_contexts,
     load_gis_features,
     read_scene_contexts,
+    scene_context_count,
 )
 from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, AccessibilityNode, Pose2D, to_dict
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
@@ -130,10 +133,50 @@ def _episode_ids(value: str | None) -> List[str]:
     return [x.strip() for x in (value or "shared").replace(",", "+").split("+") if x.strip()]
 
 
-def _write_graph(out: Path, graph: AccessibilityGraph) -> None:
+def _write_graph(out: Path, graph: AccessibilityGraph, compact_storage: bool = False) -> Dict[str, Any]:
+    """Write one per-episode graph and return compact build metadata.
+
+    ``compact_storage`` avoids serializing nodes/edges a second time inside
+    ``<episode>.jsonl``.  PUDO generation reads ``<episode>.meta.json`` for graph
+    metadata and the canonical ``.nodes/.edges`` files for topology.
+    """
+    started = time.perf_counter()
     write_jsonl(out / f"{graph.episode_id}.nodes.jsonl", [to_dict(n) for n in graph.nodes])
     write_jsonl(out / f"{graph.episode_id}.edges.jsonl", [to_dict(e) for e in graph.edges])
-    write_jsonl(out / f"{graph.episode_id}.jsonl", [to_dict(graph)])
+    if compact_storage:
+        dump_json(out / f"{graph.episode_id}.meta.json", {"episode_id": graph.episode_id, "metadata": graph.metadata})
+        (out / f"{graph.episode_id}.jsonl").unlink(missing_ok=True)
+    else:
+        write_jsonl(out / f"{graph.episode_id}.jsonl", [to_dict(graph)])
+    meta = {
+        "status": "PASS", "episode_id": graph.episode_id,
+        "source": (graph.metadata or {}).get("source"),
+        "nodes": len(graph.nodes), "edges": len(graph.edges),
+        "features_cropped": int((graph.metadata or {}).get("features_cropped", 0) or 0),
+        "compact_storage": bool(compact_storage),
+        "write_s": time.perf_counter() - started,
+    }
+    dump_json(out / f"{graph.episode_id}.build.json", meta)
+    return meta
+
+
+def _resume_graph_stats(out: Path, episode_id: str, compact_storage: bool) -> Optional[Dict[str, Any]]:
+    marker = out / f"{episode_id}.build.json"
+    nodes = out / f"{episode_id}.nodes.jsonl"
+    edges = out / f"{episode_id}.edges.jsonl"
+    meta = out / f"{episode_id}.meta.json"
+    full = out / f"{episode_id}.jsonl"
+    if not marker.exists() or not nodes.exists() or not edges.exists():
+        return None
+    if compact_storage and not meta.exists():
+        return None
+    if not compact_storage and not full.exists():
+        return None
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        return payload if payload.get("status") == "PASS" else None
+    except Exception:
+        return None
 
 
 
@@ -226,7 +269,7 @@ def _build_prepared(args: argparse.Namespace) -> Dict[str, Any]:
     episodes = _episode_ids(args.episode_ids)
     for eid in episodes:
         graph = AccessibilityGraph(eid, nodes, edges, {"source": args.source_name, "builder": "prepared_jsonl_validator", "episode_radius_m": args.episode_radius_m, "snap_tolerance_m": args.snap_tolerance_m})
-        _write_graph(out, graph)
+        _write_graph(out, graph, compact_storage=bool(getattr(args, "compact_storage", False)))
     return {"status": "PASS", "episodes": episodes, "nodes": len(nodes), "edges": len(edges), "source": args.source_name, "mode": "prepared_jsonl", "synthetic_rejected": bool(args.fail_on_synthetic)}
 
 
@@ -248,14 +291,28 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
             _reject_synthetic([{"source": f.source, "id": f.feature_id} for f in features], "GIS features")
         if not features:
             raise RuntimeError("GIS fusion found no usable OSM/OpenSidewalks/city GIS features")
-        contexts = read_scene_contexts(args.scene_dataset_dir, _episode_ids(args.episode_ids), args.episode_radius_m)
+        expected_contexts = scene_context_count(args.scene_dataset_dir)
+        contexts = iter_scene_contexts(args.scene_dataset_dir, _episode_ids(args.episode_ids), args.episode_radius_m)
         out = Path(args.output_graph_dir)
         out.mkdir(parents=True, exist_ok=True)
         builder = AccessibilityFusionBuilder(transformer, args.snap_tolerance_m, args.source_name)
-        graphs: List[AccessibilityGraph] = []
         diagnostics: List[Dict[str, Any]] = []
-        iterator = contexts if args.disable_tqdm else tqdm(contexts, desc="accessibility graphs", unit="episode")
+        episode_ids_out: List[str] = []
+        timing_rows: List[Dict[str, Any]] = []
+        total_nodes = 0
+        total_edges = 0
+        resumed = 0
+        build_started = time.perf_counter()
+        iterator = contexts if args.disable_tqdm else tqdm(contexts, total=expected_contexts, desc="accessibility graphs", unit="episode", mininterval=1.0, dynamic_ncols=True)
         for scene in iterator:
+            resume_stats = _resume_graph_stats(out, scene.episode_id, args.compact_storage) if args.resume else None
+            if resume_stats is not None:
+                episode_ids_out.append(scene.episode_id)
+                total_nodes += int(resume_stats.get("nodes", 0) or 0)
+                total_edges += int(resume_stats.get("edges", 0) or 0)
+                resumed += 1
+                continue
+            ep_started = time.perf_counter()
             try:
                 graph = builder.build_for_scene(
                     scene,
@@ -271,15 +328,28 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
                 if args.diagnostic_report_json:
                     dump_json(args.diagnostic_report_json, {"failed_episode": getattr(scene, "episode_id", None), "diagnostics": diagnostics})
                 raise RuntimeError(f"{exc}\nSpatial alignment diagnostics: {json.dumps(diag, indent=2, sort_keys=True)}") from exc
-            _write_graph(out, graph)
-            graphs.append(graph)
+            build_s = time.perf_counter() - ep_started
+            write_stats = _write_graph(out, graph, compact_storage=args.compact_storage)
+            timing_rows.append({**write_stats, "resumed": False, "build_s": build_s, "total_s": build_s + float(write_stats.get("write_s", 0.0) or 0.0)})
+            timing_rows = sorted(timing_rows, key=lambda x: float(x.get("total_s", 0.0)), reverse=True)[:50]
+            episode_ids_out.append(graph.episode_id)
+            total_nodes += len(graph.nodes)
+            total_edges += len(graph.edges)
+            if not args.disable_tqdm and hasattr(iterator, "set_postfix"):
+                iterator.set_postfix(nodes=len(graph.nodes), edges=len(graph.edges), cropped=(graph.metadata or {}).get("features_cropped", 0), refresh=False)
+        build_elapsed = time.perf_counter() - build_started
         report = {
-            "episodes": [g.episode_id for g in graphs],
-            "nodes": sum(len(g.nodes) for g in graphs),
-            "edges": sum(len(g.edges) for g in graphs),
+            "episode_count": len(episode_ids_out),
+            "episode_id_sample": episode_ids_out[:20],
+            "nodes": total_nodes,
+            "edges": total_edges,
             "source": args.source_name,
             "mode": "gis_fusion",
             "features_loaded": len(features),
+            "resumed_episodes": resumed,
+            "compact_storage": bool(args.compact_storage),
+            "elapsed_s": build_elapsed,
+            "episodes_per_s": len(episode_ids_out) / max(build_elapsed, 1e-9),
             "synthetic_rejected": bool(args.fail_on_synthetic),
             "georeference": args.georeference_json,
             "georeference_validated": bool(transformer.config.get("validated", False)),
@@ -288,6 +358,12 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
             "spatial_alignment_validated": True,
             "status": "PASS",
         }
+        if args.timing_report_json:
+            dump_json(args.timing_report_json, {
+                "status": "PASS", "summary": report,
+                "slowest_episodes": timing_rows,
+                "note": "Detailed per-episode timings remain in <episode>.build.json; this report is intentionally compact.",
+            })
     out = Path(args.output_graph_dir)
     source_report = Path(args.source_report_json) if args.source_report_json else out / "source_report.json"
     quality_report = Path(args.quality_report_json) if args.quality_report_json else out / "quality_report.json"
@@ -322,8 +398,11 @@ def main() -> None:
     p.add_argument("--source_name", default="nuplan_osm_opensidewalks_citygis")
     p.add_argument("--fail_on_synthetic", action="store_true")
     p.add_argument("--no_bidirectional_edges", action="store_true")
-    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--num_workers", type=int, default=0, help="Reserved for parallel episode workers; current optimized path is streaming/sequential to keep GIS memory bounded.")
     p.add_argument("--disable_tqdm", action="store_true", help="Disable per-episode progress bars.")
+    p.add_argument("--compact_storage", action="store_true", help="Write nodes/edges plus lightweight metadata instead of duplicating the full graph in <episode>.jsonl.")
+    p.add_argument("--resume", action="store_true", help="Skip episodes with a complete .build.json marker and matching graph files.")
+    p.add_argument("--timing_report_json", default=None, help="Optional per-episode build/write timing report.")
     p.add_argument("--diagnostic_report_json", default=None, help="Optional path for spatial/georeference diagnostics on failure.")
     p.add_argument("--source_report_json", default=None, help="Optional per-city source report path; avoids overwriting reports when several cities share an output graph directory.")
     p.add_argument("--quality_report_json", default=None, help="Optional per-city graph quality report path.")

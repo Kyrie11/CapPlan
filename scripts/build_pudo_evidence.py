@@ -4,15 +4,25 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from capplan.data.gis_fusion import CoordinateTransformer, distance_to_polyline, nearest_route_side, read_scene_contexts
+from capplan.data.gis_fusion import CoordinateTransformer, distance_to_polyline, iter_scene_contexts, nearest_route_side, scene_context_count
 from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, AccessibilityNode, edge_from_dict, node_from_dict
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
+
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    def tqdm(iterable=None, **kwargs):  # type: ignore
+        return iterable if iterable is not None else []
 
 CORE = ["curb_height_m", "deployment_clearance_m", "sidewalk_width_m"]
 
@@ -276,9 +286,13 @@ def _load_graph(graph_dir: Path, episode_id: str) -> AccessibilityGraph:
         raise FileNotFoundError(f"missing accessibility graph files for {episode_id} in {graph_dir}")
     nodes = [node_from_dict(x) for x in read_jsonl(node_file)]
     edges = [edge_from_dict(x) for x in read_jsonl(edge_file)]
-    meta = {}
+    meta: Dict[str, Any] = {}
+    meta_file = graph_dir / f"{episode_id}.meta.json"
     graph_file = graph_dir / f"{episode_id}.jsonl"
-    if graph_file.exists():
+    if meta_file.exists():
+        payload = json.loads(meta_file.read_text(encoding="utf-8"))
+        meta = dict(payload.get("metadata", payload)) if isinstance(payload, dict) else {}
+    elif graph_file.exists():
         rows = read_jsonl(graph_file)
         if rows:
             meta = rows[0].get("metadata", {})
@@ -315,6 +329,119 @@ def _nearest_edge_attrs(x: float, y: float, graph: AccessibilityGraph) -> Dict[s
         return {}
     return {"sidewalk_width_m": best_e.width_m, "lighting": best_e.lighting, "shelter": best_e.shelter, "surface": best_e.surface, "distance_to_ped_edge_m": best_d}
 
+
+
+class GraphSpatialIndex:
+    """Exact nearest-node/edge queries with NumPy vectorized geometry.
+
+    The original generator performed Python loops over every node/edge for every
+    candidate.  Full four-city graphs contain tens of thousands of nodes per
+    episode, so that O(candidates * graph_size) Python overhead dominates the
+    bootstrap.  This index preserves exact Euclidean/point-segment semantics but
+    executes the distance kernels in NumPy.
+    """
+
+    def __init__(self, graph: AccessibilityGraph):
+        self.graph = graph
+        self.nodes = list(graph.nodes)
+        self.node_xy = np.asarray([(float(n.x), float(n.y)) for n in self.nodes], dtype=np.float64)
+        self.kind_indices: Dict[str, np.ndarray] = {}
+        kinds = sorted({str(n.kind) for n in self.nodes})
+        for kind in kinds:
+            self.kind_indices[kind] = np.asarray([i for i, n in enumerate(self.nodes) if n.kind == kind], dtype=np.int64)
+
+        node_index = {n.node_id: i for i, n in enumerate(self.nodes)}
+        edge_refs: List[AccessibilityEdge] = []
+        a_xy: List[Tuple[float, float]] = []
+        b_xy: List[Tuple[float, float]] = []
+        for edge in graph.edges:
+            ia = node_index.get(edge.from_node)
+            ib = node_index.get(edge.to_node)
+            if ia is None or ib is None:
+                continue
+            edge_refs.append(edge)
+            a_xy.append((self.nodes[ia].x, self.nodes[ia].y))
+            b_xy.append((self.nodes[ib].x, self.nodes[ib].y))
+        self.edge_refs = edge_refs
+        self.edge_a = np.asarray(a_xy, dtype=np.float64).reshape((-1, 2)) if a_xy else np.empty((0, 2), dtype=np.float64)
+        self.edge_b = np.asarray(b_xy, dtype=np.float64).reshape((-1, 2)) if b_xy else np.empty((0, 2), dtype=np.float64)
+
+    def nearest_node(self, x: float, y: float, kinds: Optional[set[str]] = None) -> tuple[Optional[AccessibilityNode], float]:
+        if not self.nodes:
+            return None, float("inf")
+        if kinds:
+            chunks = [self.kind_indices[k] for k in kinds if k in self.kind_indices and self.kind_indices[k].size]
+            if not chunks:
+                return None, float("inf")
+            idx = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+        else:
+            idx = np.arange(len(self.nodes), dtype=np.int64)
+        pts = self.node_xy[idx]
+        dx = pts[:, 0] - float(x)
+        dy = pts[:, 1] - float(y)
+        d2 = dx * dx + dy * dy
+        local = int(np.argmin(d2))
+        global_idx = int(idx[local])
+        return self.nodes[global_idx], float(math.sqrt(float(d2[local])))
+
+    def nearest_edge_attrs(self, x: float, y: float) -> Dict[str, Any]:
+        if not self.edge_refs:
+            return {}
+        p = np.asarray([float(x), float(y)], dtype=np.float64)
+        v = self.edge_b - self.edge_a
+        w = p - self.edge_a
+        den = np.einsum("ij,ij->i", v, v)
+        num = np.einsum("ij,ij->i", w, v)
+        t = np.divide(num, den, out=np.zeros_like(num), where=den > 0.0)
+        t = np.clip(t, 0.0, 1.0)
+        proj = self.edge_a + v * t[:, None]
+        delta = proj - p
+        d2 = np.einsum("ij,ij->i", delta, delta)
+        i = int(np.argmin(d2))
+        edge = self.edge_refs[i]
+        return {
+            "sidewalk_width_m": edge.width_m,
+            "lighting": edge.lighting,
+            "shelter": edge.shelter,
+            "surface": edge.surface,
+            "distance_to_ped_edge_m": float(math.sqrt(float(d2[i]))),
+        }
+
+
+class PointRecordIndex:
+    """Vectorized nearest-neighbour lookup for already-normalized point records."""
+
+    def __init__(self, records: List[Dict[str, Any]]):
+        self.records = records
+        if records:
+            self.xy = np.asarray([(float(r["x"]), float(r["y"])) for r in records], dtype=np.float64)
+        else:
+            self.xy = np.empty((0, 2), dtype=np.float64)
+
+    def nearest(self, x: float, y: float, tolerance: float, *, with_distance: bool = False) -> Optional[Dict[str, Any]]:
+        if self.xy.size == 0:
+            return None
+        dx = self.xy[:, 0] - float(x)
+        dy = self.xy[:, 1] - float(y)
+        d2 = dx * dx + dy * dy
+        i = int(np.argmin(d2))
+        dist = float(math.sqrt(float(d2[i])))
+        if dist > float(tolerance):
+            return None
+        out = dict(self.records[i])
+        if with_distance:
+            out["distance_m"] = dist
+        return out
+
+
+def _as_regulation_record(row: Dict[str, Any], transformer: Optional[CoordinateTransformer]) -> Optional[Dict[str, Any]]:
+    xy = _xy_from_row(row, transformer)
+    if not xy:
+        return None
+    out = dict(_row_view(row))
+    out["x"] = float(xy[0])
+    out["y"] = float(xy[1])
+    return out
 
 def _regulation_match(x: float, y: float, regs: List[Dict[str, Any]], tolerance: float, transformer: Optional[CoordinateTransformer] = None) -> Optional[Dict[str, Any]]:
     best, best_d = None, float("inf")
@@ -379,88 +506,246 @@ def _coalesce(*values: Any) -> Any:
 
 
 def _blockage_from_agents(x: float, y: float, scene: Dict[str, Any], radius: float = 6.0) -> float:
-    count = 0
-    for step in scene.get("agent_history", []) or []:
-        for obj in step.get("objects", []) or []:
+    """Temporal occupancy ratio near a candidate curb point.
+
+    Count *timesteps* containing at least one nearby actor rather than raw
+    detections.  The old implementation counted the same stationary actor once
+    per sample and saturated at 0.95 after ten detections, which made blockage
+    depend on sampling rate rather than temporal occupancy.
+    """
+    steps = scene.get("agent_history", []) or []
+    if not steps:
+        return 0.0
+    occupied = 0
+    valid_steps = 0
+    r2 = float(radius) * float(radius)
+    for step in steps:
+        objects = step.get("objects", []) or []
+        valid_steps += 1
+        hit = False
+        for obj in objects:
             try:
-                d = math.hypot(float(obj.get("x")) - x, float(obj.get("y")) - y)
+                dx = float(obj.get("x")) - float(x)
+                dy = float(obj.get("y")) - float(y)
             except Exception:
                 continue
-            if d <= radius:
-                count += 1
-    return min(0.95, count / 10.0)
+            if dx * dx + dy * dy <= r2:
+                hit = True
+                break
+        occupied += int(hit)
+    return float(occupied) / float(max(1, valid_steps))
 
 
-def _candidate_nodes(graph: AccessibilityGraph, route: List[List[float]], radius: float) -> List[AccessibilityNode]:
+def _candidate_nodes(
+    graph: AccessibilityGraph,
+    route: List[List[float]],
+    radius: float,
+    *,
+    max_fallback: int = 128,
+    fallback_spacing_m: float = 20.0,
+) -> List[Tuple[AccessibilityNode, float, str]]:
+    """Return explicit curb candidates or a spatially-thinned fallback set.
+
+    Explicit curb/curb-ramp/connector candidates are never capped.  Only the
+    generic sidewalk/crossing/entrance fallback is deduplicated and capped.
+    This avoids thousands of adjacent sidewalk vertices becoming independent
+    PUDO audit rows while preserving explicit evidence.
+    """
     meta_attrs = graph.metadata.get("node_attributes", {}) if isinstance(graph.metadata, dict) else {}
-    out: List[AccessibilityNode] = []
+    explicit: List[Tuple[AccessibilityNode, float, str]] = []
     for n in graph.nodes:
         attrs = meta_attrs.get(n.node_id, {}) if isinstance(meta_attrs, dict) else {}
+        if not (n.kind in {"curb", "curb_ramp"} or attrs.get("pudo_connector_candidate")):
+            continue
         route_dist = distance_to_polyline([n.x, n.y], route) if route else 0.0
-        if n.kind in {"curb", "curb_ramp"} or attrs.get("pudo_connector_candidate"):
-            if not route or route_dist <= radius:
-                out.append(n)
-    if not out:
-        # Conservative fallback within this generator: use entrance/sidewalk nodes near route as
-        # *candidates* but legal_stop remains false unless regulation evidence matches.
-        for n in graph.nodes:
-            if n.kind in {"sidewalk", "crossing", "entrance"} and (not route or distance_to_polyline([n.x, n.y], route) <= radius):
-                out.append(n)
-    return out
+        if not route or route_dist <= radius:
+            explicit.append((n, float(route_dist), "explicit"))
+    if explicit:
+        explicit.sort(key=lambda item: (item[1], item[0].node_id))
+        return explicit
+
+    fallback: List[Tuple[AccessibilityNode, float, str]] = []
+    for n in graph.nodes:
+        if n.kind not in {"sidewalk", "crossing", "entrance"}:
+            continue
+        route_dist = distance_to_polyline([n.x, n.y], route) if route else 0.0
+        if not route or route_dist <= radius:
+            fallback.append((n, float(route_dist), "fallback"))
+    fallback.sort(key=lambda item: (item[1], 0 if item[0].kind == "entrance" else 1 if item[0].kind == "crossing" else 2, item[0].node_id))
+
+    spacing = max(0.1, float(fallback_spacing_m))
+    seen_cells: set[Tuple[int, int]] = set()
+    thinned: List[Tuple[AccessibilityNode, float, str]] = []
+    for item in fallback:
+        n = item[0]
+        cell = (int(math.floor(float(n.x) / spacing)), int(math.floor(float(n.y) / spacing)))
+        if cell in seen_cells:
+            continue
+        seen_cells.add(cell)
+        thinned.append(item)
+        if max_fallback > 0 and len(thinned) >= max_fallback:
+            break
+    return thinned
 
 
-def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build PUDO evidence as resumable per-episode shards, then concatenate.
+
+    Full nuPlan runs can contain many thousands of episodes.  Keeping every PUDO
+    row in one Python list makes memory scale with the full city and loses all
+    work if the process stops before the final write.  Shards make memory scale
+    with one episode and provide a durable resume boundary.
+    """
     graph_dir = Path(args.accessibility_graph_dir)
     transformer = CoordinateTransformer.from_file(args.georeference_json) if args.georeference_json else None
-    contexts = read_scene_contexts(args.scene_dataset_dir, [], args.candidate_radius_m)
-    scenes = {c.episode_id: c for c in contexts}
-    out: List[Dict[str, Any]] = list(normalized_input_rows)
-    existing = {(r.get("episode_id"), r.get("anchor_id")) for r in out}
-    regs = _read(args.curb_regulation_jsonl) + _read(args.curb_regulation_dir)
-    raw_inventory = _read(args.curb_inventory_jsonl)
-    external_candidates: List[Dict[str, Any]] = []
-    for candidate_path in (args.pudo_candidate_source or []):
-        external_candidates.extend(_read(candidate_path))
-    inventory = [normalize(r, args.source_name, transformer) for r in raw_inventory if r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id"))]
-    global_inventory = [rec for rec in (_as_inventory_record(r, transformer) for r in raw_inventory if not (r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id")))) if rec is not None]
-    for r in inventory:
-        key = (r.get("episode_id"), r.get("anchor_id"))
-        if key not in existing:
-            out.append(r); existing.add(key)
+    output = Path(args.output_pudo_evidence_jsonl)
+    shard_dir = Path(args.shard_dir) if args.shard_dir else output.parent / f"{output.stem}.shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
 
-    episode_ids = list(scenes) or sorted({str(r.get("episode_id")) for r in out if r.get("episode_id")})
-    if not episode_ids:
-        # infer from graph files
-        episode_ids = sorted({p.name.split(".nodes.jsonl")[0] for p in graph_dir.glob("*.nodes.jsonl")})
-    for eid in episode_ids:
-        graph = _load_graph(graph_dir, eid)
-        scene = scenes.get(eid)
-        route = scene.route_polyline if scene else []
-        # Official/public curbside layers (parking payment points, taxi zones,
-        # taxi stands) may propose candidate locations, but NEVER confer stopping
-        # legality or interface feasibility by themselves. Each candidate is
-        # independently matched to regulation and physical curb evidence.
-        for cidx, candidate in enumerate(external_candidates):
+    normalized_by_episode: Dict[str, List[Dict[str, Any]]] = {}
+    for row in normalized_input_rows:
+        normalized_by_episode.setdefault(str(row.get("episode_id") or ""), []).append(row)
+
+    raw_regs = _read(args.curb_regulation_jsonl) + _read(args.curb_regulation_dir)
+    reg_records = [rec for rec in (_as_regulation_record(r, transformer) for r in raw_regs) if rec is not None]
+    reg_index = PointRecordIndex(reg_records)
+
+    raw_inventory = _read(args.curb_inventory_jsonl)
+    for row in raw_inventory:
+        if row.get("episode_id") or (isinstance(row.get("properties"), dict) and row["properties"].get("episode_id")):
+            normalized = normalize(row, args.source_name, transformer)
+            normalized_by_episode.setdefault(str(normalized.get("episode_id") or ""), []).append(normalized)
+    global_inventory = [rec for rec in (_as_inventory_record(r, transformer) for r in raw_inventory if not (r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id")))) if rec is not None]
+    inventory_index = PointRecordIndex(global_inventory)
+
+    prepared_external: List[Tuple[Dict[str, Any], float, float, int]] = []
+    cidx = 0
+    for candidate_path in (args.pudo_candidate_source or []):
+        for candidate in _read(candidate_path):
             xy = _xy_from_row(candidate, transformer)
-            if not xy:
+            if xy is not None:
+                prepared_external.append((candidate, float(xy[0]), float(xy[1]), cidx))
+            cidx += 1
+
+    if args.scene_dataset_dir:
+        scene_iter = iter_scene_contexts(args.scene_dataset_dir, [], args.candidate_radius_m)
+        expected = scene_context_count(args.scene_dataset_dir)
+    else:
+        eids = sorted({p.name.split(".nodes.jsonl")[0] for p in graph_dir.glob("*.nodes.jsonl")})
+        scene_iter = (type("_Scene", (), {"episode_id": eid, "route_polyline": [], "metadata": {}})() for eid in eids)
+        expected = len(eids)
+
+    if not args.disable_tqdm:
+        scene_iter = tqdm(scene_iter, total=expected, desc="PUDO evidence", unit="episode", mininterval=1.0, dynamic_ncols=True)
+
+    perf: Dict[str, Any] = {
+        "episodes": 0,
+        "resumed_episodes": 0,
+        "rows_generated": 0,
+        "graph_load_s": 0.0,
+        "graph_index_s": 0.0,
+        "external_candidate_s": 0.0,
+        "graph_candidate_s": 0.0,
+        "explicit_graph_candidates": 0,
+        "fallback_graph_candidates": 0,
+        "slowest_episodes": [],
+    }
+    total_rows = 0
+    total_complete = 0
+    total_eligible = 0
+    missing = {k: 0 for k in CORE}
+    rows_per_episode: List[int] = []
+    shard_paths: List[Path] = []
+    build_started = time.perf_counter()
+    inprogress_marker = output.with_suffix(output.suffix + ".inprogress.json")
+    started_unix = time.time()
+
+    def update_inprogress() -> None:
+        dump_json(inprogress_marker, {
+            "status": "RUNNING",
+            "source": args.source_name,
+            "output": str(output),
+            "shard_dir": str(shard_dir),
+            "expected_episodes": expected,
+            "completed_or_resumed_episodes": int(perf.get("episodes", 0) or 0),
+            "rows_so_far": total_rows,
+            "started_unix": started_unix,
+            "elapsed_s": time.perf_counter() - build_started,
+            "note": "While this marker exists, an older canonical city JSONL may still be present and must not be interpreted as the current run.",
+        })
+
+    update_inprogress()
+
+    def absorb_marker(marker: Dict[str, Any]) -> None:
+        nonlocal total_rows, total_complete, total_eligible
+        rows = int(marker.get("rows", 0) or 0)
+        total_rows += rows
+        total_complete += int(marker.get("paper_evidence_complete", 0) or 0)
+        total_eligible += int(marker.get("paper_eligible", 0) or 0)
+        rows_per_episode.append(rows)
+        for key in CORE:
+            missing[key] += int((marker.get("missing_core_counts") or {}).get(key, 0) or 0)
+
+    for scene in scene_iter:
+        eid = str(scene.episode_id)
+        episode_started = time.perf_counter()
+        shard = shard_dir / f"{eid}.jsonl"
+        marker_path = shard_dir / f"{eid}.build.json"
+        shard_paths.append(shard)
+
+        if args.resume and shard.exists() and marker_path.exists():
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            except Exception:
+                marker = {}
+            if marker.get("status") == "PASS":
+                perf["episodes"] += 1
+                perf["resumed_episodes"] += 1
+                absorb_marker(marker)
+                if perf["episodes"] % 25 == 0:
+                    update_inprogress()
+                if hasattr(scene_iter, "set_postfix"):
+                    scene_iter.set_postfix(rows=total_rows, resumed=perf["resumed_episodes"], refresh=False)
                 continue
-            x, y = xy
-            if route and distance_to_polyline([x, y], route) > args.candidate_radius_m:
+
+        episode_rows: List[Dict[str, Any]] = []
+        existing: set[Tuple[Any, Any]] = set()
+        for row in normalized_by_episode.get(eid, []):
+            rr = _annotate_paper_flags(row)
+            key = (rr.get("episode_id"), rr.get("anchor_id"))
+            if key not in existing:
+                episode_rows.append(rr)
+                existing.add(key)
+
+        t0 = time.perf_counter()
+        graph = _load_graph(graph_dir, eid)
+        graph_load_s = time.perf_counter() - t0
+        perf["graph_load_s"] += graph_load_s
+        route = scene.route_polyline if scene else []
+
+        t0 = time.perf_counter()
+        graph_index = GraphSpatialIndex(graph)
+        graph_index_s = time.perf_counter() - t0
+        perf["graph_index_s"] += graph_index_s
+
+        t0 = time.perf_counter()
+        for candidate, x, y, candidate_index in prepared_external:
+            route_distance = distance_to_polyline([x, y], route) if route else 0.0
+            if route and route_distance > args.candidate_radius_m:
                 continue
-            nearest_ped, ped_dist = _nearest_node(x, y, graph.nodes, {"sidewalk", "crossing", "entrance"})
+            nearest_ped, ped_dist = graph_index.nearest_node(x, y, {"sidewalk", "crossing", "entrance"})
             ped_id = nearest_ped.node_id if nearest_ped is not None and ped_dist <= args.pedestrian_snap_tolerance_m else None
-            attrs = _nearest_edge_attrs(x, y, graph) if ped_id else {}
-            reg = _regulation_match(x, y, regs, args.regulation_snap_tolerance_m, transformer)
-            inv = _nearest_inventory_match(x, y, global_inventory, args.inventory_snap_tolerance_m)
+            attrs = graph_index.nearest_edge_attrs(x, y) if ped_id else {}
+            reg = reg_index.nearest(x, y, args.regulation_snap_tolerance_m)
+            inv = inventory_index.nearest(x, y, args.inventory_snap_tolerance_m, with_distance=True)
             legal = _bool((reg or {}).get("legal_stop", (reg or {}).get("stopping_allowed", (reg or {}).get("regulation"))), False)
             blockage = _blockage_from_agents(x, y, scene.metadata if scene else {})
             candidate_view = _row_view(candidate)
             candidate_source = str(candidate_view.get("source") or args.source_name)
-            candidate_id = str(candidate_view.get("regulation_id") or candidate_view.get("anchor_id") or candidate_view.get("id") or f"external_{cidx:05d}")
+            candidate_id = str(candidate_view.get("regulation_id") or candidate_view.get("anchor_id") or candidate_view.get("id") or f"external_{candidate_index:05d}")
             width = _coalesce((inv or {}).get("sidewalk_width_m"), attrs.get("sidewalk_width_m"))
             row = {
-                "anchor_id": f"{eid}:candidate:{candidate_id}",
-                "pudo_id": f"{eid}:candidate:{candidate_id}",
+                "anchor_id": f"{eid}:candidate:{candidate_id}", "pudo_id": f"{eid}:candidate:{candidate_id}",
                 "episode_id": eid, "kind": "pickup_dropoff",
                 "curb_pose": {"x": x, "y": y, "heading": 0.0, "frame": "map"},
                 "stop_pose": {"x": x, "y": y, "heading": 0.0, "frame": "map"},
@@ -470,6 +755,7 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "legal_stop_source": str((reg or {}).get("source") or (reg or {}).get("regulation_id") or "no_matching_regulation_fail_closed"),
                 "legal_stop_authoritative": bool((reg or {}).get("authoritative") is True or (reg or {}).get("audited") is True or str((reg or {}).get("evidence_tier") or "").lower().startswith("a_") or _legacy_manual_audit_source((reg or {}).get("source"))),
                 "adjacent_ped_node_id": ped_id,
+                "pedestrian_match_distance_m": float(ped_dist) if ped_id else None,
                 "curb_height_m": (inv or {}).get("curb_height_m"),
                 "sidewalk_width_m": width,
                 "deployment_clearance_m": (inv or {}).get("deployment_clearance_m"),
@@ -477,8 +763,8 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "map_confidence": min(float(candidate_view.get("confidence", 0.6) or 0.6), float((inv or {}).get("confidence", 1.0) or 1.0), float((reg or {}).get("confidence", 1.0) or 1.0)),
                 "dynamic_confidence": 1.0 - blockage,
                 "lighting": attrs.get("lighting"), "shelter": attrs.get("shelter"),
-                "candidate_source": candidate_source,
-                "candidate_only": True,
+                "candidate_source": candidate_source, "candidate_only": True,
+                "candidate_selection": "external", "candidate_route_distance_m": float(route_distance),
                 "curb_inventory_source": (inv or {}).get("source"),
                 "curb_inventory_authoritative": bool((inv or {}).get("authoritative")),
                 "curb_inventory_core_fields": list((inv or {}).get("core_fields") or []),
@@ -488,52 +774,52 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
             }
             key = (eid, row["anchor_id"])
             if key not in existing:
-                out.append(_annotate_paper_flags(row)); existing.add(key)
+                episode_rows.append(_annotate_paper_flags(row)); existing.add(key)
+        external_s = time.perf_counter() - t0
+        perf["external_candidate_s"] += external_s
 
-        for idx, n in enumerate(_candidate_nodes(graph, route, args.candidate_radius_m)):
+        t0 = time.perf_counter()
+        graph_candidates = _candidate_nodes(
+            graph, route, args.candidate_radius_m,
+            max_fallback=args.max_fallback_graph_candidates_per_episode,
+            fallback_spacing_m=args.fallback_candidate_spacing_m,
+        )
+        meta_attrs = graph.metadata.get("node_attributes", {}) if isinstance(graph.metadata, dict) else {}
+        for idx, (n, route_distance, selection) in enumerate(graph_candidates):
+            perf["explicit_graph_candidates" if selection == "explicit" else "fallback_graph_candidates"] += 1
             anchor_id = f"{eid}:pudo_{idx:04d}"
             if (eid, anchor_id) in existing:
                 continue
-            attrs = _nearest_edge_attrs(n.x, n.y, graph)
-            meta_attrs = graph.metadata.get("node_attributes", {}) if isinstance(graph.metadata, dict) else {}
+            attrs = graph_index.nearest_edge_attrs(n.x, n.y)
             nattrs = meta_attrs.get(n.node_id, {}) if isinstance(meta_attrs, dict) else {}
-            reg = _regulation_match(n.x, n.y, regs, args.regulation_snap_tolerance_m, transformer)
-            inv = _nearest_inventory_match(n.x, n.y, global_inventory, args.inventory_snap_tolerance_m)
+            reg = reg_index.nearest(n.x, n.y, args.regulation_snap_tolerance_m)
+            inv = inventory_index.nearest(n.x, n.y, args.inventory_snap_tolerance_m, with_distance=True)
             legal = _bool((reg or {}).get("legal_stop", (reg or {}).get("stopping_allowed", (reg or {}).get("regulation"))), False)
-            nearest_ped, _ = _nearest_node(n.x, n.y, graph.nodes, {"sidewalk", "crossing", "entrance"})
+            nearest_ped, ped_dist = graph_index.nearest_node(n.x, n.y, {"sidewalk", "crossing", "entrance"})
+            if nearest_ped is None or ped_dist > args.pedestrian_snap_tolerance_m:
+                nearest_ped = None; ped_dist = float("inf")
             blockage = _blockage_from_agents(n.x, n.y, scene.metadata if scene else {})
-            # Publication-core interface dimensions must come from the matched
-            # audited/authoritative inventory when available.  The old order
-            # preferred graph/OSM values but still labeled curb_inventory_source
-            # with the audited record, which could misattribute provenance.
             width = _coalesce((inv or {}).get("sidewalk_width_m"), nattrs.get("width_m"), attrs.get("sidewalk_width_m"))
             clearance = _coalesce((inv or {}).get("deployment_clearance_m"), nattrs.get("deployment_clearance_m"))
             curb_height = _coalesce((inv or {}).get("curb_height_m"), nattrs.get("curb_height_m"))
             confidence_terms = [float(n.confidence), float((reg or {}).get("confidence", 1.0) or 1.0)]
-            if inv:
-                confidence_terms.append(float(inv.get("confidence", 1.0) or 1.0))
+            if inv: confidence_terms.append(float(inv.get("confidence", 1.0) or 1.0))
             row = {
-                "anchor_id": anchor_id,
-                "pudo_id": anchor_id,
-                "episode_id": eid,
-                "kind": "pickup_dropoff",
+                "anchor_id": anchor_id, "pudo_id": anchor_id, "episode_id": eid, "kind": "pickup_dropoff",
                 "curb_pose": {"x": n.x, "y": n.y, "heading": 0.0, "frame": "map"},
                 "stop_pose": {"x": n.x, "y": n.y, "heading": 0.0, "frame": "map"},
-                "x": n.x,
-                "y": n.y,
+                "x": n.x, "y": n.y,
                 "side": str(_coalesce(nattrs.get("route_side"), (inv or {}).get("side"), nearest_route_side([n.x, n.y], route) if route else "unknown")),
                 "legal_stop": legal,
                 "legal_stop_source": str((reg or {}).get("source") or (reg or {}).get("regulation_id") or "no_matching_regulation_fail_closed"),
                 "legal_stop_authoritative": bool((reg or {}).get("authoritative") is True or (reg or {}).get("audited") is True or str((reg or {}).get("evidence_tier") or "").lower().startswith("a_") or _legacy_manual_audit_source((reg or {}).get("source"))),
                 "adjacent_ped_node_id": nearest_ped.node_id if nearest_ped else None,
-                "curb_height_m": curb_height,
-                "sidewalk_width_m": width,
-                "deployment_clearance_m": clearance,
-                "blockage_risk": blockage,
-                "map_confidence": min(confidence_terms),
-                "dynamic_confidence": 1.0 - blockage,
-                "lighting": attrs.get("lighting"),
-                "shelter": attrs.get("shelter"),
+                "pedestrian_match_distance_m": None if not nearest_ped else float(ped_dist),
+                "curb_height_m": curb_height, "sidewalk_width_m": width, "deployment_clearance_m": clearance,
+                "blockage_risk": blockage, "map_confidence": min(confidence_terms), "dynamic_confidence": 1.0 - blockage,
+                "lighting": attrs.get("lighting"), "shelter": attrs.get("shelter"),
+                "candidate_node_kind": n.kind, "candidate_selection": selection,
+                "candidate_route_distance_m": float(route_distance),
                 "curb_inventory_source": (inv or {}).get("source"),
                 "curb_inventory_authoritative": bool((inv or {}).get("authoritative")),
                 "curb_inventory_core_fields": list((inv or {}).get("core_fields") or []),
@@ -541,52 +827,130 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "source": args.source_name,
                 "evidence_notes": "derived_from_accessibility_graph_and_city_curb_regulation; legal_stop fails closed without matched regulation",
             }
-            out.append(_annotate_paper_flags(row))
-            existing.add((eid, anchor_id))
-    return out
+            episode_rows.append(_annotate_paper_flags(row)); existing.add((eid, anchor_id))
+        graph_candidate_s = time.perf_counter() - t0
+        perf["graph_candidate_s"] += graph_candidate_s
+
+        part = shard.with_suffix(shard.suffix + ".part")
+        part.unlink(missing_ok=True)
+        write_jsonl(part, episode_rows)
+        part.replace(shard)
+        ep_missing = {k: sum(1 for r in episode_rows if r.get(k) is None) for k in CORE}
+        marker = {
+            "status": "PASS", "episode_id": eid, "rows": len(episode_rows),
+            "paper_evidence_complete": sum(int(bool(r.get("paper_evidence_complete"))) for r in episode_rows),
+            "paper_eligible": sum(int(bool(r.get("paper_eligible"))) for r in episode_rows),
+            "missing_core_counts": ep_missing,
+            "graph_nodes": len(graph.nodes), "graph_edges": len(graph.edges),
+            "graph_load_s": graph_load_s, "graph_index_s": graph_index_s,
+            "external_candidate_s": external_s, "graph_candidate_s": graph_candidate_s,
+            "elapsed_s": time.perf_counter() - episode_started,
+        }
+        dump_json(marker_path, marker)
+        absorb_marker(marker)
+        perf["episodes"] += 1
+        perf["rows_generated"] += len(episode_rows)
+        perf["slowest_episodes"].append({"episode_id": eid, "elapsed_s": marker["elapsed_s"], "rows": len(episode_rows), "nodes": len(graph.nodes), "edges": len(graph.edges)})
+        perf["slowest_episodes"] = sorted(perf["slowest_episodes"], key=lambda x: x["elapsed_s"], reverse=True)[:20]
+        if perf["episodes"] % 25 == 0:
+            update_inprogress()
+        if hasattr(scene_iter, "set_postfix"):
+            scene_iter.set_postfix(rows=total_rows, last=f"{marker['elapsed_s']:.2f}s", resumed=perf["resumed_episodes"], refresh=False)
+
+    update_inprogress()
+    # Combine only shards observed in this run; stale shards from a previous
+    # different scene selection can never leak into the canonical city output.
+    output.parent.mkdir(parents=True, exist_ok=True)
+    combined_part = output.with_suffix(output.suffix + ".part")
+    combined_part.unlink(missing_ok=True)
+    with combined_part.open("w", encoding="utf-8") as dst:
+        for shard in shard_paths:
+            if not shard.exists():
+                raise RuntimeError(f"missing PUDO shard after build: {shard}")
+            with shard.open("r", encoding="utf-8") as src:
+                for line in src:
+                    if line.strip():
+                        dst.write(line)
+    combined_part.replace(output)
+
+    perf["elapsed_s"] = time.perf_counter() - build_started
+    perf["episodes_per_s"] = perf["episodes"] / max(perf["elapsed_s"], 1e-9)
+    perf["shard_dir"] = str(shard_dir)
+    inprogress_marker.unlink(missing_ok=True)
+    episode_total = max(1, perf["episodes"])
+    row_den = max(1, total_rows)
+    report = {
+        "status": "PASS", "rows": total_rows,
+        "missing_core_counts": missing,
+        "missing_core_rates": {k: v / row_den for k, v in missing.items()},
+        "paper_evidence_complete": total_complete, "paper_eligible": total_eligible,
+        "episode_count": perf["episodes"],
+        "rows_per_episode": {
+            "min": min(rows_per_episode) if rows_per_episode else 0,
+            "max": max(rows_per_episode) if rows_per_episode else 0,
+            "mean": (sum(rows_per_episode) / episode_total) if rows_per_episode else 0.0,
+        },
+        "source": args.source_name, "mode": "pudo_generator",
+        "performance": perf,
+        "interpretation": "Unknown candidates are retained. paper_eligible requires independent legality, pedestrian binding, and all three core interface fields.",
+    }
+    if args.fail_on_missing_core_evidence:
+        bad = {k: v for k, v in report["missing_core_rates"].items() if v > args.max_core_missing_rate}
+        if bad:
+            raise RuntimeError(f"core PUDO evidence missing rate too high: {bad}; threshold={args.max_core_missing_rate}")
+    return report
 
 
 def build(args: argparse.Namespace) -> Dict[str, Any]:
     transformer = CoordinateTransformer.from_file(args.georeference_json) if args.georeference_json else None
-    rows = []
-    for p in [args.input_pudo_evidence_jsonl, args.curb_inventory_jsonl]:
-        rows.extend(_read(p))
-    normalized_input = []
-    for r in rows:
-        # Curated inputs may include global curb inventory; only normalize rows with episode binding here.
-        if r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id")):
-            normalized_input.append(normalize(r, args.source_name, transformer))
+    source_paths = [args.input_pudo_evidence_jsonl]
+    if not args.accessibility_graph_dir:
+        source_paths.append(args.curb_inventory_jsonl)
+    normalized_input: List[Dict[str, Any]] = []
+    for path in source_paths:
+        for r in _read(path):
+            if r.get("episode_id") or (isinstance(r.get("properties"), dict) and r["properties"].get("episode_id")):
+                normalized_input.append(normalize(r, args.source_name, transformer))
+
     if args.accessibility_graph_dir:
-        out_rows = _build_from_graphs(args, normalized_input)
+        report = _build_from_graphs(args, normalized_input)
     else:
         if not normalized_input:
             raise RuntimeError("PUDO evidence build requires real curb/PUDO evidence or --accessibility_graph_dir to generate candidates; no synthetic fallback is available")
-        out_rows = normalized_input
-    out_rows = [_annotate_paper_flags(r) for r in out_rows]
-    total = max(1, len(out_rows))
-    missing = {k: sum(1 for r in out_rows if r.get(k) is None) for k in CORE}
-    if args.fail_on_missing_core_evidence:
-        bad = {k: v / total for k, v in missing.items() if v / total > args.max_core_missing_rate}
-        if bad:
-            raise RuntimeError(f"core PUDO evidence missing rate too high: {bad}; threshold={args.max_core_missing_rate}")
-    write_jsonl(args.output_pudo_evidence_jsonl, out_rows)
-    by_episode: Dict[str, Dict[str, int]] = {}
-    for r in out_rows:
-        e = by_episode.setdefault(str(r.get("episode_id") or "unknown"), {"total": 0, "evidence_complete": 0, "paper_eligible": 0})
-        e["total"] += 1
-        e["evidence_complete"] += int(bool(r.get("paper_evidence_complete")))
-        e["paper_eligible"] += int(bool(r.get("paper_eligible")))
-    report = {
-        "status": "PASS", "rows": len(out_rows), "missing_core_counts": missing,
-        "missing_core_rates": {k: v / total for k, v in missing.items()},
-        "paper_evidence_complete": sum(int(bool(r.get("paper_evidence_complete"))) for r in out_rows),
-        "paper_eligible": sum(int(bool(r.get("paper_eligible"))) for r in out_rows),
-        "episodes": by_episode, "source": args.source_name,
-        "mode": "pudo_generator" if args.accessibility_graph_dir else "pudo_validator",
-        "interpretation": "Unknown candidates are retained. paper_eligible requires independent legality, pedestrian binding, and all three core interface fields.",
-    }
+        out_rows = [_annotate_paper_flags(r) for r in normalized_input]
+        total = max(1, len(out_rows))
+        missing = {k: sum(1 for r in out_rows if r.get(k) is None) for k in CORE}
+        if args.fail_on_missing_core_evidence:
+            bad = {k: v / total for k, v in missing.items() if v / total > args.max_core_missing_rate}
+            if bad:
+                raise RuntimeError(f"core PUDO evidence missing rate too high: {bad}; threshold={args.max_core_missing_rate}")
+        write_jsonl(args.output_pudo_evidence_jsonl, out_rows)
+        by_episode: Dict[str, int] = {}
+        for r in out_rows:
+            eid = str(r.get("episode_id") or "unknown")
+            by_episode[eid] = by_episode.get(eid, 0) + 1
+        totals = list(by_episode.values())
+        report = {
+            "status": "PASS", "rows": len(out_rows), "missing_core_counts": missing,
+            "missing_core_rates": {k: v / total for k, v in missing.items()},
+            "paper_evidence_complete": sum(int(bool(r.get("paper_evidence_complete"))) for r in out_rows),
+            "paper_eligible": sum(int(bool(r.get("paper_eligible"))) for r in out_rows),
+            "episode_count": len(by_episode), "episode_id_sample": sorted(by_episode)[:20],
+            "rows_per_episode": {
+                "min": min(totals) if totals else 0, "max": max(totals) if totals else 0,
+                "mean": (sum(totals) / len(totals)) if totals else 0.0,
+            },
+            "source": args.source_name, "mode": "pudo_validator",
+            "interpretation": "Unknown candidates are retained. paper_eligible requires independent legality, pedestrian binding, and all three core interface fields.",
+        }
+
     if args.report_json:
         dump_json(args.report_json, report)
+    if args.timing_report_json:
+        dump_json(args.timing_report_json, {
+            "status": "PASS", "output": str(args.output_pudo_evidence_jsonl),
+            "rows": int(report.get("rows", 0) or 0), "performance": report.get("performance", {}),
+        })
     return report
 
 
@@ -608,6 +972,12 @@ def main() -> None:
     p.add_argument("--inventory_snap_tolerance_m", type=float, default=15.0)
     p.add_argument("--pedestrian_snap_tolerance_m", type=float, default=25.0)
     p.add_argument("--max_route_deviation_m", type=float, default=300.0)
+    p.add_argument("--max_fallback_graph_candidates_per_episode", type=int, default=128, help="Cap only generic sidewalk/crossing/entrance fallback candidates; explicit curb candidates are never capped.")
+    p.add_argument("--fallback_candidate_spacing_m", type=float, default=20.0, help="Spatial thinning grid for generic fallback PUDO candidates.")
+    p.add_argument("--disable_tqdm", action="store_true", help="Disable per-episode PUDO progress.")
+    p.add_argument("--timing_report_json", default=None, help="Optional compact performance report for bottleneck diagnosis.")
+    p.add_argument("--resume", action="store_true", help="Resume PUDO generation from completed per-episode shards.")
+    p.add_argument("--shard_dir", default=None, help="Optional directory for resumable per-episode PUDO shards.")
     p.add_argument("--source_name", default="city_curb_regulation+sidewalk_inventory")
     p.add_argument("--fail_on_missing_core_evidence", action="store_true")
     p.add_argument("--max_core_missing_rate", type=float, default=0.05)
