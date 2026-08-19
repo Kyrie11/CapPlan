@@ -62,6 +62,24 @@ def _graph_episode_ids(graph_dir: Path) -> List[str]:
     return sorted({p.name.split(".nodes.jsonl")[0] for p in graph_dir.glob("*.nodes.jsonl") if p.name != "nodes.jsonl"}) or ["shared"]
 
 
+def _load_episode_allowlist(path: str | None) -> set[str] | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(p)
+    if p.suffix.lower() == ".json":
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            return {str(x) for x in payload}
+        if isinstance(payload, dict):
+            for key in ["episode_ids", "allowed_episode_ids", "paper_episode_ids"]:
+                if isinstance(payload.get(key), list):
+                    return {str(x) for x in payload[key]}
+        raise RuntimeError(f"episode allowlist JSON has no supported episode-id list: {p}")
+    return {line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip() and not line.lstrip().startswith("#")}
+
+
 def _load_nodes(graph_dir: Path, eid: str) -> List[AccessibilityNode]:
     f = graph_dir / f"{eid}.nodes.jsonl"
     if not f.exists():
@@ -71,15 +89,30 @@ def _load_nodes(graph_dir: Path, eid: str) -> List[AccessibilityNode]:
     return [node_from_dict(x) for x in read_jsonl(f)]
 
 
-def _entrance_nodes(nodes: Sequence[AccessibilityNode], allow_non_entrance_od: bool = False) -> List[AccessibilityNode]:
-    entrances = [n for n in nodes if n.kind in {"entrance", "origin_entrance", "destination_entrance", "transit_stop"}]
+def _entrance_nodes(
+    nodes: Sequence[AccessibilityNode],
+    allow_non_entrance_od: bool = False,
+    trusted_source_tokens: Sequence[str] | None = None,
+) -> List[AccessibilityNode]:
+    # Bootstrap diagnostics may use a mapped transit stop as an OD-like anchor,
+    # but paper mode is explicitly entrance-to-entrance.  When trusted-source
+    # filtering is enabled (the paper path), do not silently promote a
+    # transit_stop into origin/destination entrance truth.
+    allowed_kinds = {"entrance", "origin_entrance", "destination_entrance"}
+    if trusted_source_tokens is None:
+        allowed_kinds.add("transit_stop")
+    entrances = [n for n in nodes if n.kind in allowed_kinds]
+    if trusted_source_tokens is not None:
+        tokens = [str(x).lower() for x in trusted_source_tokens]
+        entrances = [n for n in entrances if any(t in str(n.source or "").lower() for t in tokens)]
     if len(entrances) >= 2:
         return entrances
     if allow_non_entrance_od:
         fallback = [n for n in nodes if n.kind in {"sidewalk", "crossing", "curb", "curb_ramp", "pudo"}]
         if len(fallback) >= 2:
             return fallback
-    raise RuntimeError("service layer generation requires at least two real entrance/transit_stop nodes per episode; use --allow_non_entrance_od only for bootstrap diagnostics, not paper experiments")
+    qualifier = "trusted audited " if trusted_source_tokens is not None else "real "
+    raise RuntimeError(f"service layer generation requires at least two {qualifier}entrance nodes per episode; use --allow_non_entrance_od only for bootstrap diagnostics, not paper experiments")
 
 
 def _three_layer_profiles(source: str = "calibrated_three_layer_profiles") -> List[Dict[str, Any]]:
@@ -181,7 +214,12 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
         raise RuntimeError("calibrated OD service generation requires --accessibility_graph_dir")
     cfg = _demand_config(args.demand_sources_config)
     graph_dir = Path(args.accessibility_graph_dir)
-    episode_ids = cfg.get("episode_ids") or _graph_episode_ids(graph_dir)
+    episode_ids = [str(x) for x in (cfg.get("episode_ids") or _graph_episode_ids(graph_dir))]
+    allowlist = _load_episode_allowlist(args.episode_allowlist)
+    if allowlist is not None:
+        episode_ids = [eid for eid in episode_ids if eid in allowlist]
+        if not episode_ids:
+            raise RuntimeError(f"episode allowlist {args.episode_allowlist} has no episodes present in {graph_dir}")
     profile_ids = [str(p["profile_id"]) for p in profiles]
     profile_mix = cfg.get("profile_mix") or profile_ids
     profile_mix = [str(x) for x in profile_mix]
@@ -198,9 +236,12 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
     request_time_span = float(cfg.get("request_time_span_s", 12 * 3600))
     rng = random.Random(args.seed)
     rows: List[Dict[str, Any]] = []
+    trusted_tokens = None
+    if args.require_trusted_entrances:
+        trusted_tokens = ["reviewed_audit:", "manual_audit:"] + list(args.trusted_entrance_source or [])
     for eid in episode_ids:
         nodes = _load_nodes(graph_dir, str(eid))
-        entrances = _entrance_nodes(nodes, allow_non_entrance_od=args.allow_non_entrance_od)
+        entrances = _entrance_nodes(nodes, allow_non_entrance_od=args.allow_non_entrance_od, trusted_source_tokens=trusted_tokens)
         # AbilityBench counterfactuals intentionally keep the traffic scene and
         # passenger OD fixed while changing only the capability contract. The
         # previous code sampled a fresh OD for every profile, which made T4
@@ -275,8 +316,16 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
         # dataset manifests self-contained and reproducible.
         write_jsonl(args.output_capability_profiles_jsonl, profiles)
 
+    allowlist = _load_episode_allowlist(args.episode_allowlist)
+    input_rows_before_allowlist = None
     if args.service_requests_jsonl:
-        rows = [validate_service_request(r) for r in _read_records(args.service_requests_jsonl, "service_requests")]
+        materialized = _read_records(args.service_requests_jsonl, "service_requests")
+        input_rows_before_allowlist = len(materialized)
+        if allowlist is not None:
+            materialized = [r for r in materialized if str(r.get("episode_id")) in allowlist]
+            if not materialized:
+                raise RuntimeError(f"episode allowlist {args.episode_allowlist} removed every materialized service request")
+        rows = [validate_service_request(r) for r in materialized]
         mode = "real_jsonl_validator"
     else:
         cfg = _demand_config(args.demand_sources_config)
@@ -295,6 +344,12 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
         "source": args.source_name,
         "mode": mode,
         "materialized_capability_profiles_jsonl": args.output_capability_profiles_jsonl,
+        "episode_allowlist": args.episode_allowlist,
+        "allowed_episode_count": len(allowlist) if allowlist is not None else None,
+        "input_rows_before_allowlist": input_rows_before_allowlist,
+        "unique_output_episodes": len({str(r.get("episode_id")) for r in rows}),
+        "require_trusted_entrances": bool(args.require_trusted_entrances),
+        "trusted_entrance_source_tokens": (["reviewed_audit:", "manual_audit:"] + list(args.trusted_entrance_source or [])) if args.require_trusted_entrances else [],
     }
     if args.report_json:
         dump_json(args.report_json, report)
@@ -315,6 +370,9 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--source_name", default="calibrated_service_layer")
     p.add_argument("--allow_non_entrance_od", action="store_true", help="Bootstrap-only: sample OD from sidewalk/curb nodes if entrance nodes are absent. Not valid for paper-mode datasets.")
+    p.add_argument("--episode_allowlist", default=None, help="Optional text/JSON episode-id allowlist. Paper builds should use an allowlist selected from audited PUDO + entrance evidence instead of forcing every nuPlan scenario into the main-result set.")
+    p.add_argument("--require_trusted_entrances", action="store_true", help="Restrict O/D sampling to independently audited/trusted entrance nodes. Manual/reviewed-audit sources are trusted by default.")
+    p.add_argument("--trusted_entrance_source", action="append", default=[], help="Additional trusted entrance source substring; repeat as needed.")
     p.add_argument("--report_json", default=None)
     args = p.parse_args()
     print(json.dumps(build(args), indent=2, sort_keys=True))

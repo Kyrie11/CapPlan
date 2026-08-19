@@ -7,6 +7,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 import argparse
 import hashlib
+import json
 import math
 import subprocess
 from dataclasses import asdict, replace
@@ -50,6 +51,24 @@ def _split_cli_path_list(values: List[str] | str | None) -> List[str]:
             if piece:
                 out.append(piece)
     return out
+
+
+def _load_episode_allowlist(path: str | None) -> set[str] | None:
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(p)
+    if p.suffix.lower() == ".json":
+        payload = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            return {str(x) for x in payload}
+        if isinstance(payload, dict):
+            for key in ["episode_ids", "allowed_episode_ids", "paper_episode_ids"]:
+                if isinstance(payload.get(key), list):
+                    return {str(x) for x in payload[key]}
+        raise RuntimeError(f"episode allowlist JSON has no supported episode-id list: {p}")
+    return {line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip() and not line.lstrip().startswith("#")}
 
 
 def _resolve_db_inputs(args: argparse.Namespace) -> List[str] | str | None:
@@ -168,6 +187,13 @@ def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: An
         raise RuntimeError(f"paper_mode requires validated georeference for {eid}; graph metadata georeference_validated=false")
     if args.reject_proxy_entrances and (_source_is_synthetic_or_proxy(origin.source) or _source_is_synthetic_or_proxy(destination.source)):
         raise RuntimeError(f"paper_mode rejects proxy/synthetic entrances for {eid}: {origin.source}, {destination.source}")
+    trusted_entrance_tokens = ["reviewed_audit:", "manual_audit:"] + list(getattr(args, "trusted_entrance_source", []) or [])
+    if not all(any(token.lower() in str(src or "").lower() for token in trusted_entrance_tokens) for src in [origin.source, destination.source]):
+        raise RuntimeError(
+            f"paper_mode requires independently audited/trusted origin+destination entrance sources for {eid}; "
+            f"got origin={origin.source!r}, destination={destination.source!r}. "
+            "Use reviewed manual entrance evidence or pass --trusted_entrance_source for an independently verified official source."
+        )
     if args.reject_synthetic_accessibility:
         bad_edges = [e.edge_id for e in graph.edges if _source_is_synthetic_or_proxy(e.source)]
         if bad_edges:
@@ -556,7 +582,8 @@ def main() -> None:
     # Backward-compatible alias; mapped to nuplan_data_root only when provided.
     p.add_argument("--nuplan_root", default=None)
     p.add_argument("--split", default="mini")
-    p.add_argument("--max_scenarios", type=int, default=4, help="Maximum matching scenarios; for real nuPlan data, 0 means all.")
+    p.add_argument("--max_scenarios", type=int, default=4, help="Maximum matching scenarios; for real nuPlan data, 0 means all. When --episode_allowlist is supplied, all DB scenarios are scanned and only allowlisted IDs are materialized.")
+    p.add_argument("--episode_allowlist", default=None, help="Optional text/JSON episode-id allowlist for audited paper subsets.")
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
     p.add_argument("--paper_mode", action="store_true", help="Enable publication-grade data gates: no synthetic/proxy fallbacks, no missing core evidence, and real service/profile/fleet inputs required.")
     p.add_argument("--source_policy", choices=["bootstrap", "paper"], default="bootstrap", help="Dataset evidence policy recorded in the manifest. paper requires --paper_mode and complete audited evidence.")
@@ -567,6 +594,7 @@ def main() -> None:
     p.add_argument("--fleet_jsonl", default=None, help="Fleet vehicle/interface JSONL. Paper mode requires this instead of the fixed smoke vehicle set.")
     p.add_argument("--capability_profiles_jsonl", default=None, help="Capability profiles in JSONL/YAML form. Paper mode requires this; smoke mode samples archetypes.")
     p.add_argument("--reject_proxy_entrances", action="store_true", help="Fail if entrances are proxy/synthetic sources.")
+    p.add_argument("--trusted_entrance_source", action="append", default=[], help="Additional source substring accepted as independently verified entrance truth in paper mode. Manual/reviewed audit sources are trusted by default.")
     p.add_argument("--reject_synthetic_accessibility", action="store_true", help="Fail if accessibility graph nodes/edges have synthetic/proxy provenance.")
     p.add_argument("--min_graph_nodes", type=int, default=100)
     p.add_argument("--min_graph_edges", type=int, default=150)
@@ -592,6 +620,9 @@ def main() -> None:
         args.reject_proxy_entrances = True
         args.reject_synthetic_accessibility = True
     _assert_paper_mode_config(args)
+    episode_allowlist = _load_episode_allowlist(args.episode_allowlist)
+    if episode_allowlist is not None and not episode_allowlist:
+        raise RuntimeError("episode allowlist is empty")
 
     service_requests_by_episode = load_service_requests_by_episode(args.service_requests_jsonl) if args.service_requests_jsonl else {}
     fleet_by_episode = load_fleet_interfaces(args.fleet_jsonl) if args.fleet_jsonl else {}
@@ -639,14 +670,26 @@ def main() -> None:
     counterfactual_pairs: List[Dict[str, Any]] = []
     service_request_records: List[Dict[str, Any]] = []
 
-    scenario_iter = adapter.iter_scenarios(args.max_scenarios)
+    # An episode allowlist is selected from evidence *after* candidate generation,
+    # so it may contain IDs that occur late in the DB stream. Do not apply the
+    # old first-N limit before filtering or the resulting paper subset would be
+    # order-dependent and silently incomplete.
+    adapter_limit = 0 if episode_allowlist is not None else args.max_scenarios
+    scenario_iter = adapter.iter_scenarios(adapter_limit)
     if not args.disable_tqdm:
-        scenario_iter = tqdm(scenario_iter, total=(None if args.max_scenarios <= 0 else args.max_scenarios), desc=f"build {args.scene_source} dataset", unit="scenario")
+        total = len(episode_allowlist) if episode_allowlist is not None else (None if args.max_scenarios <= 0 else args.max_scenarios)
+        scenario_iter = tqdm(scenario_iter, total=total, desc=f"build {args.scene_source} dataset", unit="scenario")
 
+    scanned_scenarios = 0
+    skipped_not_allowlisted = 0
     for record in scenario_iter:
+        scanned_scenarios += 1
         scene = record.scene
         ep = record.episode
         eid = ep.episode_id
+        if episode_allowlist is not None and eid not in episode_allowlist:
+            skipped_not_allowlisted += 1
+            continue
 
         request = None
         if args.service_layer_source in {"real_jsonl", "calibrated_od"}:
@@ -776,6 +819,15 @@ def main() -> None:
             if cert:
                 certificate_labels.append(to_dict(cert))
 
+    if episode_allowlist is not None:
+        built_ids = {str(e.get("episode_id")) for e in episodes}
+        missing_allowed = sorted(episode_allowlist - built_ids)
+        if missing_allowed:
+            raise RuntimeError(
+                f"episode allowlist requested {len(episode_allowlist)} IDs but {len(missing_allowed)} were not found in the configured nuPlan DB/map filter; "
+                f"first missing IDs: {missing_allowed[:10]}"
+            )
+
     write_jsonl(out / "scenes.jsonl", scenes)
     write_jsonl(out / "episodes.jsonl", episodes)
     write_jsonl(out / "entrances.jsonl", entrances)
@@ -805,6 +857,10 @@ def main() -> None:
         "builder_git_commit": _git_commit(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "strict_mode": bool(args.strict),
+        "episode_allowlist": args.episode_allowlist,
+        "episode_allowlist_count": len(episode_allowlist) if episode_allowlist is not None else None,
+        "scanned_scenarios": scanned_scenarios,
+        "skipped_not_allowlisted": skipped_not_allowlisted,
         "num_episodes": len(episodes),
         "num_contracts": len(contracts),
         "num_transitions": len(transitions),

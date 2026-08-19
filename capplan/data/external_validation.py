@@ -149,6 +149,25 @@ def _is_number(value: Any) -> bool:
         return False
 
 
+def _row_is_authoritative_or_audited(r: Mapping[str, Any], *, source_authoritative: bool = False) -> bool:
+    """Conservative publication-evidence predicate used by semantic preflight.
+
+    A file-level ``authoritative`` flag is accepted for genuinely official
+    homogeneous layers.  Mixed normalized layers must carry row-level audit /
+    authority markers so community/candidate rows cannot inherit trust from a
+    reviewed row elsewhere in the file.
+    """
+    if source_authoritative:
+        return True
+    if bool(r.get("authoritative")) or bool(r.get("audited")) or bool(r.get("reviewed")):
+        return True
+    tier = str(r.get("evidence_tier") or "").strip().lower()
+    if tier.startswith("a_") or tier in {"a", "tier_a", "authoritative"} or "manual_audit" in tier:
+        return True
+    source = str(r.get("source") or r.get("source_id") or "").strip().lower()
+    return any(token in source for token in ("reviewed_audit:", "manual_audit:"))
+
+
 def _semantic_role_check(role: Optional[str], rows: Sequence[Mapping[str, Any]], out: SourceInspection) -> None:
     if not role or not rows:
         return
@@ -202,20 +221,35 @@ def _semantic_role_check(role: Optional[str], rows: Sequence[Mapping[str, Any]],
     elif role == "curb_inventory":
         # A Boolean curb-ramp flag is useful topology, but it is not enough to
         # establish board/alight interface feasibility. Publication evidence
-        # needs at least one dimensional or slope measurement per usable record.
+        # needs dimensional/slope measurements, and we separately report how
+        # many of those measurements are backed by authoritative/audited rows.
         measured = ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "running_slope", "cross_slope", "ramp_slope", "landing_slope")
-        usable = sum(1 for r in rows if any(_is_number(r.get(k)) for k in measured))
+        usable_rows = [r for r in rows if any(_is_number(r.get(k)) for k in measured)]
+        audited_usable = sum(1 for r in usable_rows if _row_is_authoritative_or_audited(r, source_authoritative=out.authoritative))
         ramp_flags = sum(1 for r in rows if isinstance(r.get("curb_ramp"), bool))
-        out.role_stats["usable_physical_curb_records"] = usable
+        audited_core = sum(
+            1 for r in rows
+            if all(_is_number(r.get(k)) for k in ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m"))
+            and _row_is_authoritative_or_audited(r, source_authoritative=out.authoritative)
+        )
+        out.role_stats["usable_physical_curb_records"] = len(usable_rows)
+        out.role_stats["authoritative_or_audited_physical_curb_records"] = audited_usable
+        out.role_stats["authoritative_or_audited_complete_core_records"] = audited_core
         out.role_stats["curb_ramp_flag_records"] = ramp_flags
         out.role_stats["measured_fields_present"] = [k for k in measured if any(_is_number(r.get(k)) for r in rows)]
-        if usable <= 0:
+        if not usable_rows:
             out.errors.append("curb_inventory_has_no_dimensional_or_slope_measurements")
+        elif audited_usable <= 0:
+            out.warnings.append("curb_inventory_has_measurements_but_none_are_authoritative_or_audited")
     elif role == "curb_regulations":
-        usable = sum(1 for r in rows if isinstance(r.get("legal_stop"), bool) and bool(r.get("legal_basis") or r.get("source")))
-        out.role_stats["usable_legality_records"] = usable
-        if usable <= 0:
+        usable_rows = [r for r in rows if isinstance(r.get("legal_stop"), bool) and bool(r.get("legal_basis") or r.get("source"))]
+        audited_usable = sum(1 for r in usable_rows if _row_is_authoritative_or_audited(r, source_authoritative=out.authoritative))
+        out.role_stats["usable_legality_records"] = len(usable_rows)
+        out.role_stats["authoritative_or_audited_legality_records"] = audited_usable
+        if not usable_rows:
             out.errors.append("curb_regulation_has_no_boolean_legal_stop_with_basis")
+        elif audited_usable <= 0:
+            out.warnings.append("curb_regulation_has_legality_but_none_is_authoritative_or_audited")
     elif role == "entrances":
         def is_point(r: Mapping[str, Any]) -> bool:
             geom = r.get("geometry") if isinstance(r.get("geometry"), dict) else {}
@@ -226,15 +260,19 @@ def _semantic_role_check(role: Optional[str], rows: Sequence[Mapping[str, Any]],
                 or (_is_number(r.get("longitude")) and _is_number(r.get("latitude")))
             )
         usable = sum(1 for r in rows if is_point(r))
-        verified = sum(1 for r in rows if is_point(r) and not bool(r.get("is_proxy")) and str(r.get("kind") or "").lower() != "entrance_proxy")
+        verified_rows = [r for r in rows if is_point(r) and not bool(r.get("is_proxy")) and str(r.get("kind") or "").lower() != "entrance_proxy"]
+        audited_verified = sum(1 for r in verified_rows if _row_is_authoritative_or_audited(r, source_authoritative=out.authoritative))
         proxies = sum(1 for r in rows if is_point(r) and (bool(r.get("is_proxy")) or str(r.get("kind") or "").lower() == "entrance_proxy"))
         out.role_stats["usable_entrance_points"] = usable
-        out.role_stats["verified_nonproxy_entrance_points"] = verified
+        out.role_stats["verified_nonproxy_entrance_points"] = len(verified_rows)
+        out.role_stats["authoritative_or_audited_nonproxy_entrance_points"] = audited_verified
         out.role_stats["proxy_entrance_points"] = proxies
         if usable <= 0:
             out.errors.append("entrance_source_has_no_point_entrances")
-        elif verified <= 0:
+        elif not verified_rows:
             out.errors.append("entrance_source_contains_only_proxy_points")
+        elif audited_verified <= 0:
+            out.warnings.append("entrance_source_has_nonproxy_points_but_none_is_authoritative_or_audited")
     elif role == "manual_audit":
         usable = sum(1 for r in rows if r.get("audit_id") and r.get("observed_at") and r.get("auditor_id"))
         out.role_stats["usable_audit_records"] = usable
@@ -477,6 +515,7 @@ def validate_city_sources(
         except Exception:
             georef_payload = {}
 
+    require_audited_core = bool(city_cfg.get("require_audited_core_evidence", False))
     requirements = {
         "pedestrian_topology": topology_ok,
         "georeference_parseable": inspections["georeference_json"].valid,
@@ -485,9 +524,18 @@ def validate_city_sources(
             and bool(georef_payload.get("validated", False))
             and bool(georef_payload.get("spatial_alignment_validated", False))
         ),
-        "curb_physical_inventory": inspections["curb_inventory_jsonl"].valid,
-        "curb_legality_or_regulation": inspections["curb_regulation_jsonl"].valid,
-        "entrance_layer": inspections["entrance_source"].valid,
+        "curb_physical_inventory": (
+            inspections["curb_inventory_jsonl"].valid
+            and (not require_audited_core or int(inspections["curb_inventory_jsonl"].role_stats.get("authoritative_or_audited_physical_curb_records", 0)) > 0)
+        ),
+        "curb_legality_or_regulation": (
+            inspections["curb_regulation_jsonl"].valid
+            and (not require_audited_core or int(inspections["curb_regulation_jsonl"].role_stats.get("authoritative_or_audited_legality_records", 0)) > 0)
+        ),
+        "entrance_layer": (
+            inspections["entrance_source"].valid
+            and (not require_audited_core or int(inspections["entrance_source"].role_stats.get("authoritative_or_audited_nonproxy_entrance_points", 0)) > 0)
+        ),
         "elevation_or_measured_slope": inspections["elevation_source"].valid or bool(city_cfg.get("all_slopes_measured", False)),
         "authoritative_accessibility_evidence": (
             (inspections["city_gis_dir"].valid and (inspections["city_gis_dir"].authoritative or bool(city_cfg.get("city_gis_authoritative", False))))
@@ -513,6 +561,8 @@ def validate_city_sources(
     warnings: List[str] = []
     if inspections["opensidewalks_source"].valid and not is_validated_osw(inspections["opensidewalks_source"]):
         warnings.append("opensidewalks_source_is_only_an_osm_derived_candidate")
+    if policy == "paper" and not require_audited_core:
+        warnings.append("strict_audited_core_evidence_preflight_is_disabled")
     if policy == "bootstrap":
         missing_paper = [name for name in paper_required if not requirements[name]]
         if missing_paper:

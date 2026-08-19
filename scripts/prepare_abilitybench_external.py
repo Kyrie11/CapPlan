@@ -208,7 +208,7 @@ def _require_artifact(path: Path, label: str, dry_run: bool) -> None:
         raise RuntimeError(f"{label} is missing or invalid: {path}; errors={report.errors}")
 
 
-def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dry_run: bool, disable_tqdm: bool = False, source_policy_override: str | None = None, cities_override: str | None = None, max_scenarios_override: int | None = None) -> None:
+def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dry_run: bool, disable_tqdm: bool = False, source_policy_override: str | None = None, cities_override: str | None = None, max_scenarios_override: int | None = None, episode_allowlist_override: str | None = None) -> None:
     nuplan = config["nuplan"]
     external_root = _path(config.get("external_root", "{project_root}/data/external"))
     outputs_root = _path(config.get("outputs_root", "{project_root}/data/outputs"))
@@ -229,6 +229,9 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
         cities = wanted
     max_per_city = int(split_cfg.get("max_scenarios_per_city", 100) if max_scenarios_override is None else max_scenarios_override)
     source_policy = _source_policy(config, source_policy_override)
+    episode_allowlist = _path(episode_allowlist_override) if episode_allowlist_override else None
+    if episode_allowlist is not None and not dry_run and not episode_allowlist.exists():
+        raise FileNotFoundError(episode_allowlist)
     num_workers = int(config.get("num_workers", 0))
     seed = int(config.get("seed", 13))
     min_nodes = int(config.get("quality", {}).get("min_graph_nodes", 100))
@@ -323,6 +326,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 split_name,
                 "--max_scenarios",
                 str(max_per_city),
+                *( ["--episode_allowlist", str(episode_allowlist)] if episode_allowlist else [] ),
                 "--num_workers",
                 str(num_workers),
                 "--seed",
@@ -434,6 +438,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             )
         service_cfg = config.get("service", {}) or {}
         profile_source = _path(service_cfg["capability_profiles"]) if service_cfg.get("capability_profiles") else None
+        trusted_entrance_sources = [str(x) for x in (service_cfg.get("trusted_entrance_sources") or [])]
         demand_cfg = _path(service_cfg["demand_sources_config"]) if service_cfg.get("demand_sources_config") else None
         _run(
             [
@@ -457,6 +462,9 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(reports_root / "service_layer.json"),
                 "--seed",
                 str(seed),
+                *( ["--episode_allowlist", str(episode_allowlist)] if episode_allowlist else [] ),
+                *( ["--require_trusted_entrances"] if source_policy == "paper" else [] ),
+                *( sum((["--trusted_entrance_source", src] for src in trusted_entrance_sources), []) if source_policy == "paper" else [] ),
                 *( ["--allow_non_entrance_od"] if source_policy == "bootstrap" else [] ),
             ],
             dry_run,
@@ -516,6 +524,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--fleet_jsonl",
                 str(fleet_jsonl),
                 *( ["--reject_synthetic_accessibility", "--reject_proxy_entrances"] if source_policy == "paper" else ["--allow_bootstrap_service_nodes"] ),
+                *( sum((["--trusted_entrance_source", src] for src in [str(x) for x in ((config.get("service", {}) or {}).get("trusted_entrance_sources") or [])]), []) if source_policy == "paper" else [] ),
                 "--min_graph_nodes",
                 str(min_nodes),
                 "--min_graph_edges",
@@ -588,11 +597,12 @@ def main() -> None:
     p.add_argument("--source_policy", choices=["bootstrap", "paper"], default=None, help="bootstrap builds a real-data diagnostic dataset with fail-closed missing evidence; paper requires complete evidence categories; OSM and OpenSidewalks are alternatives, not both mandatory.")
     p.add_argument("--cities", default=None, help="Optional comma/plus-separated city subset for fast diagnostics, e.g. boston or boston+vegas.")
     p.add_argument("--max_scenarios_per_city", type=int, default=None, help="Override config split max_scenarios_per_city. For real nuPlan data, 0 means all matching scenarios.")
+    p.add_argument("--episode_allowlist", default=None, help="Optional split-level text/JSON episode allowlist produced from audited paper evidence. Applied to service and dataset stages; candidate extraction/graphs/PUDO remain complete.")
     args = p.parse_args()
     stages = {x.strip() for x in args.stages.split(",") if x.strip()}
     config = _load_config(args.config)
     config["_config_path"] = args.config
-    build_pipeline(config, args.split, stages, args.dry_run, args.disable_tqdm, args.source_policy, args.cities, args.max_scenarios_per_city)
+    build_pipeline(config, args.split, stages, args.dry_run, args.disable_tqdm, args.source_policy, args.cities, args.max_scenarios_per_city, args.episode_allowlist)
 
 
 if __name__ == "__main__":

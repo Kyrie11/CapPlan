@@ -60,6 +60,11 @@ fetch_public() {
     --config "$CONFIG" --cities boston,pittsburgh,vegas,singapore --strict
 }
 
+fetch_public_force() {
+  runlog fetch_recommended_public_sources.force python scripts/fetch_recommended_public_sources.py \
+    --config "$CONFIG" --cities boston,pittsburgh,vegas,singapore --strict --force
+}
+
 validate_dem_city() {
   local city="$1" res="$2" datum="$3" source="$4"
   local -a rasters=("$EXT/raw/dem/$city"/*.tif)
@@ -148,13 +153,208 @@ paper_pilot() {
     --stages preflight,extract,graphs,pudo,service,dataset,merge
 }
 
-paper_full() {
+
+bootstrap_candidates_full() {
+  # Pass 1: enumerate all matching nuPlan scenarios and build candidate
+  # accessibility/PUDO evidence. Do not create publication labels yet.
   for split in train val test; do
-    runlog "paper.${split}.all" python scripts/prepare_abilitybench_external.py \
+    runlog "bootstrap_candidates.${split}.all" python scripts/prepare_abilitybench_external.py \
+      --config "$CONFIG" --split "$split" --source_policy bootstrap \
+      --cities boston+pittsburgh+vegas+singapore --max_scenarios_per_city 0 \
+      --stages preflight,extract,graphs,pudo --disable_tqdm
+  done
+}
+
+build_site_catalogs() {
+  for city in boston pittsburgh vegas singapore; do
+    mkdir -p "$EXT/audits/$city"
+    runlog "paper_site_catalog.${city}" python scripts/build_pudo_site_catalog.py \
+      --input "train=$DATA_ROOT/outputs/prepared/train/pudo/${city}.jsonl" \
+      --input "val=$DATA_ROOT/outputs/prepared/val/pudo/${city}.jsonl" \
+      --input "test=$DATA_ROOT/outputs/prepared/test/pudo/${city}.jsonl" \
+      --georeference_json "$EXT/georeference/${city}.json" --city "$city" \
+      --max_candidates_per_episode 4 --dedup_radius_m 5 \
+      --output_csv "$EXT/audits/$city/pudo_site_catalog.csv" \
+      --report_json "$REPORTS/paper_site_catalog.${city}.json" \
+      --split_exclusion_json "$EXT/audits/$city/site_disjoint_exclusions.json"
+  done
+}
+
+prefill_audit_worklists() {
+  for city in boston pittsburgh vegas singapore; do
+    runlog "pudo_audit_prefill.${city}" python scripts/prepare_pudo_audit_worklist.py \
+      --input_csv "$EXT/audits/$city/pudo_site_catalog.csv" --city "$city" \
+      --external_root "$EXT" \
+      --output_csv "$EXT/audits/$city/pudo_audit_worklist.csv" \
+      --report_json "$REPORTS/pudo_audit_prefill.${city}.json"
+  done
+}
+
+classify_audits() {
+  for city in boston pittsburgh vegas singapore; do
+    runlog "pudo_audit_classify.${city}" python scripts/review_pudo_audit_worklist.py \
+      --input_csv "$EXT/audits/$city/pudo_audit_worklist.csv" \
+      --output_csv "$EXT/audits/$city/pudo_audit_review_status.csv" \
+      --review_candidates_csv "$EXT/audits/$city/source_complete_review_candidates.csv" \
+      --accepted_csv "$EXT/audits/$city/pudo_audit_source_accepted.csv" \
+      --unresolved_csv "$EXT/audits/$city/pudo_audit_unresolved.csv" \
+      --report_json "$REPORTS/pudo_audit_classify.${city}.json"
+  done
+}
+
+review_source_complete_audits() {
+  : "${REVIEWER_ID:?Set REVIEWER_ID only after a reviewer has inspected source_complete_review_candidates.csv}"
+  : "${CONFIRM_SOURCE_REVIEW:?Set CONFIRM_SOURCE_REVIEW=YES only after actual human review}"
+  [[ "$CONFIRM_SOURCE_REVIEW" == "YES" ]] || { echo "CONFIRM_SOURCE_REVIEW must equal YES" >&2; return 2; }
+  for city in boston pittsburgh vegas singapore; do
+    local review_csv="$EXT/audits/$city/source_complete_review_candidates.csv"
+    if [[ ! -s "$review_csv" ]] || [[ $(wc -l < "$review_csv") -le 1 ]]; then
+      echo "INFO: no source-complete review candidates for $city; skip explicit source review"
+      continue
+    fi
+    runlog "pudo_audit_source_review.${city}" python scripts/review_pudo_audit_worklist.py \
+      --input_csv "$review_csv" \
+      --output_csv "$EXT/audits/$city/pudo_audit_review_status.csv" \
+      --review_candidates_csv "$review_csv" \
+      --accepted_csv "$EXT/audits/$city/pudo_audit_source_accepted.csv" \
+      --unresolved_csv "$EXT/audits/$city/pudo_audit_unresolved.csv" \
+      --approve_source_complete --reviewer_id "$REVIEWER_ID" \
+      --report_json "$REPORTS/pudo_audit_source_review.${city}.json"
+  done
+}
+
+import_source_complete_audits() {
+  for city in boston pittsburgh vegas singapore; do
+    local csv="$EXT/audits/$city/pudo_audit_source_accepted.csv"
+    if [[ -s "$csv" ]] && [[ $(wc -l < "$csv") -gt 1 ]]; then
+      runlog "manual_audit_layers.source.${city}" python scripts/build_manual_audit_layers.py \
+        --input_csv "$csv" --city "$city" --external_root "$EXT" --paper_mode \
+        --report_json "$REPORTS/manual_audit_layers.source.${city}.json"
+    else
+      echo "INFO: no automatically source-complete audited rows for $city; unresolved rows remain in pudo_audit_unresolved.csv"
+    fi
+  done
+}
+
+import_completed_manual_audits() {
+  # For facts that cannot be established from an authoritative source, populate
+  # audits/<city>/pudo_audit_manual_completed.csv with actual observations.
+  # observed_at and auditor_id must be factual; this stage never invents them.
+  for city in boston pittsburgh vegas singapore; do
+    local csv="$EXT/audits/$city/pudo_audit_manual_completed.csv"
+    if [[ -s "$csv" ]] && [[ $(wc -l < "$csv") -gt 1 ]]; then
+      runlog "manual_audit_layers.manual.${city}" python scripts/build_manual_audit_layers.py \
+        --input_csv "$csv" --city "$city" --external_root "$EXT" --paper_mode \
+        --report_json "$REPORTS/manual_audit_layers.manual.${city}.json"
+    else
+      echo "INFO: no completed manual audit CSV for $city at $csv"
+    fi
+  done
+}
+
+rebuild_paper_evidence_full() {
+  # Pass 2: recompute graph/PUDO evidence against the frozen reviewed snapshot.
+  for split in train val test; do
+    runlog "paper_evidence.${split}.all" python scripts/prepare_abilitybench_external.py \
       --config "$CONFIG" --split "$split" --source_policy paper \
       --cities boston+pittsburgh+vegas+singapore --max_scenarios_per_city 0 \
-      --stages preflight,extract,graphs,pudo,service,dataset,merge
+      --stages preflight,graphs,pudo --disable_tqdm
   done
+}
+
+select_paper_allowlists() {
+  # First select episodes purely by paper evidence/graph quality.  Then compute
+  # physical-site leakage only among those preliminary episodes, so a bootstrap
+  # candidate that can never enter the paper set does not unnecessarily delete
+  # a lower-priority training episode.
+  for city in boston pittsburgh vegas singapore; do
+    mkdir -p "$EXT/audits/$city/paper_allowlists"
+    for split in train val test; do
+      runlog "paper_select_pre_site.${city}.${split}" python scripts/select_paper_episodes.py \
+        --pudo_evidence_jsonl "$DATA_ROOT/outputs/prepared/$split/pudo/${city}.jsonl" \
+        --accessibility_graph_dir "$DATA_ROOT/outputs/prepared/$split/accessibility_graphs" \
+        --city "$city" --split "$split" \
+        --min_paper_eligible_pudos 2 --min_distinct_pudo_sites 2 \
+        --min_graph_nodes 100 --min_graph_edges 150 \
+        --output_txt "$EXT/audits/$city/paper_allowlists/${split}.pre_site.txt" \
+        --report_json "$REPORTS/paper_select_pre_site.${city}.${split}.json"
+    done
+
+    runlog "paper_anchor_leakage.${city}" python scripts/build_paper_anchor_leakage.py \
+      --pudo_input "train=$DATA_ROOT/outputs/prepared/train/pudo/${city}.jsonl" \
+      --pudo_input "val=$DATA_ROOT/outputs/prepared/val/pudo/${city}.jsonl" \
+      --pudo_input "test=$DATA_ROOT/outputs/prepared/test/pudo/${city}.jsonl" \
+      --graph_input "train=$DATA_ROOT/outputs/prepared/train/accessibility_graphs" \
+      --graph_input "val=$DATA_ROOT/outputs/prepared/val/accessibility_graphs" \
+      --graph_input "test=$DATA_ROOT/outputs/prepared/test/accessibility_graphs" \
+      --allowlist "train=$EXT/audits/$city/paper_allowlists/train.pre_site.txt" \
+      --allowlist "val=$EXT/audits/$city/paper_allowlists/val.pre_site.txt" \
+      --allowlist "test=$EXT/audits/$city/paper_allowlists/test.pre_site.txt" \
+      --city "$city" --pudo_radius_m 5 --entrance_radius_m 5 \
+      --output_json "$EXT/audits/$city/paper_anchor_site_disjoint_exclusions.json"
+
+    for split in train val test; do
+      runlog "paper_select.${city}.${split}" python scripts/select_paper_episodes.py \
+        --pudo_evidence_jsonl "$DATA_ROOT/outputs/prepared/$split/pudo/${city}.jsonl" \
+        --accessibility_graph_dir "$DATA_ROOT/outputs/prepared/$split/accessibility_graphs" \
+        --city "$city" --split "$split" \
+        --site_exclusion_json "$EXT/audits/$city/paper_anchor_site_disjoint_exclusions.json" \
+        --min_paper_eligible_pudos 2 --min_distinct_pudo_sites 2 \
+        --min_graph_nodes 100 --min_graph_edges 150 \
+        --output_txt "$EXT/audits/$city/paper_allowlists/${split}.txt" \
+        --report_json "$REPORTS/paper_select.${city}.${split}.json"
+    done
+  done
+}
+
+paper_build_allowlisted() {
+  # Different cities have different paper allowlists, so build city datasets
+  # independently, then merge back into official train/val/test split names.
+  for split in train val test; do
+    for city in boston pittsburgh vegas singapore; do
+      local allow="$EXT/audits/$city/paper_allowlists/${split}.txt"
+      [[ -s "$allow" ]] || { echo "Empty/missing paper allowlist: $allow" >&2; return 2; }
+      runlog "paper.${split}.${city}.allowlisted" python scripts/prepare_abilitybench_external.py \
+        --config "$CONFIG" --split "$split" --source_policy paper --cities "$city" \
+        --max_scenarios_per_city 0 --episode_allowlist "$allow" \
+        --stages service,dataset --disable_tqdm
+      if [[ -s "$REPORTS/build/$split/service_layer.json" ]]; then
+        cp "$REPORTS/build/$split/service_layer.json" "$REPORTS/build/$split/service_layer.${city}.json"
+      fi
+    done
+    runlog "paper.${split}.merge" python scripts/prepare_abilitybench_external.py \
+      --config "$CONFIG" --split "$split" --source_policy paper \
+      --cities boston+pittsburgh+vegas+singapore --max_scenarios_per_city 0 --stages merge
+    runlog "paper.${split}.validate" python scripts/validate_dataset.py \
+      --dataset_dir "$DATA_ROOT/outputs/datasets/abilitybench_av_${split}" --strict
+    runlog "paper.${split}.audit" python scripts/audit_dataset_quality.py \
+      --dataset_dir "$DATA_ROOT/outputs/datasets/abilitybench_av_${split}" \
+      --paper_mode --fail_if_not_publication_ready \
+      --output "$REPORTS/dataset_quality.paper.${split}.json"
+  done
+}
+
+qa_snapshot() {
+  runlog "four_city_paper_readiness" python scripts/check_four_city_paper_readiness.py \
+    --config "$CONFIG" --reports_root "$REPORTS" \
+    --output_json "$REPORTS/four_city_paper_readiness.json"
+}
+
+qa_strict() {
+  runlog "four_city_paper_readiness.strict" python scripts/check_four_city_paper_readiness.py \
+    --config "$CONFIG" --reports_root "$REPORTS" --require_allowlists --strict \
+    --output_json "$REPORTS/four_city_paper_readiness.strict.json"
+}
+
+qa_bundle() {
+  runlog "qa_bundle" python scripts/package_capplan_qa_bundle.py \
+    --config "$CONFIG" --reports_root "$REPORTS" \
+    --output_zip "$REPORTS/capplan_paper_qa_bundle.zip"
+}
+
+paper_full() {
+  echo "paper-full is now the allowlisted second-pass build; run bootstrap-candidates-full -> site-catalogs -> prefill-audits -> classify-audits -> review/manual audit -> import -> provenance/paper-preflight -> rebuild-paper-evidence-full -> select-paper-allowlists first." >&2
+  paper_build_allowlisted
 }
 
 merge_all() {
@@ -195,16 +395,30 @@ Stages:
   inspect-nuplan
   prepare-osm
   fetch-public
+  fetch-public-force       # repair/refresh all automatable public layers
   validate-dems
   bootstrap-preflight
   bootstrap-pilot
-  export-audits
-  build-audits
+  bootstrap-candidates-full
+  site-catalogs
+  prefill-audits
+  classify-audits
+  review-source-complete-audits
+  import-source-complete-audits
+  import-completed-manual-audits
+  export-audits             # legacy pilot shortlist
+  build-audits              # legacy pilot importer
   build-provenance
   paper-preflight
   paper-pilot
-  paper-full
+  rebuild-paper-evidence-full
+  select-paper-allowlists
+  paper-build-allowlisted
+  paper-full                # alias for paper-build-allowlisted
   merge-all
+  qa-snapshot
+  qa-strict
+  qa-bundle
   train-surrogate
   auto-bootstrap   # inspect + osm + fetch + dem + bootstrap preflight + pilot
 USAGE
@@ -215,16 +429,30 @@ case "${1:-}" in
   inspect-nuplan) inspect_nuplan ;;
   prepare-osm) prepare_osm ;;
   fetch-public) fetch_public ;;
+  fetch-public-force) fetch_public_force ;;
   validate-dems) validate_dems ;;
   bootstrap-preflight) bootstrap_preflight ;;
   bootstrap-pilot) bootstrap_pilot ;;
+  bootstrap-candidates-full) bootstrap_candidates_full ;;
+  site-catalogs) build_site_catalogs ;;
+  prefill-audits) prefill_audit_worklists ;;
+  classify-audits) classify_audits ;;
+  review-source-complete-audits) review_source_complete_audits ;;
+  import-source-complete-audits) import_source_complete_audits ;;
+  import-completed-manual-audits) import_completed_manual_audits ;;
   export-audits) export_audits ;;
   build-audits) build_audits ;;
   build-provenance) build_provenance ;;
   paper-preflight) paper_preflight ;;
   paper-pilot) paper_pilot ;;
+  rebuild-paper-evidence-full) rebuild_paper_evidence_full ;;
+  select-paper-allowlists) select_paper_allowlists ;;
+  paper-build-allowlisted) paper_build_allowlisted ;;
   paper-full) paper_full ;;
   merge-all) merge_all ;;
+  qa-snapshot) qa_snapshot ;;
+  qa-strict) qa_strict ;;
+  qa-bundle) qa_bundle ;;
   train-surrogate) train_surrogate ;;
   auto-bootstrap)
     inspect_nuplan

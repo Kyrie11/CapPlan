@@ -17,25 +17,75 @@ from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 CORE = ["curb_height_m", "deployment_clearance_m", "sidewalk_width_m"]
 
 
+def _legacy_manual_audit_source(value: Any) -> bool:
+    """Compatibility for pre-v2 reviewed audit rows.
+
+    New importers write explicit ``authoritative``/``audited`` flags. Older
+    CapPlan audit fixtures used source names such as ``manual_interface_audit``
+    and ``manual_posted_sign_audit``. Accept only the narrow manual+audit
+    pattern, never a generic ``manual`` or official-candidate label.
+    """
+    s = str(value or "").strip().lower()
+    return ("manual" in s and "audit" in s) or s.startswith("reviewed_audit:") or s.startswith("manual_audit:")
+
+
 def _paper_evidence_flags(row: Dict[str, Any]) -> Tuple[bool, bool, str]:
     core_complete = all(row.get(k) is not None for k in CORE)
     has_ped_binding = bool(row.get("adjacent_ped_node_id"))
+
     legality_source = str(row.get("legal_stop_source") or "").lower()
-    has_legality_evidence = bool(legality_source) and legality_source not in {"unknown", "none"} and "no_matching_regulation" not in legality_source and "heuristic" not in legality_source and "no_legality_evidence" not in legality_source
+    has_legality_source = (
+        bool(legality_source)
+        and legality_source not in {"unknown", "none"}
+        and "no_matching_regulation" not in legality_source
+        and "heuristic" not in legality_source
+        and "no_legality_evidence" not in legality_source
+    )
+    legality_authoritative = bool(row.get("legal_stop_authoritative")) or _legacy_manual_audit_source(legality_source)
+    has_legality_evidence = has_legality_source and legality_authoritative
+
     source = str(row.get("source") or "").lower()
     interface_source = str(row.get("curb_inventory_source") or row.get("interface_evidence_source") or "").lower()
     trustworthy_source = not (source.startswith("synthetic") or source in {"toy", "mock", "unknown", ""})
-    has_interface_evidence = bool(interface_source) and not (interface_source.startswith("synthetic") or "proxy" in interface_source or interface_source in {"toy", "mock", "unknown"})
+    interface_source_ok = bool(interface_source) and not (interface_source.startswith("synthetic") or "proxy" in interface_source or interface_source in {"toy", "mock", "unknown"})
+    inventory_core_fields = {str(x) for x in (row.get("curb_inventory_core_fields") or [])}
+    legacy_manual_interface = _legacy_manual_audit_source(interface_source)
+    if not inventory_core_fields and legacy_manual_interface and core_complete:
+        # In the pre-v2 schema the audit source was stored but field-level core
+        # provenance was not. This compatibility path is intentionally limited
+        # to explicit manual-audit source names.
+        inventory_core_fields = set(CORE)
+    interface_authoritative = bool(row.get("curb_inventory_authoritative")) or legacy_manual_interface
+    # Every publication-core dimension must be present on the *same matched*
+    # audited/authoritative inventory record. This prevents a community/graph
+    # width from being combined with one audited curb dimension and then
+    # mislabeled as fully audited interface evidence.
+    has_interface_evidence = interface_source_ok and interface_authoritative and all(k in inventory_core_fields for k in CORE)
+
     evidence_complete = core_complete and has_ped_binding and has_legality_evidence and trustworthy_source and has_interface_evidence
     eligible = evidence_complete and bool(row.get("legal_stop"))
     missing = [k for k in CORE if row.get(k) is None]
     reasons = []
-    if missing: reasons.append("missing:" + ",".join(missing))
-    if not has_ped_binding: reasons.append("no_pedestrian_binding")
-    if not has_legality_evidence: reasons.append("no_independent_legality_evidence")
-    if not trustworthy_source: reasons.append("non_auditable_candidate_source")
-    if not has_interface_evidence: reasons.append("no_auditable_interface_evidence")
-    if evidence_complete and not bool(row.get("legal_stop")): reasons.append("legality_negative")
+    if missing:
+        reasons.append("missing:" + ",".join(missing))
+    if not has_ped_binding:
+        reasons.append("no_pedestrian_binding")
+    if not has_legality_source:
+        reasons.append("no_independent_legality_evidence")
+    elif not legality_authoritative:
+        reasons.append("legality_source_not_audited_or_authoritative")
+    if not trustworthy_source:
+        reasons.append("non_auditable_candidate_source")
+    if not interface_source_ok:
+        reasons.append("no_auditable_interface_evidence")
+    elif not interface_authoritative:
+        reasons.append("interface_source_not_audited_or_authoritative")
+    else:
+        missing_inventory = [k for k in CORE if k not in inventory_core_fields]
+        if missing_inventory:
+            reasons.append("interface_core_not_from_same_audited_inventory:" + ",".join(missing_inventory))
+    if evidence_complete and not bool(row.get("legal_stop")):
+        reasons.append("legality_negative")
     return evidence_complete, eligible, "paper_ready" if eligible else ("evidence_complete_negative" if evidence_complete else ";".join(reasons) or "candidate_uncertain")
 
 
@@ -196,7 +246,12 @@ def normalize(row: Dict[str, Any], default_source: str, transformer: Optional[Co
     out.setdefault("legal_stop", _bool(row.get("legal_stop", row.get("vehicle_stop_feasible", row.get("regulation", None))), False))
     if any(out.get(k) is not None for k in CORE):
         out.setdefault("curb_inventory_source", str(source))
+    tier = str(row.get("evidence_tier") or "").lower()
+    authoritative = bool(row.get("authoritative") is True or row.get("audited") is True or tier.startswith("a_"))
+    out.setdefault("curb_inventory_authoritative", authoritative)
+    out.setdefault("curb_inventory_core_fields", [k for k in CORE if out.get(k) is not None])
     out.setdefault("legal_stop_source", row.get("legal_stop_source") or row.get("regulation_id") or row.get("curb_regulation_source") or source)
+    out.setdefault("legal_stop_authoritative", authoritative)
     out.setdefault("side", row.get("side", "unknown"))
     if "availability" in row and "dynamic_confidence" not in out:
         out["dynamic_confidence"] = max(0.0, min(1.0, float(row["availability"])))
@@ -292,6 +347,14 @@ def _as_inventory_record(row: Dict[str, Any], transformer: Optional[CoordinateTr
         "surface": _first_present(row, ["surface", "material"]),
         "curb_ramp": _bool(_first_present(row, ["curb_ramp", "ramp", "has_ramp", "kerb_ramp"]), False),
     }
+    view = _row_view(row)
+    tier = str(view.get("evidence_tier") or "").lower()
+    legacy_audit = _legacy_manual_audit_source(source)
+    rec["authoritative"] = bool(view.get("authoritative") is True or view.get("audited") is True or tier.startswith("a_") or legacy_audit)
+    rec["audited"] = bool(view.get("audited") is True or legacy_audit)
+    rec["evidence_tier"] = view.get("evidence_tier")
+    rec["observed_at"] = view.get("observed_at")
+    rec["core_fields"] = [k for k in CORE if rec.get(k) is not None]
     return rec
 
 
@@ -405,6 +468,7 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "side": str(_coalesce(candidate_view.get("side"), (inv or {}).get("side"), nearest_route_side([x, y], route) if route else "unknown")),
                 "legal_stop": legal,
                 "legal_stop_source": str((reg or {}).get("source") or (reg or {}).get("regulation_id") or "no_matching_regulation_fail_closed"),
+                "legal_stop_authoritative": bool((reg or {}).get("authoritative") is True or (reg or {}).get("audited") is True or str((reg or {}).get("evidence_tier") or "").lower().startswith("a_") or _legacy_manual_audit_source((reg or {}).get("source"))),
                 "adjacent_ped_node_id": ped_id,
                 "curb_height_m": (inv or {}).get("curb_height_m"),
                 "sidewalk_width_m": width,
@@ -416,6 +480,8 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "candidate_source": candidate_source,
                 "candidate_only": True,
                 "curb_inventory_source": (inv or {}).get("source"),
+                "curb_inventory_authoritative": bool((inv or {}).get("authoritative")),
+                "curb_inventory_core_fields": list((inv or {}).get("core_fields") or []),
                 "curb_inventory_match_distance_m": (inv or {}).get("distance_m"),
                 "source": candidate_source,
                 "evidence_notes": "external_candidate_only; legality and board/alight interface require independent matched evidence",
@@ -436,9 +502,13 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
             legal = _bool((reg or {}).get("legal_stop", (reg or {}).get("stopping_allowed", (reg or {}).get("regulation"))), False)
             nearest_ped, _ = _nearest_node(n.x, n.y, graph.nodes, {"sidewalk", "crossing", "entrance"})
             blockage = _blockage_from_agents(n.x, n.y, scene.metadata if scene else {})
-            width = _coalesce(nattrs.get("width_m"), attrs.get("sidewalk_width_m"), (inv or {}).get("sidewalk_width_m"))
-            clearance = _coalesce(nattrs.get("deployment_clearance_m"), (inv or {}).get("deployment_clearance_m"))
-            curb_height = _coalesce(nattrs.get("curb_height_m"), (inv or {}).get("curb_height_m"))
+            # Publication-core interface dimensions must come from the matched
+            # audited/authoritative inventory when available.  The old order
+            # preferred graph/OSM values but still labeled curb_inventory_source
+            # with the audited record, which could misattribute provenance.
+            width = _coalesce((inv or {}).get("sidewalk_width_m"), nattrs.get("width_m"), attrs.get("sidewalk_width_m"))
+            clearance = _coalesce((inv or {}).get("deployment_clearance_m"), nattrs.get("deployment_clearance_m"))
+            curb_height = _coalesce((inv or {}).get("curb_height_m"), nattrs.get("curb_height_m"))
             confidence_terms = [float(n.confidence), float((reg or {}).get("confidence", 1.0) or 1.0)]
             if inv:
                 confidence_terms.append(float(inv.get("confidence", 1.0) or 1.0))
@@ -454,6 +524,7 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "side": str(_coalesce(nattrs.get("route_side"), (inv or {}).get("side"), nearest_route_side([n.x, n.y], route) if route else "unknown")),
                 "legal_stop": legal,
                 "legal_stop_source": str((reg or {}).get("source") or (reg or {}).get("regulation_id") or "no_matching_regulation_fail_closed"),
+                "legal_stop_authoritative": bool((reg or {}).get("authoritative") is True or (reg or {}).get("audited") is True or str((reg or {}).get("evidence_tier") or "").lower().startswith("a_") or _legacy_manual_audit_source((reg or {}).get("source"))),
                 "adjacent_ped_node_id": nearest_ped.node_id if nearest_ped else None,
                 "curb_height_m": curb_height,
                 "sidewalk_width_m": width,
@@ -464,6 +535,8 @@ def _build_from_graphs(args: argparse.Namespace, normalized_input_rows: List[Dic
                 "lighting": attrs.get("lighting"),
                 "shelter": attrs.get("shelter"),
                 "curb_inventory_source": (inv or {}).get("source"),
+                "curb_inventory_authoritative": bool((inv or {}).get("authoritative")),
+                "curb_inventory_core_fields": list((inv or {}).get("core_fields") or []),
                 "curb_inventory_match_distance_m": (inv or {}).get("distance_m"),
                 "source": args.source_name,
                 "evidence_notes": "derived_from_accessibility_graph_and_city_curb_regulation; legal_stop fails closed without matched regulation",

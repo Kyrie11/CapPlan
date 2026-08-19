@@ -98,8 +98,37 @@ def download_layer(
         retries=retries,
         timeout=timeout,
     )
-    object_ids = sorted({int(x) for x in ids_payload.get("objectIds", [])})
-    oid_field = ids_payload.get("objectIdFieldName")
+    # ArcGIS services are inconsistent here: several MapServer layers return
+    # ``{"objectIds": null}`` even though a normal query works.  Treat null as
+    # an unsupported/empty ID list rather than iterating over None.
+    raw_object_ids = ids_payload.get("objectIds") or []
+    object_ids = sorted({int(x) for x in raw_object_ids})
+
+    # Layer metadata gives us a second chance to recover the OID field and the
+    # server transfer-limit/pagination capabilities.  This matters for services
+    # that do not implement returnIdsOnly correctly.
+    metadata = request_json(layer_url.rstrip("/"), {"f": "json"}, retries=retries, timeout=timeout)
+    oid_field = ids_payload.get("objectIdFieldName") or metadata.get("objectIdField")
+    if not oid_field:
+        for field in metadata.get("fields") or []:
+            if str(field.get("type") or "") == "esriFieldTypeOID":
+                oid_field = field.get("name")
+                break
+    max_record_count = int(metadata.get("maxRecordCount") or batch_size or 500)
+    supports_pagination = bool((metadata.get("advancedQueryCapabilities") or {}).get("supportsPagination", False))
+
+    count_payload = request_json(
+        query_url,
+        {"where": where, "returnCountOnly": "true", "f": "json", **spatial},
+        retries=retries,
+        timeout=timeout,
+    )
+    expected_count = count_payload.get("count")
+    try:
+        expected_count = int(expected_count) if expected_count is not None else None
+    except (TypeError, ValueError):
+        expected_count = None
+
     features: List[Dict[str, Any]] = []
     if object_ids:
         for batch in chunks(object_ids, max(1, batch_size)):
@@ -119,25 +148,71 @@ def download_layer(
                 raise RuntimeError("ArcGIS query did not return a GeoJSON FeatureCollection")
             features.extend(payload["features"])
     else:
-        # Some services do not support returnIdsOnly. Fall back to a single
-        # bounded query; the completeness check below records whether transfer
-        # limits were exceeded.
-        payload = request_json(
-            query_url,
-            {
-                "where": where,
-                "outFields": "*",
-                "returnGeometry": "true",
-                "outSR": 4326,
-                "f": "geojson",
-                **spatial,
-            },
-            retries=retries,
-            timeout=timeout,
-        )
-        if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
-            raise RuntimeError("ArcGIS query did not return a GeoJSON FeatureCollection")
-        features.extend(payload["features"])
+        # Some services do not support returnIdsOnly.  A single query can be
+        # silently truncated at maxRecordCount, so page when the service says it
+        # supports pagination.  If pagination is unavailable, only accept a
+        # single response when the server-reported count proves it is complete.
+        page_size = max(1, min(int(batch_size), max_record_count if max_record_count > 0 else int(batch_size)))
+        if supports_pagination:
+            offset = 0
+            seen_page_fingerprints = set()
+            while expected_count is None or offset < expected_count:
+                params = {
+                    "where": where,
+                    "outFields": "*",
+                    "returnGeometry": "true",
+                    "outSR": 4326,
+                    "resultOffset": offset,
+                    "resultRecordCount": page_size,
+                    "f": "geojson",
+                    **spatial,
+                }
+                if oid_field:
+                    params["orderByFields"] = f"{oid_field} ASC"
+                payload = request_json(query_url, params, retries=retries, timeout=timeout)
+                if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
+                    raise RuntimeError("ArcGIS paginated query did not return a GeoJSON FeatureCollection")
+                page = payload["features"]
+                if not page:
+                    break
+                fingerprint = hashlib.sha256(json.dumps(page[:2], sort_keys=True, default=str).encode("utf-8")).hexdigest()
+                if fingerprint in seen_page_fingerprints:
+                    raise RuntimeError(
+                        "ArcGIS service appears to ignore resultOffset; refusing to save a silently duplicated/truncated layer"
+                    )
+                seen_page_fingerprints.add(fingerprint)
+                features.extend(page)
+                offset += len(page)
+                if len(page) < page_size:
+                    break
+        else:
+            payload = request_json(
+                query_url,
+                {
+                    "where": where,
+                    "outFields": "*",
+                    "returnGeometry": "true",
+                    "outSR": 4326,
+                    "f": "geojson",
+                    **spatial,
+                },
+                retries=retries,
+                timeout=timeout,
+            )
+            if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
+                raise RuntimeError("ArcGIS query did not return a GeoJSON FeatureCollection")
+            features.extend(payload["features"])
+            if expected_count is not None and len(features) < expected_count:
+                raise RuntimeError(
+                    f"ArcGIS service does not advertise pagination and returned {len(features)}/{expected_count} records; "
+                    "refusing an incomplete download. Use a smaller bbox or a service-specific query."
+                )
+
+    # A count check is stronger than trusting exceededTransferLimit (which is not
+    # consistently preserved in GeoJSON responses).  Never publish a partial
+    # authoritative GIS layer as if it were complete.
+    if expected_count is not None and len(features) != expected_count:
+        raise RuntimeError(f"ArcGIS completeness check failed: downloaded {len(features)} features, server count={expected_count}")
 
     fc = {
         "type": "FeatureCollection",
@@ -149,6 +224,9 @@ def download_layer(
             "bbox_south_west_north_east": list(bbox) if bbox else None,
             "object_id_field": oid_field,
             "record_count": len(features),
+            "expected_record_count": expected_count,
+            "supports_pagination": supports_pagination,
+            "max_record_count": max_record_count,
             "authoritative": True,
             "evidence_tier": "A_authoritative_city_gis",
         },
@@ -167,6 +245,9 @@ def download_layer(
         "features": len(features),
         "sha256": hashlib.sha256(raw).hexdigest(),
         "source_url": layer_url,
+        "expected_features": expected_count,
+        "supports_pagination": supports_pagination,
+        "object_id_field": oid_field,
     }
 
 

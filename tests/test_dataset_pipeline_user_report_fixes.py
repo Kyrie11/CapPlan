@@ -277,3 +277,102 @@ def test_bootstrap_audit_does_not_fail_only_because_it_is_not_paper(tmp_path):
     issues = set(report["publication_readiness"]["issues"])
     assert "source_policy_not_paper" not in issues
     assert "dataset_not_built_in_paper_mode" not in issues
+
+
+def test_paper_trusted_od_does_not_promote_transit_stop_to_entrance():
+    import pytest
+    from capplan.data.schemas import AccessibilityNode, Pose2D
+    from scripts.build_service_layer import _entrance_nodes
+
+    nodes = [
+        AccessibilityNode(f"s{i}", float(i), 0.0, "transit_stop", source="reviewed_audit:official_stop", pose=Pose2D(float(i), 0.0, 0.0, "map"))
+        for i in range(2)
+    ]
+    # Bootstrap can still use true mapped transit stops as OD-like diagnostics.
+    assert len(_entrance_nodes(nodes)) == 2
+    # Paper mode is entrance-to-entrance and must not relabel stops as entrances.
+    with pytest.raises(RuntimeError, match="trusted audited entrance"):
+        _entrance_nodes(nodes, trusted_source_tokens=["reviewed_audit:"])
+
+
+def test_readiness_stale_path_check_ignores_archived_pre_migration_reports(tmp_path):
+    import json
+    from scripts.check_four_city_paper_readiness import _stale_report_paths
+
+    reports = tmp_path / "reports"
+    external = tmp_path / "data0" / "external"
+    (reports / "archive" / "pre_20260817").mkdir(parents=True)
+    (reports / "archive" / "pre_20260817" / "old.json").write_text(
+        json.dumps({"path": "/home/senzeyu2/code/CapPlan/data/external/old"}), encoding="utf-8"
+    )
+    assert _stale_report_paths(reports, external) == []
+
+    (reports / "current.json").write_text(
+        json.dumps({"path": "/home/senzeyu2/code/CapPlan/data/external/current"}), encoding="utf-8"
+    )
+    assert _stale_report_paths(reports, external)
+
+
+def test_readiness_checks_nuplan_db_basename_overlap(tmp_path):
+    import json
+    from scripts.check_four_city_paper_readiness import _nuplan_db_split_overlap
+
+    for split, names in {"train": ["a.db", "b.db"], "val": ["c.db"], "test": ["d.db"]}.items():
+        (tmp_path / f"nuplan_db_cities.{split}.json").write_text(
+            json.dumps({"dbs": [{"db": f"/x/{split}/{n}"} for n in names]}), encoding="utf-8"
+        )
+    assert _nuplan_db_split_overlap(tmp_path)["status"] == "PASS"
+    (tmp_path / "nuplan_db_cities.test.json").write_text(
+        json.dumps({"dbs": [{"db": "/x/test/a.db"}]}), encoding="utf-8"
+    )
+    report = _nuplan_db_split_overlap(tmp_path)
+    assert report["status"] == "FAIL"
+    assert report["overlap_counts"]["train__test"] == 1
+
+
+def test_review_worklist_requires_row_level_acceptance_and_can_promote_reviewed_entrance_candidate(tmp_path):
+    import csv, subprocess, sys
+
+    inp = tmp_path / "work.csv"
+    fields = [
+        "audit_id","city","lon","lat","curb_height_m","sidewalk_width_m","deployment_clearance_m","curb_ramp",
+        "legal_stop","legal_basis","curb_height_m_source","sidewalk_width_m_source","deployment_clearance_m_source","curb_ramp_source",
+        "legal_stop_source","entrance_candidate_id","entrance_candidate_lon","entrance_candidate_lat","entrance_candidate_source",
+        "review_accept","entrance_linkage_approved","auto_filled_fields",
+    ]
+    row = {
+        "audit_id":"a1","city":"boston","lon":"-71.0","lat":"42.3","curb_height_m":"0.1","sidewalk_width_m":"2.0",
+        "deployment_clearance_m":"1.5","curb_ramp":"true","legal_stop":"true","legal_basis":"official rule",
+        "curb_height_m_source":"official","sidewalk_width_m_source":"official","deployment_clearance_m_source":"official",
+        "curb_ramp_source":"official","legal_stop_source":"official regulation","entrance_candidate_id":"e1",
+        "entrance_candidate_lon":"-71.0001","entrance_candidate_lat":"42.3001","entrance_candidate_source":"official entrance",
+        "review_accept":"","entrance_linkage_approved":"","auto_filled_fields":"curb_height_m;sidewalk_width_m;deployment_clearance_m;curb_ramp;legal_stop;legal_basis",
+    }
+    with inp.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerow(row)
+
+    status = tmp_path / "status.csv"; candidates = tmp_path / "candidates.csv"; accepted = tmp_path / "accepted.csv"; unresolved = tmp_path / "unresolved.csv"
+    subprocess.check_call([
+        sys.executable, "scripts/review_pudo_audit_worklist.py", "--input_csv", str(inp), "--output_csv", str(status),
+        "--review_candidates_csv", str(candidates), "--accepted_csv", str(accepted), "--unresolved_csv", str(unresolved),
+    ])
+    with candidates.open(newline="", encoding="utf-8") as f:
+        c = list(csv.DictReader(f))
+    assert len(c) == 1 and c[0]["review_decision"] == "ENTRANCE_LINKAGE_REVIEW_PENDING"
+    assert list(csv.DictReader(accepted.open(newline="", encoding="utf-8"))) == []
+
+    c[0]["review_accept"] = "true"
+    c[0]["entrance_linkage_approved"] = "true"
+    with candidates.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(c[0].keys())); w.writeheader(); w.writerows(c)
+    subprocess.check_call([
+        sys.executable, "scripts/review_pudo_audit_worklist.py", "--input_csv", str(candidates), "--output_csv", str(status),
+        "--review_candidates_csv", str(candidates), "--accepted_csv", str(accepted), "--unresolved_csv", str(unresolved),
+        "--approve_source_complete", "--reviewer_id", "reviewer-1",
+    ])
+    with accepted.open(newline="", encoding="utf-8") as f:
+        a = list(csv.DictReader(f))
+    assert len(a) == 1
+    assert a[0]["entrance_id"] == "e1"
+    assert a[0]["review_decision"] == "ACCEPT_SOURCE_EVIDENCE"
+    assert a[0]["auditor_id"] == "reviewer-1"

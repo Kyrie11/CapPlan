@@ -69,6 +69,7 @@ splits:
 
 cities:
   boston:
+    require_audited_core_evidence: true
     map_names: [us-ma-boston]
     location_aliases: [us-ma-boston, boston]
     bbox: [42.30, -71.15, 42.42, -70.98]
@@ -86,6 +87,7 @@ cities:
     provenance_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/manifests/boston.json"
 
   pittsburgh:
+    require_audited_core_evidence: true
     map_names: [us-pa-pittsburgh-hazelwood]
     location_aliases: [us-pa-pittsburgh-hazelwood, pittsburgh]
     bbox: [40.38, -80.04, 40.48, -79.88]
@@ -108,6 +110,7 @@ cities:
     provenance_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/manifests/pittsburgh.json"
 
   vegas:
+    require_audited_core_evidence: true
     # Expanded south from 36.07 to cover the full nuPlan Las Vegas map before spatial-alignment gating.
     map_names: [us-nv-las-vegas-strip]
     location_aliases: [us-nv-las-vegas-strip, las_vegas, las-vegas, vegas]
@@ -129,6 +132,7 @@ cities:
     provenance_manifest: "/data0/senzeyu2/dataset/CapPlan/data/external/manifests/vegas.json"
 
   singapore:
+    require_audited_core_evidence: true
     map_names: [sg-one-north]
     location_aliases: [sg-one-north, singapore]
     bbox: [1.27, 103.75, 1.33, 103.82]
