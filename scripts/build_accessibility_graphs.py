@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import multiprocessing as mp
 import sys
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from capplan.data.gis_fusion import (
     AccessibilityFusionBuilder,
+    GISFeatureSpatialIndex,
     CoordinateTransformer,
     iter_scene_contexts,
     load_gis_features,
@@ -21,6 +23,9 @@ from capplan.data.gis_fusion import (
 )
 from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, AccessibilityNode, Pose2D, to_dict
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
+from capplan.utils.build_fingerprint import fingerprint
+
+GRAPH_BUILD_VERSION = "20260820_corridor_exact_v3"
 
 try:
     from tqdm.auto import tqdm  # type: ignore
@@ -133,7 +138,27 @@ def _episode_ids(value: str | None) -> List[str]:
     return [x.strip() for x in (value or "shared").replace(",", "+").split("+") if x.strip()]
 
 
-def _write_graph(out: Path, graph: AccessibilityGraph, compact_storage: bool = False) -> Dict[str, Any]:
+def _graph_node_record(node: AccessibilityNode) -> Dict[str, Any]:
+    """Serialize a graph node without dataclasses.asdict deep-copy overhead.
+
+    ``schemas.to_dict`` calls ``asdict`` and then recursively walks the result.
+    For millions of graph rows that double traversal is expensive.  Graph node
+    fields are JSON-native except the nested Pose2D, so a shallow record plus a
+    shallow pose conversion is value-identical and avoids copying large lists.
+    """
+    row = dict(vars(node))
+    pose = row.get("pose")
+    if pose is not None and hasattr(pose, "__dict__"):
+        row["pose"] = dict(vars(pose))
+    return row
+
+
+def _graph_edge_record(edge: AccessibilityEdge) -> Dict[str, Any]:
+    """Value-identical shallow serialization for AccessibilityEdge."""
+    return dict(vars(edge))
+
+
+def _write_graph(out: Path, graph: AccessibilityGraph, compact_storage: bool = False, build_fingerprint: str | None = None) -> Dict[str, Any]:
     """Write one per-episode graph and return compact build metadata.
 
     ``compact_storage`` avoids serializing nodes/edges a second time inside
@@ -141,8 +166,8 @@ def _write_graph(out: Path, graph: AccessibilityGraph, compact_storage: bool = F
     metadata and the canonical ``.nodes/.edges`` files for topology.
     """
     started = time.perf_counter()
-    write_jsonl(out / f"{graph.episode_id}.nodes.jsonl", [to_dict(n) for n in graph.nodes])
-    write_jsonl(out / f"{graph.episode_id}.edges.jsonl", [to_dict(e) for e in graph.edges])
+    write_jsonl(out / f"{graph.episode_id}.nodes.jsonl", (_graph_node_record(n) for n in graph.nodes))
+    write_jsonl(out / f"{graph.episode_id}.edges.jsonl", (_graph_edge_record(e) for e in graph.edges))
     if compact_storage:
         dump_json(out / f"{graph.episode_id}.meta.json", {"episode_id": graph.episode_id, "metadata": graph.metadata})
         (out / f"{graph.episode_id}.jsonl").unlink(missing_ok=True)
@@ -154,13 +179,15 @@ def _write_graph(out: Path, graph: AccessibilityGraph, compact_storage: bool = F
         "nodes": len(graph.nodes), "edges": len(graph.edges),
         "features_cropped": int((graph.metadata or {}).get("features_cropped", 0) or 0),
         "compact_storage": bool(compact_storage),
+        "build_version": GRAPH_BUILD_VERSION,
+        "build_fingerprint": build_fingerprint,
         "write_s": time.perf_counter() - started,
     }
     dump_json(out / f"{graph.episode_id}.build.json", meta)
     return meta
 
 
-def _resume_graph_stats(out: Path, episode_id: str, compact_storage: bool) -> Optional[Dict[str, Any]]:
+def _resume_graph_stats(out: Path, episode_id: str, compact_storage: bool, expected_fingerprint: str | None = None) -> Optional[Dict[str, Any]]:
     marker = out / f"{episode_id}.build.json"
     nodes = out / f"{episode_id}.nodes.jsonl"
     edges = out / f"{episode_id}.edges.jsonl"
@@ -174,7 +201,13 @@ def _resume_graph_stats(out: Path, episode_id: str, compact_storage: bool) -> Op
         return None
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
-        return payload if payload.get("status") == "PASS" else None
+        if payload.get("status") != "PASS":
+            return None
+        if payload.get("build_version") != GRAPH_BUILD_VERSION:
+            return None
+        if expected_fingerprint is not None and payload.get("build_fingerprint") != expected_fingerprint:
+            return None
+        return payload
     except Exception:
         return None
 
@@ -251,6 +284,49 @@ def _spatial_diagnostics(scene: Any, features: Sequence[Any], transformer: Coord
         "hint": "0 cropped features usually means the WGS84->nuPlan map georeference is not aligned, the transform backend is wrong/missing, or the Overpass/city-GIS bbox does not cover this nuPlan map/scenario. For nuPlan DB-set maps whose scene poses look like UTM/easting-northing coordinates, use local_crs plus projected_map_frame=true and check transform_backend is pyproj or utm_fallback.",
     }
 
+def _graph_build_fingerprint(args: argparse.Namespace) -> str:
+    payload = {
+        "version": GRAPH_BUILD_VERSION,
+        "source_name": args.source_name,
+        "episode_radius_m": float(args.episode_radius_m),
+        "corridor_chunk_length_m": float(args.corridor_chunk_length_m),
+        "snap_tolerance_m": float(args.snap_tolerance_m),
+        "pudo_connector_radius_m": float(args.pudo_connector_radius_m),
+        "min_nodes_per_episode": int(args.min_nodes_per_episode),
+        "min_edges_per_episode": int(args.min_edges_per_episode),
+        "add_bidirectional": not bool(args.no_bidirectional_edges),
+        "compact_storage": bool(args.compact_storage),
+        "fail_on_synthetic": bool(args.fail_on_synthetic),
+        "episode_ids": str(args.episode_ids or ""),
+    }
+    scene_file = Path(args.scene_dataset_dir) / "scenes.jsonl" if args.scene_dataset_dir else None
+    scene_manifest = Path(args.scene_dataset_dir) / "scene_context_manifest.json" if args.scene_dataset_dir else None
+    scene_content_id = None
+    if scene_manifest and scene_manifest.exists():
+        try:
+            sm = json.loads(scene_manifest.read_text(encoding="utf-8"))
+            if sm.get("scenes_sha256"):
+                scene_content_id = {
+                    "scenes_sha256": sm.get("scenes_sha256"),
+                    "num_scenes": sm.get("num_scenes"),
+                    "extract_version": sm.get("extract_version"),
+                }
+        except Exception:
+            pass
+    if scene_content_id is not None:
+        payload["scene_content"] = scene_content_id
+        scene_file_for_stat = None
+    else:
+        scene_file_for_stat = scene_file
+    paths = [
+        scene_file_for_stat, args.georeference_json, args.nodes_jsonl, args.edges_jsonl,
+        args.osm_nodes_jsonl, args.osm_edges_jsonl, args.osm_source,
+        args.opensidewalks_source, args.city_gis_dir, args.curb_inventory_source,
+        args.entrance_source, args.elevation_source,
+    ]
+    return fingerprint(payload, paths)
+
+
 def _build_prepared(args: argparse.Namespace) -> Dict[str, Any]:
     node_rows = _read_json_records(args.nodes_jsonl or args.osm_nodes_jsonl)
     edge_rows = _read_json_records(args.edges_jsonl or args.osm_edges_jsonl)
@@ -266,11 +342,68 @@ def _build_prepared(args: argparse.Namespace) -> Dict[str, Any]:
         raise RuntimeError(f"accessibility graph too small: {len(nodes)} nodes/{len(edges)} edges; required {args.min_nodes_per_episode}/{args.min_edges_per_episode}")
     out = Path(args.output_graph_dir)
     out.mkdir(parents=True, exist_ok=True)
+    build_fp = _graph_build_fingerprint(args)
     episodes = _episode_ids(args.episode_ids)
     for eid in episodes:
         graph = AccessibilityGraph(eid, nodes, edges, {"source": args.source_name, "builder": "prepared_jsonl_validator", "episode_radius_m": args.episode_radius_m, "snap_tolerance_m": args.snap_tolerance_m})
-        _write_graph(out, graph, compact_storage=bool(getattr(args, "compact_storage", False)))
-    return {"status": "PASS", "episodes": episodes, "nodes": len(nodes), "edges": len(edges), "source": args.source_name, "mode": "prepared_jsonl", "synthetic_rejected": bool(args.fail_on_synthetic)}
+        _write_graph(out, graph, compact_storage=bool(getattr(args, "compact_storage", False)), build_fingerprint=build_fp)
+    return {"status": "PASS", "episodes": episodes, "nodes": len(nodes), "edges": len(edges), "source": args.source_name, "mode": "prepared_jsonl", "build_version": GRAPH_BUILD_VERSION, "build_fingerprint": build_fp, "synthetic_rejected": bool(args.fail_on_synthetic)}
+
+
+_MP_GRAPH_BUILDER = None
+_MP_GRAPH_FEATURES = None
+_MP_GRAPH_ARGS = None
+_MP_GRAPH_OUT = None
+_MP_GRAPH_BUILD_FP = None
+_MP_GRAPH_TRANSFORMER = None
+
+
+def _build_one_graph_episode(scene: Any, builder: AccessibilityFusionBuilder, features: List[Any], args: argparse.Namespace, out: Path, build_fp: str, transformer: CoordinateTransformer) -> Dict[str, Any]:
+    ep_started = time.perf_counter()
+    try:
+        graph = builder.build_for_scene(
+            scene,
+            features,
+            min_nodes=args.min_nodes_per_episode,
+            min_edges=args.min_edges_per_episode,
+            add_bidirectional=not args.no_bidirectional_edges,
+            pudo_connector_radius_m=args.pudo_connector_radius_m,
+        )
+    except RuntimeError as exc:
+        diag = _spatial_diagnostics(scene, features, transformer)
+        if args.diagnostic_report_json:
+            # Failure-only path; writing the exact diagnostic remains more
+            # useful than silently losing the old report in parallel mode.
+            dump_json(args.diagnostic_report_json, {"failed_episode": getattr(scene, "episode_id", None), "diagnostics": [diag]})
+        raise RuntimeError(f"{exc}\nSpatial alignment diagnostics: {json.dumps(diag, indent=2, sort_keys=True)}") from exc
+    build_s = time.perf_counter() - ep_started
+    write_stats = _write_graph(out, graph, compact_storage=args.compact_storage, build_fingerprint=build_fp)
+    graph_timing = (graph.metadata or {}).get("build_timing_s", {}) if isinstance(graph.metadata, dict) else {}
+    return {
+        "episode_id": graph.episode_id,
+        "nodes": len(graph.nodes),
+        "edges": len(graph.edges),
+        "features_cropped": int((graph.metadata or {}).get("features_cropped", 0) or 0),
+        "build_s": build_s,
+        "write_stats": write_stats,
+        "graph_timing": graph_timing,
+        "total_s": build_s + float(write_stats.get("write_s", 0.0) or 0.0),
+    }
+
+
+def _init_graph_fork_worker() -> None:
+    # Rebind the source-id guard after fork. Features/index are inherited
+    # copy-on-write and remain read-only, avoiding one 1-2M-feature index build
+    # per worker.
+    if _MP_GRAPH_BUILDER is not None and _MP_GRAPH_FEATURES is not None:
+        _MP_GRAPH_BUILDER._feature_index_source_id = id(_MP_GRAPH_FEATURES)
+
+
+def _graph_fork_worker(scene: Any) -> Dict[str, Any]:
+    return _build_one_graph_episode(
+        scene, _MP_GRAPH_BUILDER, _MP_GRAPH_FEATURES, _MP_GRAPH_ARGS,
+        _MP_GRAPH_OUT, _MP_GRAPH_BUILD_FP, _MP_GRAPH_TRANSFORMER,
+    )
 
 
 def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
@@ -295,48 +428,94 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
         contexts = iter_scene_contexts(args.scene_dataset_dir, _episode_ids(args.episode_ids), args.episode_radius_m)
         out = Path(args.output_graph_dir)
         out.mkdir(parents=True, exist_ok=True)
-        builder = AccessibilityFusionBuilder(transformer, args.snap_tolerance_m, args.source_name)
+        build_fp = _graph_build_fingerprint(args)
+        builder = AccessibilityFusionBuilder(
+            transformer,
+            args.snap_tolerance_m,
+            args.source_name,
+            corridor_chunk_length_m=args.corridor_chunk_length_m,
+        )
         diagnostics: List[Dict[str, Any]] = []
         episode_ids_out: List[str] = []
         timing_rows: List[Dict[str, Any]] = []
         total_nodes = 0
         total_edges = 0
         resumed = 0
+        build_breakdown = {"crop_s": 0.0, "topology_s": 0.0, "snap_s": 0.0, "pudo_connector_s": 0.0, "dedupe_s": 0.0, "write_s": 0.0}
         build_started = time.perf_counter()
-        iterator = contexts if args.disable_tqdm else tqdm(contexts, total=expected_contexts, desc="accessibility graphs", unit="episode", mininterval=1.0, dynamic_ncols=True)
-        for scene in iterator:
-            resume_stats = _resume_graph_stats(out, scene.episode_id, args.compact_storage) if args.resume else None
-            if resume_stats is not None:
-                episode_ids_out.append(scene.episode_id)
-                total_nodes += int(resume_stats.get("nodes", 0) or 0)
-                total_edges += int(resume_stats.get("edges", 0) or 0)
-                resumed += 1
-                continue
-            ep_started = time.perf_counter()
+        worker_count = max(0, int(args.num_workers))
+        progress = None if args.disable_tqdm else tqdm(total=expected_contexts, desc="accessibility graphs", unit="episode", mininterval=1.0, dynamic_ncols=True)
+
+        def absorb_result(result: Dict[str, Any]) -> None:
+            nonlocal total_nodes, total_edges
+            write_stats = result["write_stats"]
+            graph_timing = result.get("graph_timing") or {}
+            for key in ["crop_s", "topology_s", "snap_s", "pudo_connector_s", "dedupe_s"]:
+                build_breakdown[key] += float(graph_timing.get(key, 0.0) or 0.0)
+            build_breakdown["write_s"] += float(write_stats.get("write_s", 0.0) or 0.0)
+            timing_rows.append({**write_stats, "resumed": False, "build_s": result["build_s"], "total_s": result["total_s"]})
+            timing_rows[:] = sorted(timing_rows, key=lambda x: float(x.get("total_s", 0.0)), reverse=True)[:50]
+            episode_ids_out.append(str(result["episode_id"]))
+            total_nodes += int(result["nodes"])
+            total_edges += int(result["edges"])
+            if progress is not None:
+                progress.update(1)
+                progress.set_postfix(nodes=result["nodes"], edges=result["edges"], cropped=result["features_cropped"], workers=max(1, worker_count), refresh=False)
+
+        def absorb_resume(scene: Any, resume_stats: Dict[str, Any]) -> None:
+            nonlocal total_nodes, total_edges, resumed
+            episode_ids_out.append(scene.episode_id)
+            total_nodes += int(resume_stats.get("nodes", 0) or 0)
+            total_edges += int(resume_stats.get("edges", 0) or 0)
+            resumed += 1
+            if progress is not None:
+                progress.update(1)
+                progress.set_postfix(resumed=resumed, workers=max(1, worker_count), refresh=False)
+
+        if worker_count > 1 and hasattr(mp, "get_context"):
+            # Build the million-feature bounds index once *before* fork so all
+            # workers share it copy-on-write. Graph/PUDO calibration showed graph
+            # CPU at ~1 core and near-zero iowait, making process-level episode
+            # parallelism both safe and materially useful on the 48-core host.
+            if builder._feature_index is None:
+                builder._feature_index = GISFeatureSpatialIndex(features)
+                builder._feature_index_source_id = id(features)
+            global _MP_GRAPH_BUILDER, _MP_GRAPH_FEATURES, _MP_GRAPH_ARGS, _MP_GRAPH_OUT, _MP_GRAPH_BUILD_FP, _MP_GRAPH_TRANSFORMER
+            _MP_GRAPH_BUILDER = builder; _MP_GRAPH_FEATURES = features; _MP_GRAPH_ARGS = args
+            _MP_GRAPH_OUT = out; _MP_GRAPH_BUILD_FP = build_fp; _MP_GRAPH_TRANSFORMER = transformer
             try:
-                graph = builder.build_for_scene(
-                    scene,
-                    features,
-                    min_nodes=args.min_nodes_per_episode,
-                    min_edges=args.min_edges_per_episode,
-                    add_bidirectional=not args.no_bidirectional_edges,
-                    pudo_connector_radius_m=args.pudo_connector_radius_m,
-                )
-            except RuntimeError as exc:
-                diag = _spatial_diagnostics(scene, features, transformer)
-                diagnostics.append(diag)
-                if args.diagnostic_report_json:
-                    dump_json(args.diagnostic_report_json, {"failed_episode": getattr(scene, "episode_id", None), "diagnostics": diagnostics})
-                raise RuntimeError(f"{exc}\nSpatial alignment diagnostics: {json.dumps(diag, indent=2, sort_keys=True)}") from exc
-            build_s = time.perf_counter() - ep_started
-            write_stats = _write_graph(out, graph, compact_storage=args.compact_storage)
-            timing_rows.append({**write_stats, "resumed": False, "build_s": build_s, "total_s": build_s + float(write_stats.get("write_s", 0.0) or 0.0)})
-            timing_rows = sorted(timing_rows, key=lambda x: float(x.get("total_s", 0.0)), reverse=True)[:50]
-            episode_ids_out.append(graph.episode_id)
-            total_nodes += len(graph.nodes)
-            total_edges += len(graph.edges)
-            if not args.disable_tqdm and hasattr(iterator, "set_postfix"):
-                iterator.set_postfix(nodes=len(graph.nodes), edges=len(graph.edges), cropped=(graph.metadata or {}).get("features_cropped", 0), refresh=False)
+                ctx = mp.get_context("fork")
+            except ValueError:
+                ctx = None
+            if ctx is None:
+                worker_count = 0
+            else:
+                batch_size = max(4, worker_count * 4)
+                with ctx.Pool(processes=worker_count, initializer=_init_graph_fork_worker) as pool:
+                    pending: List[Any] = []
+                    for scene in contexts:
+                        resume_stats = _resume_graph_stats(out, scene.episode_id, args.compact_storage, build_fp) if args.resume else None
+                        if resume_stats is not None:
+                            absorb_resume(scene, resume_stats)
+                            continue
+                        pending.append(scene)
+                        if len(pending) >= batch_size:
+                            for result in pool.map(_graph_fork_worker, pending, chunksize=1):
+                                absorb_result(result)
+                            pending.clear()
+                    if pending:
+                        for result in pool.map(_graph_fork_worker, pending, chunksize=1):
+                            absorb_result(result)
+        if worker_count <= 1:
+            for scene in contexts:
+                resume_stats = _resume_graph_stats(out, scene.episode_id, args.compact_storage, build_fp) if args.resume else None
+                if resume_stats is not None:
+                    absorb_resume(scene, resume_stats)
+                    continue
+                result = _build_one_graph_episode(scene, builder, features, args, out, build_fp, transformer)
+                absorb_result(result)
+        if progress is not None:
+            progress.close()
         build_elapsed = time.perf_counter() - build_started
         report = {
             "episode_count": len(episode_ids_out),
@@ -345,11 +524,16 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
             "edges": total_edges,
             "source": args.source_name,
             "mode": "gis_fusion",
+            "build_version": GRAPH_BUILD_VERSION,
+            "build_fingerprint": build_fp,
             "features_loaded": len(features),
             "resumed_episodes": resumed,
             "compact_storage": bool(args.compact_storage),
             "elapsed_s": build_elapsed,
             "episodes_per_s": len(episode_ids_out) / max(build_elapsed, 1e-9),
+            "performance_breakdown_s": build_breakdown,
+            "corridor_chunk_length_m": float(args.corridor_chunk_length_m),
+            "episode_workers": max(1, int(args.num_workers)),
             "synthetic_rejected": bool(args.fail_on_synthetic),
             "georeference": args.georeference_json,
             "georeference_validated": bool(transformer.config.get("validated", False)),
@@ -391,6 +575,7 @@ def main() -> None:
     p.add_argument("--output_graph_dir", required=True)
     p.add_argument("--episode_ids", default="shared")
     p.add_argument("--episode_radius_m", type=float, default=800.0, help="Buffer around route corridor for per-scenario crop.")
+    p.add_argument("--corridor_chunk_length_m", type=float, default=1000.0, help="Length of conservative route-envelope chunks used to avoid irrelevant corners of one global bbox without dropping any feature that could lie inside the configured route buffer.")
     p.add_argument("--snap_tolerance_m", type=float, default=3.0)
     p.add_argument("--pudo_connector_radius_m", type=float, default=75.0, help="Distance from route corridor for curb/curb-ramp nodes marked as PUDO connector candidates.")
     p.add_argument("--min_nodes_per_episode", type=int, default=100)
@@ -398,7 +583,7 @@ def main() -> None:
     p.add_argument("--source_name", default="nuplan_osm_opensidewalks_citygis")
     p.add_argument("--fail_on_synthetic", action="store_true")
     p.add_argument("--no_bidirectional_edges", action="store_true")
-    p.add_argument("--num_workers", type=int, default=0, help="Reserved for parallel episode workers; current optimized path is streaming/sequential to keep GIS memory bounded.")
+    p.add_argument("--num_workers", type=int, default=0, help="Parallel graph episode worker processes on Linux. Workers share the prebuilt city GIS index via fork copy-on-write; 0/1 is sequential.")
     p.add_argument("--disable_tqdm", action="store_true", help="Disable per-episode progress bars.")
     p.add_argument("--compact_storage", action="store_true", help="Write nodes/edges plus lightweight metadata instead of duplicating the full graph in <episode>.jsonl.")
     p.add_argument("--resume", action="store_true", help="Skip episodes with a complete .build.json marker and matching graph files.")

@@ -27,11 +27,28 @@ def load_json(path: str | Path) -> Any:
 
 
 def write_jsonl(path: str | Path, records: Iterable[Any]) -> None:
+    """Write deterministic compact JSONL in buffered batches.
+
+    The original implementation called ``json.dumps`` and ``file.write`` once
+    per record using the stdlib's default separators.  Accessibility graph
+    builds routinely write millions of node/edge rows, so the per-line Python
+    call overhead and extra whitespace become a measurable part of bootstrap
+    runtime.  Compact separators change only JSON formatting, not values, and
+    batching reduces syscall/Python overhead while preserving deterministic key
+    ordering.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), default=_default)
     with path.open("w", encoding="utf-8") as f:
+        buffer: List[str] = []
         for r in records:
-            f.write(json.dumps(r, sort_keys=True, default=_default) + "\n")
+            buffer.append(encoder.encode(r) + "\n")
+            if len(buffer) >= 1024:
+                f.write("".join(buffer))
+                buffer.clear()
+        if buffer:
+            f.write("".join(buffer))
 
 
 def iter_jsonl(path: str | Path) -> Iterator[Any]:

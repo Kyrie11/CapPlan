@@ -25,6 +25,10 @@ except Exception as exc:  # pragma: no cover
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+import sys
+sys.path.insert(0, str(PROJECT_ROOT))
+from capplan.utils.build_fingerprint import file_inventory_fingerprint
+
 
 def expand_path(value: str) -> Path:
     p = Path(str(value).format(project_root=str(PROJECT_ROOT))).expanduser()
@@ -181,6 +185,7 @@ def main() -> None:
         "db_dir_reports": db_dir_reports,
         "empty_db_dirs": empty_db_dirs,
         "db_count": len(dbs),
+        "db_inventory_fingerprint": file_inventory_fingerprint(dbs),
         "db_errors": db_errors,
         "location_aliases": city_location_names,
         "location_db_counts": dict(sorted(location_counts.items())),
@@ -190,7 +195,7 @@ def main() -> None:
         "ambiguous_locations": dict(ambiguous),
         "issues": issues,
         "dbs": db_reports,
-        "note": "val/test may contain multiple cities; keep DBs in place and filter by map_names rather than physically splitting them.",
+        "note": "val/test may contain multiple cities; keep DBs in place. A fresh inventory fingerprint lets extraction reuse this audited city mapping and pass only the relevant DB files, while map_names remains a second safety filter.",
     }
     text = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
     print(text)

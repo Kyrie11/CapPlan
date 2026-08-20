@@ -86,6 +86,9 @@ def main() -> None:
                     "episodes_per_s": graph_summary.get("episodes_per_s"),
                     "features_loaded": graph_summary.get("features_loaded"),
                     "resumed_episodes": graph_summary.get("resumed_episodes"),
+                    "build_version": graph_summary.get("build_version"),
+                    "build_fingerprint": graph_summary.get("build_fingerprint"),
+                    "performance_breakdown_s": graph_summary.get("performance_breakdown_s"),
                     "build_markers_on_disk_for_city": _graph_markers_for_source(graph_dir, f"{city}_fused_external_accessibility"),
                     "slowest_episodes": graph_timing.get("slowest_episodes", [])[:10] if isinstance(graph_timing.get("slowest_episodes"), list) else [],
                 },
@@ -100,6 +103,13 @@ def main() -> None:
                     "elapsed_s": pudo_perf.get("elapsed_s"),
                     "episodes_per_s": pudo_perf.get("episodes_per_s"),
                     "resumed_episodes": pudo_perf.get("resumed_episodes"),
+                    "build_version": pudo_report.get("build_version"),
+                    "build_fingerprint": pudo_report.get("build_fingerprint"),
+                    "performance_breakdown_s": {k: pudo_perf.get(k) for k in [
+                        "graph_load_s", "graph_index_s", "candidate_select_s",
+                        "external_prefilter_s", "blockage_batch_s", "spatial_match_s",
+                        "row_assembly_s", "external_candidate_s", "graph_candidate_s"
+                    ]},
                     "shard_markers_on_disk": shard_done,
                     "slowest_episodes": pudo_perf.get("slowest_episodes", [])[:10] if isinstance(pudo_perf.get("slowest_episodes"), list) else [],
                 },

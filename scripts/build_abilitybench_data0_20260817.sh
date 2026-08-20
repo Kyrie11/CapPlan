@@ -185,6 +185,97 @@ bootstrap_performance_snapshot() {
     --output "$REPORTS/bootstrap_performance_snapshot.json"
 }
 
+run_city_stage_parallel() {
+  # Usage: run_city_stage_parallel <split> <source_policy> <stage> <jobs> <log_prefix>
+  # Each worker owns one city. Wait for *whichever* city finishes first so a
+  # slow Boston job cannot leave a free slot idle while a later city is ready.
+  # Bash >=4.3 provides wait -n (the target server satisfies this).
+  local split="$1" policy="$2" stage="$3" jobs="$4" prefix="$5"
+  local -a cities=(boston pittsburgh vegas singapore)
+  local city failed=0 active=0
+  [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "parallel jobs must be a positive integer, got: $jobs" >&2; return 2; }
+  echo "[CAPPLAN_PROGRESS] staged split=$split policy=$policy stage=$stage city_jobs=$jobs $(date -Is)"
+  for city in "${cities[@]}"; do
+    while (( active >= jobs )); do
+      if wait -n; then :; else failed=1; fi
+      active=$((active - 1))
+      if (( failed != 0 )); then
+        echo "city worker failed split=$split stage=$stage; waiting for already-running workers" >&2
+        while (( active > 0 )); do wait -n || true; active=$((active - 1)); done
+        return 1
+      fi
+    done
+    ( runlog "${prefix}.${split}.${city}.${stage}" python scripts/prepare_abilitybench_external.py \
+        --config "$CONFIG" --split "$split" --source_policy "$policy" \
+        --cities "$city" --max_scenarios_per_city 0 --stages "$stage" \
+        --skip_preflight --skip_pudo_concat ) &
+    active=$((active + 1))
+  done
+  while (( active > 0 )); do
+    if wait -n; then :; else failed=1; fi
+    active=$((active - 1))
+  done
+  (( failed == 0 )) || { echo "city worker failed split=$split stage=$stage" >&2; return 1; }
+}
+
+concat_split_pudo() {
+  local split="$1" prefix="$2"
+  runlog "${prefix}.${split}.concat" python scripts/concat_jsonl_files.py \
+    --inputs \
+      "$DATA_ROOT/outputs/prepared/$split/pudo/boston.jsonl" \
+      "$DATA_ROOT/outputs/prepared/$split/pudo/pittsburgh.jsonl" \
+      "$DATA_ROOT/outputs/prepared/$split/pudo/vegas.jsonl" \
+      "$DATA_ROOT/outputs/prepared/$split/pudo/singapore.jsonl" \
+    --output "$DATA_ROOT/outputs/prepared/$split/pudo_evidence.jsonl"
+}
+
+bootstrap_candidates_full_staged() {
+  # Recommended full-build scheduler from the 100-scene calibration:
+  # extraction is storage-heavy, while graphs/PUDO are ~single-core CPU-bound.
+  # Therefore serialize extraction by default and parallelize the CPU stages by city.
+  local extract_jobs="${CAP_EXTRACT_CITY_JOBS:-1}"
+  local graph_jobs="${CAP_GRAPH_CITY_JOBS:-2}"
+  local pudo_jobs="${CAP_PUDO_CITY_JOBS:-4}"
+  local split
+  echo "[CAPPLAN_PROGRESS] staged bootstrap CAP_NUM_WORKERS=${CAP_NUM_WORKERS:-config-default} CAP_GRAPH_NUM_WORKERS=${CAP_GRAPH_NUM_WORKERS:-${CAP_NUM_WORKERS:-config-default}} extract_city_jobs=$extract_jobs graph_city_jobs=$graph_jobs pudo_city_jobs=$pudo_jobs"
+  for split in train val test; do
+    runlog "bootstrap_preflight.${split}.staged" python scripts/prepare_abilitybench_external.py \
+      --config "$CONFIG" --split "$split" --source_policy bootstrap \
+      --cities boston+pittsburgh+vegas+singapore --max_scenarios_per_city 0 --stages preflight
+    run_city_stage_parallel "$split" bootstrap extract "$extract_jobs" bootstrap_staged
+    run_city_stage_parallel "$split" bootstrap graphs "$graph_jobs" bootstrap_staged
+    run_city_stage_parallel "$split" bootstrap pudo "$pudo_jobs" bootstrap_staged
+    concat_split_pudo "$split" bootstrap_staged
+    bootstrap_performance_snapshot
+  done
+}
+
+rebuild_paper_evidence_full_staged() {
+  # Scene extraction is unchanged between bootstrap and paper evidence passes.
+  # Resume fingerprints invalidate only graphs/PUDO whose code/config/evidence
+  # inputs actually changed, preventing mixed-version or stale-audit reuse.
+  local graph_jobs="${CAP_GRAPH_CITY_JOBS:-2}"
+  local pudo_jobs="${CAP_PUDO_CITY_JOBS:-4}"
+  local split
+  echo "[CAPPLAN_PROGRESS] staged paper evidence graph_city_jobs=$graph_jobs pudo_city_jobs=$pudo_jobs"
+  for split in train val test; do
+    runlog "paper_preflight.${split}.staged" python scripts/prepare_abilitybench_external.py \
+      --config "$CONFIG" --split "$split" --source_policy paper \
+      --cities boston+pittsburgh+vegas+singapore --max_scenarios_per_city 0 --stages preflight
+    run_city_stage_parallel "$split" paper graphs "$graph_jobs" paper_evidence_staged
+    run_city_stage_parallel "$split" paper pudo "$pudo_jobs" paper_evidence_staged
+    concat_split_pudo "$split" paper_evidence_staged
+    bootstrap_performance_snapshot
+  done
+}
+
+bootstrap_runtime_summary() {
+  local input="${CAP_PROFILE_LOG:-$REPORTS/bootstrap_runtime_profile.log}"
+  [[ -s "$input" ]] || { echo "Missing profiler log: $input" >&2; return 2; }
+  runlog "bootstrap_runtime_profile_summary" python scripts/summarize_bootstrap_runtime_profile.py \
+    --input "$input" --output "$REPORTS/bootstrap_runtime_profile_summary.json"
+}
+
 bootstrap_candidates_full_parallel() {
   # Optional throughput mode for a large multi-socket server. Cities are fully
   # independent at candidate-build time, so run a bounded number concurrently.
@@ -466,7 +557,9 @@ Stages:
   bootstrap-pilot
   bootstrap-candidates-full
   bootstrap-performance-snapshot
-  bootstrap-candidates-full-parallel  # optional; set CAP_CITY_JOBS=2 first
+  bootstrap-candidates-full-parallel  # legacy whole-city parallel mode
+  bootstrap-candidates-full-staged    # RECOMMENDED: serialized extract + parallel graph/PUDO
+  bootstrap-runtime-summary           # summarize profiler, excluding idle tail
   site-catalogs
   prefill-audits
   classify-audits
@@ -479,6 +572,7 @@ Stages:
   paper-preflight
   paper-pilot
   rebuild-paper-evidence-full
+  rebuild-paper-evidence-full-staged  # recommended paper evidence scheduler
   select-paper-allowlists
   paper-build-allowlisted
   paper-full                # alias for paper-build-allowlisted
@@ -503,6 +597,8 @@ case "${1:-}" in
   bootstrap-candidates-full) bootstrap_candidates_full ;;
   bootstrap-performance-snapshot) bootstrap_performance_snapshot ;;
   bootstrap-candidates-full-parallel) bootstrap_candidates_full_parallel ;;
+  bootstrap-candidates-full-staged) bootstrap_candidates_full_staged ;;
+  bootstrap-runtime-summary) bootstrap_runtime_summary ;;
   site-catalogs) build_site_catalogs ;;
   prefill-audits) prefill_audit_worklists ;;
   classify-audits) classify_audits ;;
@@ -515,6 +611,7 @@ case "${1:-}" in
   paper-preflight) paper_preflight ;;
   paper-pilot) paper_pilot ;;
   rebuild-paper-evidence-full) rebuild_paper_evidence_full ;;
+  rebuild-paper-evidence-full-staged) rebuild_paper_evidence_full_staged ;;
   select-paper-allowlists) select_paper_allowlists ;;
   paper-build-allowlisted) paper_build_allowlisted ;;
   paper-full) paper_full ;;

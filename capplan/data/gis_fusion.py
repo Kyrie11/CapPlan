@@ -119,6 +119,11 @@ class SceneContext:
     map_name: Optional[str] = None
     route_polyline: List[List[float]] = field(default_factory=list)
     bbox: Optional[Tuple[float, float, float, float]] = None
+    # Intended Euclidean buffer around the route corridor. ``bbox`` remains a
+    # conservative envelope for diagnostics/backward compatibility, while the
+    # graph builder can use chunked route envelopes that are a strict superset
+    # of this corridor but much tighter than one global rectangle.
+    corridor_radius_m: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -595,7 +600,67 @@ class GISFeatureSpatialIndex:
         b = self.bounds
         mask = (b[:, 0] <= xmax) & (b[:, 2] >= xmin) & (b[:, 1] <= ymax) & (b[:, 3] >= ymin)
         idxs = np.flatnonzero(mask)
-        return [self.features[int(i)] for i in idxs if _geometry_intersects_bbox(self.features[int(i)].geometry, bbox)]
+        if idxs.size == 0:
+            return []
+
+        # Any feature whose complete AABB is contained by the query box is
+        # guaranteed to intersect it, so avoid walking all geometry vertices for
+        # the overwhelmingly common interior case.  Only boundary-straddling
+        # candidates need the exact line/rectangle test.
+        bb = b[idxs]
+        contained = (bb[:, 0] >= xmin) & (bb[:, 2] <= xmax) & (bb[:, 1] >= ymin) & (bb[:, 3] <= ymax)
+        out: List[GISFeature] = [self.features[int(i)] for i in idxs[contained]]
+        for i in idxs[~contained]:
+            feature = self.features[int(i)]
+            if _geometry_intersects_bbox(feature.geometry, bbox):
+                out.append(feature)
+        return out
+
+    def query_many(self, boxes: Sequence[Tuple[float, float, float, float]]) -> List[GISFeature]:
+        """Return features intersecting the union of axis-aligned boxes.
+
+        This is used for a *lossless conservative* route-corridor prefilter.
+        Each chunk box is the bbox of a short route fragment expanded by the
+        requested corridor radius, so the union contains every point in the
+        true Euclidean route buffer.  It therefore removes only features that
+        could not belong to the configured corridor, while avoiding the huge
+        empty corners of one rectangle around an entire diagonal/curved route.
+        """
+        import numpy as np
+        if len(self.features) == 0 or not boxes:
+            return []
+        b = self.bounds
+        mask = np.zeros(len(self.features), dtype=bool)
+        # The number of boxes is intentionally small (route is chunked at
+        # kilometre scale), so repeated vectorized comparisons are much cheaper
+        # than Python geometry checks over millions of city features.
+        for xmin, ymin, xmax, ymax in boxes:
+            mask |= (b[:, 0] <= xmax) & (b[:, 2] >= xmin) & (b[:, 1] <= ymax) & (b[:, 3] >= ymin)
+        idxs = np.flatnonzero(mask)
+        if idxs.size == 0:
+            return []
+
+        # Accept features whose complete AABB is contained in any route box
+        # entirely with NumPy. This is the common interior case and avoids a
+        # Python ``feature x boxes`` loop for tens of thousands of features per
+        # episode. Only AABBs that straddle a box boundary need exact geometry
+        # intersection checks.
+        accepted = np.zeros(len(self.features), dtype=bool)
+        for xmin, ymin, xmax, ymax in boxes:
+            contained = (b[:, 0] >= xmin) & (b[:, 2] <= xmax) & (b[:, 1] >= ymin) & (b[:, 3] <= ymax)
+            accepted |= contained
+
+        unresolved = idxs[~accepted[idxs]]
+        for i in unresolved:
+            ii = int(i); fb = b[ii]; feature = self.features[ii]
+            for box in boxes:
+                xmin, ymin, xmax, ymax = box
+                if fb[0] > xmax or fb[2] < xmin or fb[1] > ymax or fb[3] < ymin:
+                    continue
+                if _geometry_intersects_bbox(feature.geometry, box):
+                    accepted[ii] = True
+                    break
+        return [self.features[int(i)] for i in np.flatnonzero(accepted & mask)]
 
 
 def distance_to_polyline(point: Sequence[float], polyline: Sequence[Sequence[float]]) -> float:
@@ -630,6 +695,88 @@ def _bbox(points: Sequence[Sequence[float]], buffer_m: float = 0.0) -> Tuple[flo
     return min(xs) - buffer_m, min(ys) - buffer_m, max(xs) + buffer_m, max(ys) + buffer_m
 
 
+def route_corridor_boxes(
+    points: Sequence[Sequence[float]],
+    radius_m: float,
+    chunk_length_m: float = 1000.0,
+) -> List[Tuple[float, float, float, float]]:
+    """Build a conservative union-of-boxes approximation of a route buffer.
+
+    Consecutive route geometry is accumulated into chunks no longer than
+    ``chunk_length_m`` (long source segments are split at the chunk boundary).
+    Each chunk's *actual polyline* bbox is expanded by ``radius_m``.  Hence the
+    union is a strict superset of the Euclidean route buffer: any feature that
+    can lie within ``radius_m`` of the route remains eligible, while large
+    corners of one global route bbox can be excluded safely.
+    """
+    pts = [(float(p[0]), float(p[1])) for p in points if len(p) >= 2]
+    if not pts:
+        return []
+    radius = max(0.0, float(radius_m))
+    chunk = max(1.0, float(chunk_length_m))
+    if len(pts) == 1:
+        x, y = pts[0]
+        return [(x - radius, y - radius, x + radius, y + radius)]
+
+    boxes: List[Tuple[float, float, float, float]] = []
+    cur_xmin = cur_xmax = pts[0][0]
+    cur_ymin = cur_ymax = pts[0][1]
+    used = 0.0
+
+    def include(x: float, y: float) -> None:
+        nonlocal cur_xmin, cur_xmax, cur_ymin, cur_ymax
+        cur_xmin = min(cur_xmin, x); cur_xmax = max(cur_xmax, x)
+        cur_ymin = min(cur_ymin, y); cur_ymax = max(cur_ymax, y)
+
+    def emit() -> None:
+        boxes.append((cur_xmin - radius, cur_ymin - radius,
+                      cur_xmax + radius, cur_ymax + radius))
+
+    x0, y0 = pts[0]
+    for x1, y1 in pts[1:]:
+        sx, sy = x0, y0
+        remaining_seg = math.hypot(x1 - sx, y1 - sy)
+        if remaining_seg <= 1e-12:
+            include(x1, y1)
+            x0, y0 = x1, y1
+            continue
+        while remaining_seg > 1e-12:
+            room = chunk - used
+            if room <= 1e-9:
+                emit()
+                cur_xmin = cur_xmax = sx
+                cur_ymin = cur_ymax = sy
+                used = 0.0
+                room = chunk
+            take = min(room, remaining_seg)
+            frac = take / remaining_seg
+            ex = sx + (x1 - sx) * frac
+            ey = sy + (y1 - sy) * frac
+            include(ex, ey)
+            used += take
+            sx, sy = ex, ey
+            remaining_seg = math.hypot(x1 - sx, y1 - sy)
+            if used >= chunk - 1e-9:
+                emit()
+                cur_xmin = cur_xmax = sx
+                cur_ymin = cur_ymax = sy
+                used = 0.0
+        x0, y0 = x1, y1
+
+    if used > 1e-9 or not boxes:
+        emit()
+
+    # Stable de-duplication handles repeated route points/chunk boundaries.
+    seen: set[Tuple[float, float, float, float]] = set()
+    out: List[Tuple[float, float, float, float]] = []
+    for box in boxes:
+        key = tuple(round(float(v), 6) for v in box)
+        if key not in seen:
+            out.append(box)
+            seen.add(key)
+    return out
+
+
 def _in_bbox(pt: Sequence[float], bbox: Tuple[float, float, float, float]) -> bool:
     return bbox[0] <= float(pt[0]) <= bbox[2] and bbox[1] <= float(pt[1]) <= bbox[3]
 
@@ -657,7 +804,14 @@ def iter_scene_contexts(scene_dataset_dir: str | Path | None, episode_ids: Seque
                         poly = [[p0.get("x", 0.0), p0.get("y", 0.0)], [pg.get("x", 0.0), pg.get("y", 0.0)]]
                 poly = [[float(p[0]), float(p[1])] for p in poly if isinstance(p, (list, tuple)) and len(p) >= 2]
                 emitted += 1
-                yield SceneContext(eid, row.get("map_name"), poly, _bbox(poly, buffer_m) if poly else None, row)
+                yield SceneContext(
+                    episode_id=eid,
+                    map_name=row.get("map_name"),
+                    route_polyline=poly,
+                    bbox=_bbox(poly, buffer_m) if poly else None,
+                    corridor_radius_m=float(buffer_m),
+                    metadata=row,
+                )
             break
     if emitted:
         return
@@ -724,15 +878,26 @@ def _edge_attrs_from_feature(f: GISFeature) -> Dict[str, Any]:
 class AccessibilityFusionBuilder:
     """Build per-scenario accessibility graphs from OSM/OpenSidewalks/city GIS."""
 
-    def __init__(self, transformer: CoordinateTransformer, snap_tolerance_m: float = 3.0, source_name: str = "nuplan_osm_opensidewalks_citygis") -> None:
+    def __init__(
+        self,
+        transformer: CoordinateTransformer,
+        snap_tolerance_m: float = 3.0,
+        source_name: str = "nuplan_osm_opensidewalks_citygis",
+        corridor_chunk_length_m: float = 1000.0,
+    ) -> None:
         self.transformer = transformer
         self.snap_tolerance_m = float(snap_tolerance_m)
         self.source_name = source_name
+        self.corridor_chunk_length_m = max(1.0, float(corridor_chunk_length_m))
         self._feature_index: GISFeatureSpatialIndex | None = None
         self._feature_index_source_id: int | None = None
 
     def build_for_scene(self, scene: SceneContext, features: List[GISFeature], min_nodes: int = 0, min_edges: int = 0, add_bidirectional: bool = True, pudo_connector_radius_m: float = 75.0) -> AccessibilityGraph:
+        import time
+        timing: Dict[str, float] = {}
+        t_stage = time.perf_counter()
         feats = self._crop(features, scene)
+        timing["crop_s"] = time.perf_counter() - t_stage
         nodes: Dict[str, AccessibilityNode] = {}
         node_extra: Dict[str, Dict[str, Any]] = {}
         edges: List[AccessibilityEdge] = []
@@ -761,9 +926,10 @@ class AccessibilityFusionBuilder:
         routable_linear_kinds = {"sidewalk", "crossing", "path", "steps"}
         point_kinds = {"entrance", "entrance_proxy", "curb", "curb_ramp", "transit_stop", "poi"}
         skipped_linear_kinds: Dict[str, int] = {}
+        t_stage = time.perf_counter()
         for f in feats:
-            attrs = _node_attrs_from_feature(f)
             if f.is_point:
+                attrs = _node_attrs_from_feature(f)
                 # Entrance proxies are deliberately kept distinct from verified entrances.
                 # They may be useful as candidate OD anchors but are not promoted to
                 # authoritative entrance evidence by the graph builder.
@@ -772,6 +938,10 @@ class AccessibilityFusionBuilder:
             if f.kind not in routable_linear_kinds:
                 skipped_linear_kinds[f.kind] = skipped_linear_kinds.get(f.kind, 0) + 1
                 continue
+            attrs = _node_attrs_from_feature(f)
+            # Edge attributes are feature-level.  Recomputing/parsing them for
+            # every vertex pair of the same polyline was pure repeated work.
+            edge_attrs_base = _edge_attrs_from_feature(f)
             previous: Optional[str] = None
             for i, (x, y) in enumerate(f.geometry):
                 kind = "crossing" if f.kind == "crossing" else "sidewalk"
@@ -780,20 +950,28 @@ class AccessibilityFusionBuilder:
                     a, b = nodes[previous], nodes[nid]
                     geom = [[a.x, a.y], [b.x, b.y]]
                     length = math.hypot(b.x - a.x, b.y - a.y)
-                    ea = _edge_attrs_from_feature(f)
+                    ea = edge_attrs_base
                     if ea.get("slope") is None and node_extra.get(previous, {}).get("elevation_m") is not None and node_extra.get(nid, {}).get("elevation_m") is not None:
+                        ea = dict(edge_attrs_base)
                         ea["slope"] = abs(float(node_extra[nid]["elevation_m"]) - float(node_extra[previous]["elevation_m"])) / max(length, 0.001)
                     eid = f"{f.feature_id}:{i-1}:{i}"
                     edges.append(AccessibilityEdge(eid, previous, nid, max(0.001, length), confidence=f.confidence, geometry=geom, source=f.source, **ea))
                     if add_bidirectional and str(f.tags.get("oneway", "")).lower() not in {"yes", "true", "1"}:
                         edges.append(AccessibilityEdge(eid + ":rev", nid, previous, max(0.001, length), confidence=f.confidence, geometry=list(reversed(geom)), source=f.source, **ea))
                 previous = nid
+        timing["topology_s"] = time.perf_counter() - t_stage
 
+        t_stage = time.perf_counter()
         self._snap_point_nodes(nodes, edges, target_kinds={"entrance"}, edge_kind="entrance_connector")
         self._snap_point_nodes(nodes, edges, target_kinds={"curb", "curb_ramp"}, edge_kind="curb_connector")
+        timing["snap_s"] = time.perf_counter() - t_stage
+        t_stage = time.perf_counter()
         if scene.route_polyline:
             self._add_pudo_connector_metadata(nodes, node_extra, scene.route_polyline, pudo_connector_radius_m)
+        timing["pudo_connector_s"] = time.perf_counter() - t_stage
+        t_stage = time.perf_counter()
         edges = self._dedupe_edges(edges, nodes)
+        timing["dedupe_s"] = time.perf_counter() - t_stage
         graph = AccessibilityGraph(scene.episode_id, list(nodes.values()), edges, {
             "source": self.source_name,
             "builder": "AccessibilityFusionBuilder",
@@ -804,6 +982,10 @@ class AccessibilityFusionBuilder:
             "node_attributes": node_extra,
             "features_cropped": len(feats),
             "skipped_non_routable_linear_features": skipped_linear_kinds,
+            "crop_mode": "lossless_chunked_route_envelope" if scene.route_polyline and scene.corridor_radius_m > 0 else "bbox",
+            "corridor_radius_m": float(scene.corridor_radius_m or 0.0),
+            "corridor_chunk_length_m": float(self.corridor_chunk_length_m),
+            "build_timing_s": timing,
         })
         if len(graph.nodes) < min_nodes or len(graph.edges) < min_edges:
             raise RuntimeError(f"accessibility graph too small for {scene.episode_id}: {len(graph.nodes)} nodes/{len(graph.edges)} edges; required {min_nodes}/{min_edges}")
@@ -815,6 +997,14 @@ class AccessibilityFusionBuilder:
         if self._feature_index is None or self._feature_index_source_id != id(features):
             self._feature_index = GISFeatureSpatialIndex(features)
             self._feature_index_source_id = id(features)
+        if scene.route_polyline and scene.corridor_radius_m > 0:
+            boxes = route_corridor_boxes(
+                scene.route_polyline,
+                scene.corridor_radius_m,
+                self.corridor_chunk_length_m,
+            )
+            if boxes:
+                return self._feature_index.query_many(boxes)
         return self._feature_index.query(scene.bbox)
 
     def _nearest_ped_node(self, nid: str, nodes: Dict[str, AccessibilityNode], exclude_kinds: set[str]) -> Tuple[Optional[str], float]:

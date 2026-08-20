@@ -162,6 +162,13 @@ class NuPlanAdapter:
         self.nuplan_available = self._check_nuplan()
         self._builder = None
         self._worker = _LocalNuPlanWorker(self.num_workers)
+        # Roadblock/lane geometry is immutable for a map and heavily reused
+        # across nearby nuPlan scenarios. Cache extracted coordinates, not map
+        # objects, so route construction keeps identical geometry semantics
+        # without repeated GPKG object traversal.
+        self._route_object_points_cache: Dict[tuple[str, str], tuple[tuple[float, float], ...]] = {}
+        self._route_geometry_cache_hits = 0
+        self._route_geometry_cache_misses = 0
         if self.scene_source == "nuplan":
             self._init_nuplan_or_raise()
         elif self.scene_source == "synthetic":
@@ -578,16 +585,28 @@ class NuPlanAdapter:
                 out.append([float(p[0]), float(p[1])])
         return out
 
-    @staticmethod
-    def _extract_route_polyline(route_ids: List[str], map_api: Any, pose0: Pose2D, mission_goal: Pose2D | None) -> List[List[float]]:
+    def _route_points_for_id(self, map_api: Any, rid: str) -> List[List[float]]:
+        map_name = safe_call(map_api, ["map_name", "get_map_name"], None) if map_api is not None else None
+        map_key = str(map_name) if map_name else f"map_api:{id(map_api)}"
+        key = (map_key, str(rid))
+        cached = self._route_object_points_cache.get(key)
+        if cached is not None:
+            self._route_geometry_cache_hits += 1
+            return [[x, y] for x, y in cached]
+        self._route_geometry_cache_misses += 1
+        obj_pts: List[List[float]] = []
+        for obj in self._map_object_candidates(map_api, str(rid)):
+            obj_pts = self._points_from_map_object(obj)
+            if len(obj_pts) >= 2:
+                break
+        frozen = tuple((float(p[0]), float(p[1])) for p in obj_pts if len(p) >= 2)
+        self._route_object_points_cache[key] = frozen
+        return [[x, y] for x, y in frozen]
+
+    def _extract_route_polyline(self, route_ids: List[str], map_api: Any, pose0: Pose2D, mission_goal: Pose2D | None) -> List[List[float]]:
         pts: List[List[float]] = []
         for rid in route_ids:
-            candidates = NuPlanAdapter._map_object_candidates(map_api, str(rid))
-            obj_pts: List[List[float]] = []
-            for obj in candidates:
-                obj_pts = NuPlanAdapter._points_from_map_object(obj)
-                if len(obj_pts) >= 2:
-                    break
+            obj_pts = self._route_points_for_id(map_api, str(rid))
             if obj_pts:
                 # Keep route order by flipping a new segment if needed.
                 if pts and len(obj_pts) >= 2:
@@ -596,12 +615,20 @@ class NuPlanAdapter:
                     if d1 < d0:
                         obj_pts = list(reversed(obj_pts))
                 pts.extend(obj_pts)
-        pts = NuPlanAdapter._dedupe_polyline(pts)
+        pts = self._dedupe_polyline(pts)
         if len(pts) >= 2:
             return pts
         if mission_goal is not None:
             return [[pose0.x, pose0.y], [mission_goal.x, mission_goal.y]]
         return [[pose0.x, pose0.y]]
+
+    @property
+    def route_geometry_cache_stats(self) -> Dict[str, int]:
+        return {
+            "entries": len(self._route_object_points_cache),
+            "hits": int(self._route_geometry_cache_hits),
+            "misses": int(self._route_geometry_cache_misses),
+        }
 
     @staticmethod
     def _polyline_length(points: List[List[float]]) -> float:

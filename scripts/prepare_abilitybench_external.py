@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from capplan.data.external_validation import inspect_source, validate_external_config
 from capplan.utils.serialization import dump_json, iter_jsonl
+from capplan.utils.build_fingerprint import file_inventory_fingerprint
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -182,6 +183,87 @@ def _resolve_city_db_dirs(split_cfg: Dict[str, Any], city_cfg: Dict[str, Any], c
     return matches if len(matches) == 1 else split_dirs
 
 
+def _collect_split_db_files(db_root: Path, db_dirs: Iterable[str]) -> List[Path]:
+    """List configured DB files without opening SQLite databases."""
+    out: List[Path] = []
+    for token in db_dirs:
+        p = Path(token)
+        candidate = p if p.is_absolute() else db_root / p
+        if candidate.is_file() and candidate.suffix.lower() == ".db":
+            out.append(candidate)
+        elif candidate.is_dir():
+            out.extend(x for x in candidate.rglob("*.db") if x.is_file())
+    return sorted(set(out))
+
+
+def _trusted_city_db_files_from_inspection(
+    *, split_name: str, city: str, split_cfg: Dict[str, Any], db_root: Path,
+    external_root: Path,
+) -> tuple[List[str] | None, str]:
+    """Reuse the audited city mapping for a mixed val/test DB directory.
+
+    The city inspection opens every DB once and records its mapped city.  For a
+    shared val/test directory, passing all DBs to every city's nuPlan builder
+    repeats SQLite discovery/loading four times.  Reusing the inspection is
+    lossless when the current file inventory fingerprint matches exactly.
+
+    Returns ``(None, reason)`` when the report is absent/stale/ambiguous so the
+    caller safely falls back to the original map-name filtering behavior.
+    """
+    split_dirs = [x for x in (_split_csv(split_cfg.get("db_dirs")) or "").split("+") if x]
+    # This optimization is only needed when several cities share one or more
+    # unspecialized DB directories. City-specific train dirs are already cheap.
+    if len(split_cfg.get("cities") or []) <= 1 or not split_dirs:
+        return None, "split_not_shared"
+    if split_cfg.get("db_dirs_by_city"):
+        return None, "city_specific_dirs_configured"
+
+    report_path = external_root / "reports" / f"nuplan_db_cities.{split_name}.json"
+    if not report_path.exists():
+        return None, f"inspection_report_missing:{report_path}"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"inspection_report_invalid:{type(exc).__name__}"
+    if report.get("status") != "PASS" or report.get("split") != split_name:
+        return None, "inspection_report_not_pass"
+    if [str(x) for x in (report.get("db_dirs") or [])] != [str(x) for x in split_dirs]:
+        return None, "inspection_db_dirs_mismatch"
+
+    current = _collect_split_db_files(db_root, split_dirs)
+    expected_fp = str(report.get("db_inventory_fingerprint") or "")
+    if not expected_fp:
+        return None, "inspection_report_has_no_inventory_fingerprint"
+    if file_inventory_fingerprint(current) != expected_fp:
+        return None, "inspection_inventory_changed"
+
+    selected: List[str] = []
+    ambiguous = 0
+    for row in report.get("dbs") or []:
+        mapped = [str(x) for x in (row.get("mapped_cities") or [])]
+        if len(mapped) != 1:
+            ambiguous += 1
+            continue
+        if mapped[0] == city:
+            db = Path(str(row.get("db") or ""))
+            if not db.exists():
+                return None, f"inspection_db_missing:{db}"
+            selected.append(str(db.resolve()))
+    if ambiguous:
+        return None, f"inspection_contains_{ambiguous}_ambiguous_db_rows"
+    if not selected:
+        return None, f"inspection_has_no_db_for_city:{city}"
+    return sorted(set(selected)), "inspection_inventory_match"
+
+
+def _write_db_manifest(path: Path, db_files: Iterable[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_suffix(path.suffix + ".part")
+    lines = [str(Path(x).resolve()) for x in db_files]
+    part.write_text("".join(x + "\n" for x in lines), encoding="utf-8")
+    part.replace(path)
+
+
 def _city_source(city: str, city_cfg: Dict[str, Any], key: str, default_root: Path, default_name: str) -> Path:
     explicit = city_cfg.get(key)
     if explicit:
@@ -276,6 +358,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     if episode_allowlist is not None and not dry_run and not episode_allowlist.exists():
         raise FileNotFoundError(episode_allowlist)
     num_workers = int(os.environ.get("CAP_NUM_WORKERS", config.get("num_workers", 0)))
+    graph_num_workers = int(os.environ.get("CAP_GRAPH_NUM_WORKERS", num_workers))
     seed = int(config.get("seed", 13))
     min_nodes = int(config.get("quality", {}).get("min_graph_nodes", 100))
     min_edges = int(config.get("quality", {}).get("min_graph_edges", 150))
@@ -350,6 +433,12 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
         scene_dirs[city] = scene_dir
         city_db_dirs = _resolve_city_db_dirs(split_cfg, city_cfg, city)
         city_map_names = _split_csv(city_cfg.get("map_names"))
+        db_root_path = _path(nuplan.get("db_root", nuplan["data_root"]))
+        assert db_root_path is not None
+        inspected_city_db_files, db_selection_reason = _trusted_city_db_files_from_inspection(
+            split_name=split_name, city=city, split_cfg=split_cfg, db_root=db_root_path,
+            external_root=external_root,
+        )
 
         if "extract" in stages or "all" in stages:
             cmd = [
@@ -360,9 +449,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--nuplan_map_root",
                 str(_path(nuplan["map_root"])),
                 "--nuplan_db_root",
-                str(_path(nuplan.get("db_root", nuplan["data_root"]))),
-                "--nuplan_db_dirs",
-                *_split_csv(city_db_dirs).split("+"),
+                str(db_root_path),
                 "--nuplan_map_version",
                 str(nuplan["map_version"]),
                 "--split",
@@ -375,12 +462,22 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(seed),
                 "--output_dir",
                 str(scene_dir),
+                "--resume",
             ]
+            if inspected_city_db_files:
+                db_manifest = reports_root / f"nuplan_db_inputs.{city}.txt"
+                if not dry_run:
+                    _write_db_manifest(db_manifest, inspected_city_db_files)
+                cmd.extend(["--nuplan_db_manifest", str(db_manifest)])
+                db_desc = f"inspection_manifest:{len(inspected_city_db_files)}db"
+            else:
+                cmd.extend(["--nuplan_db_dirs", *_split_csv(city_db_dirs).split("+")])
+                db_desc = f"dirs:{city_db_dirs} fallback_reason={db_selection_reason}"
             if city_map_names:
                 cmd.extend(["--nuplan_map_names", city_map_names])
             if disable_tqdm:
                 cmd.append("--disable_tqdm")
-            print(f"[CAPPLAN_PROGRESS] split={split_name} city={city} stage=extract db_dirs={city_db_dirs} workers={num_workers}", flush=True)
+            print(f"[CAPPLAN_PROGRESS] split={split_name} city={city} stage=extract db_selection={db_desc} workers={num_workers}", flush=True)
             _run(cmd, dry_run)
 
         if "graphs" in stages or "all" in stages:
@@ -423,7 +520,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--compact_storage",
                 "--resume",
                 "--num_workers",
-                str(num_workers),
+                str(graph_num_workers),
             ]
             if disable_tqdm:
                 cmd.append("--disable_tqdm")
@@ -557,9 +654,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--nuplan_map_root",
                 str(_path(nuplan["map_root"])),
                 "--nuplan_db_root",
-                str(_path(nuplan.get("db_root", nuplan["data_root"]))),
-                "--nuplan_db_dirs",
-                *_split_csv(city_db_dirs).split("+"),
+                str(db_root_path),
                 "--nuplan_map_version",
                 str(nuplan["map_version"]),
                 "--split",
