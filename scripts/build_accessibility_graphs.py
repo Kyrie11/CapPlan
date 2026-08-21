@@ -25,7 +25,7 @@ from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, Accessib
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 from capplan.utils.build_fingerprint import fingerprint
 
-GRAPH_BUILD_VERSION = "20260820_corridor_exact_v3"
+GRAPH_BUILD_VERSION = "20260821_episode_fingerprint_v4"
 
 try:
     from tqdm.auto import tqdm  # type: ignore
@@ -284,7 +284,14 @@ def _spatial_diagnostics(scene: Any, features: Sequence[Any], transformer: Coord
         "hint": "0 cropped features usually means the WGS84->nuPlan map georeference is not aligned, the transform backend is wrong/missing, or the Overpass/city-GIS bbox does not cover this nuPlan map/scenario. For nuPlan DB-set maps whose scene poses look like UTM/easting-northing coordinates, use local_crs plus projected_map_frame=true and check transform_backend is pyproj or utm_fallback.",
     }
 
-def _graph_build_fingerprint(args: argparse.Namespace) -> str:
+def _graph_static_fingerprint(args: argparse.Namespace) -> str:
+    """Fingerprint graph semantics + external evidence, excluding scene-list membership.
+
+    A previous global fingerprint included the SHA of the entire scenes.jsonl.
+    Adding/removing one independent episode therefore invalidated every existing
+    graph shard.  Graph content is actually a function of static evidence/config
+    plus *that episode's* route context, so resume is now keyed per episode.
+    """
     payload = {
         "version": GRAPH_BUILD_VERSION,
         "source_name": args.source_name,
@@ -297,34 +304,27 @@ def _graph_build_fingerprint(args: argparse.Namespace) -> str:
         "add_bidirectional": not bool(args.no_bidirectional_edges),
         "compact_storage": bool(args.compact_storage),
         "fail_on_synthetic": bool(args.fail_on_synthetic),
-        "episode_ids": str(args.episode_ids or ""),
     }
-    scene_file = Path(args.scene_dataset_dir) / "scenes.jsonl" if args.scene_dataset_dir else None
-    scene_manifest = Path(args.scene_dataset_dir) / "scene_context_manifest.json" if args.scene_dataset_dir else None
-    scene_content_id = None
-    if scene_manifest and scene_manifest.exists():
-        try:
-            sm = json.loads(scene_manifest.read_text(encoding="utf-8"))
-            if sm.get("scenes_sha256"):
-                scene_content_id = {
-                    "scenes_sha256": sm.get("scenes_sha256"),
-                    "num_scenes": sm.get("num_scenes"),
-                    "extract_version": sm.get("extract_version"),
-                }
-        except Exception:
-            pass
-    if scene_content_id is not None:
-        payload["scene_content"] = scene_content_id
-        scene_file_for_stat = None
-    else:
-        scene_file_for_stat = scene_file
     paths = [
-        scene_file_for_stat, args.georeference_json, args.nodes_jsonl, args.edges_jsonl,
+        args.georeference_json, args.nodes_jsonl, args.edges_jsonl,
         args.osm_nodes_jsonl, args.osm_edges_jsonl, args.osm_source,
         args.opensidewalks_source, args.city_gis_dir, args.curb_inventory_source,
         args.entrance_source, args.elevation_source,
     ]
     return fingerprint(payload, paths)
+
+
+def _graph_episode_fingerprint(static_fp: str, scene: Any) -> str:
+    # Only fields read by AccessibilityFusionBuilder/build_for_scene are included.
+    # Canonical fingerprint serialization makes this stable across process order.
+    return fingerprint({
+        "static_fingerprint": static_fp,
+        "episode_id": str(getattr(scene, "episode_id", "")),
+        "map_name": str(getattr(scene, "map_name", "")),
+        "route_polyline": getattr(scene, "route_polyline", []) or [],
+        "bbox": list(getattr(scene, "bbox", []) or []),
+        "corridor_radius_m": float(getattr(scene, "corridor_radius_m", 0.0) or 0.0),
+    }, [])
 
 
 def _build_prepared(args: argparse.Namespace) -> Dict[str, Any]:
@@ -342,11 +342,12 @@ def _build_prepared(args: argparse.Namespace) -> Dict[str, Any]:
         raise RuntimeError(f"accessibility graph too small: {len(nodes)} nodes/{len(edges)} edges; required {args.min_nodes_per_episode}/{args.min_edges_per_episode}")
     out = Path(args.output_graph_dir)
     out.mkdir(parents=True, exist_ok=True)
-    build_fp = _graph_build_fingerprint(args)
+    build_fp = _graph_static_fingerprint(args)
     episodes = _episode_ids(args.episode_ids)
     for eid in episodes:
         graph = AccessibilityGraph(eid, nodes, edges, {"source": args.source_name, "builder": "prepared_jsonl_validator", "episode_radius_m": args.episode_radius_m, "snap_tolerance_m": args.snap_tolerance_m})
-        _write_graph(out, graph, compact_storage=bool(getattr(args, "compact_storage", False)), build_fingerprint=build_fp)
+        episode_fp = fingerprint({"static_fingerprint": build_fp, "episode_id": eid}, [])
+        _write_graph(out, graph, compact_storage=bool(getattr(args, "compact_storage", False)), build_fingerprint=episode_fp)
     return {"status": "PASS", "episodes": episodes, "nodes": len(nodes), "edges": len(edges), "source": args.source_name, "mode": "prepared_jsonl", "build_version": GRAPH_BUILD_VERSION, "build_fingerprint": build_fp, "synthetic_rejected": bool(args.fail_on_synthetic)}
 
 
@@ -358,8 +359,9 @@ _MP_GRAPH_BUILD_FP = None
 _MP_GRAPH_TRANSFORMER = None
 
 
-def _build_one_graph_episode(scene: Any, builder: AccessibilityFusionBuilder, features: List[Any], args: argparse.Namespace, out: Path, build_fp: str, transformer: CoordinateTransformer) -> Dict[str, Any]:
+def _build_one_graph_episode(scene: Any, builder: AccessibilityFusionBuilder, features: List[Any], args: argparse.Namespace, out: Path, static_fp: str, transformer: CoordinateTransformer) -> Dict[str, Any]:
     ep_started = time.perf_counter()
+    episode_fp = _graph_episode_fingerprint(static_fp, scene)
     try:
         graph = builder.build_for_scene(
             scene,
@@ -377,7 +379,7 @@ def _build_one_graph_episode(scene: Any, builder: AccessibilityFusionBuilder, fe
             dump_json(args.diagnostic_report_json, {"failed_episode": getattr(scene, "episode_id", None), "diagnostics": [diag]})
         raise RuntimeError(f"{exc}\nSpatial alignment diagnostics: {json.dumps(diag, indent=2, sort_keys=True)}") from exc
     build_s = time.perf_counter() - ep_started
-    write_stats = _write_graph(out, graph, compact_storage=args.compact_storage, build_fingerprint=build_fp)
+    write_stats = _write_graph(out, graph, compact_storage=args.compact_storage, build_fingerprint=episode_fp)
     graph_timing = (graph.metadata or {}).get("build_timing_s", {}) if isinstance(graph.metadata, dict) else {}
     return {
         "episode_id": graph.episode_id,
@@ -428,7 +430,7 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
         contexts = iter_scene_contexts(args.scene_dataset_dir, _episode_ids(args.episode_ids), args.episode_radius_m)
         out = Path(args.output_graph_dir)
         out.mkdir(parents=True, exist_ok=True)
-        build_fp = _graph_build_fingerprint(args)
+        build_fp = _graph_static_fingerprint(args)
         builder = AccessibilityFusionBuilder(
             transformer,
             args.snap_tolerance_m,
@@ -494,7 +496,7 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
                 with ctx.Pool(processes=worker_count, initializer=_init_graph_fork_worker) as pool:
                     pending: List[Any] = []
                     for scene in contexts:
-                        resume_stats = _resume_graph_stats(out, scene.episode_id, args.compact_storage, build_fp) if args.resume else None
+                        resume_stats = _resume_graph_stats(out, scene.episode_id, args.compact_storage, _graph_episode_fingerprint(build_fp, scene)) if args.resume else None
                         if resume_stats is not None:
                             absorb_resume(scene, resume_stats)
                             continue
@@ -508,7 +510,7 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
                             absorb_result(result)
         if worker_count <= 1:
             for scene in contexts:
-                resume_stats = _resume_graph_stats(out, scene.episode_id, args.compact_storage, build_fp) if args.resume else None
+                resume_stats = _resume_graph_stats(out, scene.episode_id, args.compact_storage, _graph_episode_fingerprint(build_fp, scene)) if args.resume else None
                 if resume_stats is not None:
                     absorb_resume(scene, resume_stats)
                     continue
@@ -526,6 +528,7 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
             "mode": "gis_fusion",
             "build_version": GRAPH_BUILD_VERSION,
             "build_fingerprint": build_fp,
+            "fingerprint_scope": "static_evidence_plus_per_episode_route_context",
             "features_loaded": len(features),
             "resumed_episodes": resumed,
             "compact_storage": bool(args.compact_storage),

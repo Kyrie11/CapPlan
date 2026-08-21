@@ -6,6 +6,17 @@
 seed: 13
 num_workers: 0
 
+# Heavy scene materialization policy.  The complete immutable nuPlan substrate is
+# inventoried separately by `index-nuplan-full`; these settings control only the
+# expensive history + accessibility-graph + PUDO candidate corpus.
+scene_selection:
+  checkpoint_interval: 1000
+  # Keep disabled by default so configured-cap builds preserve the previous
+  # deterministic ScenarioFilter semantics.  These can be enabled deliberately
+  # for an additional temporally de-clustered/non-stationary experimental set.
+  timestamp_threshold_s: null
+  ego_displacement_minimum_m: null
+
 nuplan:
   # Official nuPlan layout:
   # data/nuplan/nuplan-v1.1/splits/{mini,trainval,test,...}/*.db

@@ -360,6 +360,11 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     num_workers = int(os.environ.get("CAP_NUM_WORKERS", config.get("num_workers", 0)))
     graph_num_workers = int(os.environ.get("CAP_GRAPH_NUM_WORKERS", num_workers))
     seed = int(config.get("seed", 13))
+    scene_selection_cfg = config.get("scene_selection", {}) or {}
+    timestamp_threshold_s = split_cfg.get("timestamp_threshold_s", scene_selection_cfg.get("timestamp_threshold_s"))
+    ego_displacement_minimum_m = split_cfg.get("ego_displacement_minimum_m", scene_selection_cfg.get("ego_displacement_minimum_m"))
+    extract_checkpoint_interval = int(os.environ.get("CAP_EXTRACT_CHECKPOINT_INTERVAL", scene_selection_cfg.get("checkpoint_interval", 1000)))
+    adopt_extract_partial = str(os.environ.get("CAP_ADOPT_EXTRACT_PARTIAL", "0")).strip().lower() in {"1", "true", "yes", "on"}
     min_nodes = int(config.get("quality", {}).get("min_graph_nodes", 100))
     min_edges = int(config.get("quality", {}).get("min_graph_edges", 150))
     min_paper_eligible = int(config.get("quality", {}).get("min_paper_eligible_pudos_per_episode", 2))
@@ -440,6 +445,38 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             external_root=external_root,
         )
 
+        if "index" in stages:
+            index_dir = prepared_root / "scenario_index"
+            index_out = index_dir / f"{city}.jsonl"
+            index_manifest = reports_root / f"nuplan_scenario_index.{city}.json"
+            cmd = [
+                sys.executable, "scripts/index_nuplan_scenarios.py",
+                "--nuplan_data_root", str(_path(nuplan["data_root"])),
+                "--nuplan_map_root", str(_path(nuplan["map_root"])),
+                "--nuplan_db_root", str(db_root_path),
+                "--nuplan_map_version", str(nuplan["map_version"]),
+                "--split", split_name, "--max_scenarios", "0",
+                "--num_workers", str(num_workers),
+                "--output_jsonl", str(index_out),
+                "--manifest_json", str(index_manifest),
+                "--resume",
+            ]
+            if inspected_city_db_files:
+                db_manifest = reports_root / f"nuplan_db_inputs.{city}.txt"
+                if not dry_run:
+                    _write_db_manifest(db_manifest, inspected_city_db_files)
+                cmd.extend(["--nuplan_db_manifest", str(db_manifest)])
+                db_desc = f"inspection_manifest:{len(inspected_city_db_files)}db"
+            else:
+                cmd.extend(["--nuplan_db_dirs", *_split_csv(city_db_dirs).split("+")])
+                db_desc = f"dirs:{city_db_dirs} fallback_reason={db_selection_reason}"
+            if city_map_names:
+                cmd.extend(["--nuplan_map_names", city_map_names])
+            if disable_tqdm:
+                cmd.append("--disable_tqdm")
+            print(f"[CAPPLAN_PROGRESS] split={split_name} city={city} stage=index db_selection={db_desc} workers={num_workers}", flush=True)
+            _run(cmd, dry_run)
+
         if "extract" in stages or "all" in stages:
             cmd = [
                 sys.executable,
@@ -463,7 +500,15 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--output_dir",
                 str(scene_dir),
                 "--resume",
+                "--checkpoint_interval",
+                str(extract_checkpoint_interval),
             ]
+            if timestamp_threshold_s is not None:
+                cmd.extend(["--timestamp_threshold_s", str(timestamp_threshold_s)])
+            if ego_displacement_minimum_m is not None:
+                cmd.extend(["--ego_displacement_minimum_m", str(ego_displacement_minimum_m)])
+            if adopt_extract_partial:
+                cmd.append("--adopt_existing_partial")
             if inspected_city_db_files:
                 db_manifest = reports_root / f"nuplan_db_inputs.{city}.txt"
                 if not dry_run:

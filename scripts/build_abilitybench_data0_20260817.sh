@@ -186,11 +186,14 @@ bootstrap_performance_snapshot() {
 }
 
 run_city_stage_parallel() {
-  # Usage: run_city_stage_parallel <split> <source_policy> <stage> <jobs> <log_prefix>
+  # Usage: run_city_stage_parallel <split> <source_policy> <stage> <jobs> <log_prefix> [max_scenarios|config]
+  # max_scenarios=config omits the CLI override and therefore uses the split cap
+  # from configs/abilitybench_nuplan_real_data0.yaml.  This is the recommended
+  # mode for expensive scene/graph/PUDO materialization.
   # Each worker owns one city. Wait for *whichever* city finishes first so a
   # slow Boston job cannot leave a free slot idle while a later city is ready.
   # Bash >=4.3 provides wait -n (the target server satisfies this).
-  local split="$1" policy="$2" stage="$3" jobs="$4" prefix="$5"
+  local split="$1" policy="$2" stage="$3" jobs="$4" prefix="$5" max_mode="${6:-0}"
   local -a cities=(boston pittsburgh vegas singapore)
   local city failed=0 active=0
   [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || { echo "parallel jobs must be a positive integer, got: $jobs" >&2; return 2; }
@@ -205,10 +208,13 @@ run_city_stage_parallel() {
         return 1
       fi
     done
-    ( runlog "${prefix}.${split}.${city}.${stage}" python scripts/prepare_abilitybench_external.py \
-        --config "$CONFIG" --split "$split" --source_policy "$policy" \
-        --cities "$city" --max_scenarios_per_city 0 --stages "$stage" \
-        --skip_preflight --skip_pudo_concat ) &
+    local -a cmd=(python scripts/prepare_abilitybench_external.py
+        --config "$CONFIG" --split "$split" --source_policy "$policy"
+        --cities "$city" --stages "$stage" --skip_preflight --skip_pudo_concat)
+    if [[ "$max_mode" != "config" ]]; then
+      cmd+=(--max_scenarios_per_city "$max_mode")
+    fi
+    ( runlog "${prefix}.${split}.${city}.${stage}" "${cmd[@]}" ) &
     active=$((active + 1))
   done
   while (( active > 0 )); do
@@ -227,6 +233,42 @@ concat_split_pudo() {
       "$DATA_ROOT/outputs/prepared/$split/pudo/vegas.jsonl" \
       "$DATA_ROOT/outputs/prepared/$split/pudo/singapore.jsonl" \
     --output "$DATA_ROOT/outputs/prepared/$split/pudo_evidence.jsonl"
+}
+
+index_nuplan_full() {
+  # Keep a complete, lightweight inventory of every matching scenario identity
+  # in the immutable official split.  This preserves full-dataset provenance
+  # without hydrating 20-step histories and multi-MB accessibility graphs for
+  # every temporally correlated nuPlan snapshot.
+  local split
+  for split in train val test; do
+    runlog "nuplan_scenario_index.${split}.all" python scripts/prepare_abilitybench_external.py \
+      --config "$CONFIG" --split "$split" --source_policy bootstrap \
+      --cities boston+pittsburgh+vegas+singapore --max_scenarios_per_city 0 \
+      --stages index --skip_preflight --skip_pudo_concat
+  done
+}
+
+bootstrap_candidates_paper_scale_staged() {
+  # RECOMMENDED heavy-materialization pass.  Unlike the legacy "full" target,
+  # this uses the configured split caps (train=1000/city, val/test=250/city by
+  # default) and preserves the full official substrate through index-nuplan-full.
+  # Increase the caps only if site/audit/paper-allowlist coverage is insufficient.
+  local extract_jobs="${CAP_EXTRACT_CITY_JOBS:-1}"
+  local graph_jobs="${CAP_GRAPH_CITY_JOBS:-2}"
+  local pudo_jobs="${CAP_PUDO_CITY_JOBS:-4}"
+  local split
+  echo "[CAPPLAN_PROGRESS] paper-scale candidate materialization CAP_NUM_WORKERS=${CAP_NUM_WORKERS:-config-default} CAP_GRAPH_NUM_WORKERS=${CAP_GRAPH_NUM_WORKERS:-${CAP_NUM_WORKERS:-config-default}} extract_city_jobs=$extract_jobs graph_city_jobs=$graph_jobs pudo_city_jobs=$pudo_jobs"
+  for split in train val test; do
+    runlog "bootstrap_preflight.${split}.paper_scale" python scripts/prepare_abilitybench_external.py \
+      --config "$CONFIG" --split "$split" --source_policy bootstrap \
+      --cities boston+pittsburgh+vegas+singapore --stages preflight
+    run_city_stage_parallel "$split" bootstrap extract "$extract_jobs" bootstrap_paper_scale config
+    run_city_stage_parallel "$split" bootstrap graphs "$graph_jobs" bootstrap_paper_scale config
+    run_city_stage_parallel "$split" bootstrap pudo "$pudo_jobs" bootstrap_paper_scale config
+    concat_split_pudo "$split" bootstrap_paper_scale
+    bootstrap_performance_snapshot
+  done
 }
 
 bootstrap_candidates_full_staged() {
@@ -358,12 +400,46 @@ classify_audits() {
   done
 }
 
+triage_audits() {
+  for city in boston pittsburgh vegas singapore; do
+    runlog "pudo_audit_triage.${city}" python scripts/triage_pudo_audits.py \
+      --input_csv "$EXT/audits/$city/pudo_audit_review_status.csv" \
+      --output_csv "$EXT/audits/$city/pudo_audit_machine_triage.csv" \
+      --machine_pass_csv "$EXT/audits/$city/machine_pass_explicit_authoritative.csv" \
+      --machine_reject_csv "$EXT/audits/$city/machine_reject_invalid_or_ambiguous.csv" \
+      --visual_review_csv "$EXT/audits/$city/visual_review_required.csv" \
+      --new_evidence_csv "$EXT/audits/$city/new_evidence_required.csv" \
+      --report_json "$REPORTS/pudo_audit_triage.${city}.json"
+  done
+}
+
+render_audit_packets() {
+  local max_rows="${CAP_AUDIT_RENDER_MAX_ROWS:-0}"
+  local radius_m="${CAP_AUDIT_RENDER_RADIUS_M:-120}"
+  for city in boston pittsburgh vegas singapore; do
+    local csv="$EXT/audits/$city/visual_review_required.csv"
+    if [[ ! -s "$csv" ]] || [[ $(wc -l < "$csv") -le 1 ]]; then
+      echo "INFO: no visual-review rows for $city; skip packet rendering"
+      continue
+    fi
+    runlog "pudo_audit_render.${city}" python scripts/render_pudo_audit_packets.py \
+      --input_csv "$csv" --data_root "$DATA_ROOT" \
+      --georeference_json "$EXT/georeference/${city}.json" \
+      --output_dir "$EXT/audits/$city/visual_packets" \
+      --radius_m "$radius_m" --max_rows "$max_rows" \
+      --report_json "$REPORTS/pudo_audit_render.${city}.json"
+  done
+}
+
 review_source_complete_audits() {
   : "${REVIEWER_ID:?Set REVIEWER_ID only after a reviewer has inspected source_complete_review_candidates.csv}"
   : "${CONFIRM_SOURCE_REVIEW:?Set CONFIRM_SOURCE_REVIEW=YES only after actual human review}"
   [[ "$CONFIRM_SOURCE_REVIEW" == "YES" ]] || { echo "CONFIRM_SOURCE_REVIEW must equal YES" >&2; return 2; }
   for city in boston pittsburgh vegas singapore; do
-    local review_csv="$EXT/audits/$city/source_complete_review_candidates.csv"
+    local review_csv="$EXT/audits/$city/visual_review_required.csv"
+    if [[ ! -s "$review_csv" ]]; then
+      review_csv="$EXT/audits/$city/source_complete_review_candidates.csv"
+    fi
     if [[ ! -s "$review_csv" ]] || [[ $(wc -l < "$review_csv") -le 1 ]]; then
       echo "INFO: no source-complete review candidates for $city; skip explicit source review"
       continue
@@ -558,11 +634,15 @@ Stages:
   bootstrap-candidates-full
   bootstrap-performance-snapshot
   bootstrap-candidates-full-parallel  # legacy whole-city parallel mode
-  bootstrap-candidates-full-staged    # RECOMMENDED: serialized extract + parallel graph/PUDO
+  index-nuplan-full                   # full lightweight immutable scenario identity inventory
+  bootstrap-candidates-paper-scale-staged # RECOMMENDED: config-capped heavy materialization
+  bootstrap-candidates-full-staged    # legacy exhaustive heavy build; checkpointable but not recommended for paper sampling
   bootstrap-runtime-summary           # summarize profiler, excluding idle tail
   site-catalogs
   prefill-audits
   classify-audits
+  triage-audits                       # deterministic reject/missing/visual/explicit-source buckets
+  render-audit-packets                # offline topology packets for rows needing semantic review
   review-source-complete-audits
   import-source-complete-audits
   import-completed-manual-audits
@@ -597,11 +677,15 @@ case "${1:-}" in
   bootstrap-candidates-full) bootstrap_candidates_full ;;
   bootstrap-performance-snapshot) bootstrap_performance_snapshot ;;
   bootstrap-candidates-full-parallel) bootstrap_candidates_full_parallel ;;
+  index-nuplan-full) index_nuplan_full ;;
+  bootstrap-candidates-paper-scale-staged) bootstrap_candidates_paper_scale_staged ;;
   bootstrap-candidates-full-staged) bootstrap_candidates_full_staged ;;
   bootstrap-runtime-summary) bootstrap_runtime_summary ;;
   site-catalogs) build_site_catalogs ;;
   prefill-audits) prefill_audit_worklists ;;
   classify-audits) classify_audits ;;
+  triage-audits) triage_audits ;;
+  render-audit-packets) render_audit_packets ;;
   review-source-complete-audits) review_source_complete_audits ;;
   import-source-complete-audits) import_source_complete_audits ;;
   import-completed-manual-audits) import_completed_manual_audits ;;

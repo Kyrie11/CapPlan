@@ -10,3 +10,5 @@ tqdm>=4.66
 
 # Optional but recommended for exact WGS84 <-> projected CRS transforms in GIS fusion.
 pyproj>=3.6
+
+matplotlib>=3.7

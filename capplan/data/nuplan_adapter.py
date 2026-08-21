@@ -137,6 +137,8 @@ class NuPlanAdapter:
         scenario_types: Sequence[str] | str | None = None,
         map_names: Sequence[str] | str | None = None,
         log_names: Sequence[str] | str | None = None,
+        timestamp_threshold_s: float | None = None,
+        ego_displacement_minimum_m: float | None = None,
         allow_synthetic_fallback: bool = False,
         # Legacy alias accepted for older scripts; does not imply fallback.
         nuplan_root: str | None = None,
@@ -158,6 +160,8 @@ class NuPlanAdapter:
         self.scenario_types = _split_path_list(scenario_types)
         self.map_names = _split_path_list(map_names)
         self.log_names = _split_path_list(log_names)
+        self.timestamp_threshold_s = None if timestamp_threshold_s is None else float(timestamp_threshold_s)
+        self.ego_displacement_minimum_m = None if ego_displacement_minimum_m is None else float(ego_displacement_minimum_m)
         self.allow_synthetic_fallback = allow_synthetic_fallback
         self.nuplan_available = self._check_nuplan()
         self._builder = None
@@ -247,14 +251,69 @@ class NuPlanAdapter:
         except Exception as e:
             raise RuntimeError(f"failed to initialize NuPlanScenarioBuilder: {e}") from e
 
-    def iter_scenarios(self, max_scenarios: int = 4) -> Iterable[NuPlanScenarioRecord]:
-        """Iterate scenarios. For real nuPlan data, ``max_scenarios <= 0`` means all matching scenarios."""
+    def iter_scenarios(
+        self,
+        max_scenarios: int = 4,
+        *,
+        skip_scenarios: int = 0,
+        expected_last_skipped_episode_id: str | None = None,
+    ) -> Iterable[NuPlanScenarioRecord]:
+        """Iterate scenarios with an exact prefix-skip hook for crash-safe resume.
+
+        ``skip_scenarios`` is applied *after* nuPlan's deterministic ScenarioFilter
+        output is constructed and *before* the expensive per-scenario history/map
+        extraction.  This is intentionally not a data sampling mechanism.  It is
+        only used to resume a previously committed JSONL prefix whose input
+        fingerprint is identical.  ``expected_last_skipped_episode_id`` guards
+        against any ordering/input drift before work is skipped.
+        """
+        skip_scenarios = max(0, int(skip_scenarios))
         if self.scene_source == "synthetic":
             if max_scenarios <= 0:
                 raise ValueError("synthetic scene generation requires max_scenarios > 0")
-            yield from self._iter_synthetic(max_scenarios)
+            for idx, rec in enumerate(self._iter_synthetic(max_scenarios)):
+                if idx < skip_scenarios:
+                    if idx == skip_scenarios - 1 and expected_last_skipped_episode_id and rec.episode.episode_id != expected_last_skipped_episode_id:
+                        raise RuntimeError(
+                            "resume boundary mismatch for synthetic scenarios: "
+                            f"expected {expected_last_skipped_episode_id}, got {rec.episode.episode_id}"
+                        )
+                    continue
+                yield rec
             return
-        yield from self._iter_real_nuplan(max_scenarios)
+        yield from self._iter_real_nuplan(
+            max_scenarios,
+            skip_scenarios=skip_scenarios,
+            expected_last_skipped_episode_id=expected_last_skipped_episode_id,
+        )
+
+    def iter_scenario_index(self, max_scenarios: int = 0) -> Iterable[Dict[str, Any]]:
+        """Yield a lightweight identity index without loading 20-step histories.
+
+        This retains the exact nuPlan ScenarioFilter population/order used by the
+        heavy extractor, but only records stable identifiers and initial timestamp.
+        It is useful for a full immutable candidate inventory while materializing
+        expensive passenger-service evidence only for a paper-scale scene subset.
+        """
+        if self.scene_source != "nuplan":
+            raise RuntimeError("scenario indexing is only defined for scene_source=nuplan")
+        for idx, scenario in enumerate(self._get_real_nuplan_scenarios(max_scenarios)):
+            token, log_name, scenario_type, map_name = self._scenario_identity(scenario, idx)
+            ts = safe_call(scenario, ["_initial_lidar_timestamp", "initial_lidar_timestamp"], None)
+            try:
+                ts_us = int(ts) if ts is not None else None
+            except Exception:
+                ts_us = None
+            yield {
+                "index": idx,
+                "episode_id": self._episode_id(log_name, token),
+                "scenario_token": token,
+                "log_name": log_name,
+                "scenario_type": scenario_type,
+                "map_name": map_name,
+                "initial_lidar_timestamp_us": ts_us,
+                "split": self.split,
+            }
 
     def _iter_synthetic(self, max_scenarios: int) -> Iterator[NuPlanScenarioRecord]:
         for i in range(max_scenarios):
@@ -302,30 +361,44 @@ class NuPlanAdapter:
             )
             yield NuPlanScenarioRecord(ep, scene, scene.ego_history, scene.agent_history, {"map_name": scene.map_name, "map_version": scene.map_version}, scene.route_corridor)
 
-    def _iter_real_nuplan(self, max_scenarios: int) -> Iterator[NuPlanScenarioRecord]:  # pragma: no cover - requires nuPlan installation/data
-        assert self._builder is not None
+    def _scenario_filter(self, max_scenarios: int):  # pragma: no cover - requires nuPlan installation/data
         scenario_limit = None if max_scenarios <= 0 else int(max_scenarios)
         try:
             from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter  # type: ignore
         except Exception as e:
             raise RuntimeError(f"failed to import nuPlan ScenarioFilter: {e}") from e
         try:
-            # API shapes differ across devkit versions.  Try common call forms.
-            scenario_filter = ScenarioFilter(
+            return ScenarioFilter(
                 scenario_types=self.scenario_types or None,
                 scenario_tokens=None,
                 log_names=self.log_names or None,
                 map_names=self.map_names or None,
                 num_scenarios_per_type=None,
                 limit_total_scenarios=scenario_limit,
-                timestamp_threshold_s=None,
-                ego_displacement_minimum_m=None,
+                timestamp_threshold_s=self.timestamp_threshold_s,
+                ego_displacement_minimum_m=self.ego_displacement_minimum_m,
                 expand_scenarios=False,
                 remove_invalid_goals=True,
                 shuffle=False,
             )
         except TypeError:
-            scenario_filter = ScenarioFilter(self.scenario_types or None, None, self.log_names or None, self.map_names or None, None, scenario_limit, None, None, False, True, False)
+            # Older devkit signature.  These versions expose the original 11
+            # fields only; keep the exact legacy behavior when optional filters
+            # are unset, and fail rather than silently ignore requested filters.
+            if self.timestamp_threshold_s is not None or self.ego_displacement_minimum_m is not None:
+                raise RuntimeError(
+                    "installed nuPlan ScenarioFilter does not support timestamp/displacement filters; "
+                    "upgrade the devkit or leave these options unset"
+                )
+            return ScenarioFilter(
+                self.scenario_types or None, None, self.log_names or None,
+                self.map_names or None, None, scenario_limit, None, None,
+                False, True, False,
+            )
+
+    def _get_real_nuplan_scenarios(self, max_scenarios: int):  # pragma: no cover
+        assert self._builder is not None
+        scenario_filter = self._scenario_filter(max_scenarios)
         scenarios = None
         for method in ["get_scenarios", "get_scenario_tokens"]:
             if hasattr(self._builder, method):
@@ -340,13 +413,53 @@ class NuPlanAdapter:
                         continue
         if scenarios is None:
             raise RuntimeError("nuPlan scenario builder did not expose a usable get_scenarios API")
-        # Do not materialize/copy the complete scenario iterable here.  In full
-        # four-city builds the builder may expose many thousands of scenarios;
-        # a second ``list(...)`` copy adds avoidable peak memory and delays the
-        # first visible progress update.
+        return scenarios
+
+    @staticmethod
+    def _episode_id(log_name: str, token: str) -> str:
+        stable = hashlib.sha1(f"{log_name}:{token}".encode()).hexdigest()[:12]
+        return f"nuplan_{stable}"
+
+    def _scenario_identity(self, scenario: Any, idx: int) -> tuple[str, str, str | None, str | None]:
+        token = safe_call(scenario, ["token", "scenario_token", "get_token"], None)
+        log_name = safe_call(scenario, ["log_name", "get_log_name"], None)
+        scenario_type = safe_call(scenario, ["scenario_type", "get_scenario_type"], None)
+        # NuPlanScenario carries _map_name directly.  Reading it avoids eagerly
+        # loading the map DB just to validate a resume boundary / write an index.
+        map_name = safe_call(scenario, ["_map_name", "map_name", "get_map_name"], None)
+        if not map_name:
+            map_api = safe_call(scenario, ["map_api", "get_map_api"], None)
+            map_name = safe_call(map_api, ["map_name", "get_map_name"], None) if map_api else None
+        if not token or not log_name:
+            raise RuntimeError(f"nuPlan scenario missing critical identity at index {idx}: token={token}, log={log_name}")
+        return str(token), str(log_name), (str(scenario_type) if scenario_type else None), (str(map_name) if map_name else None)
+
+    def _iter_real_nuplan(
+        self,
+        max_scenarios: int,
+        *,
+        skip_scenarios: int = 0,
+        expected_last_skipped_episode_id: str | None = None,
+    ) -> Iterator[NuPlanScenarioRecord]:  # pragma: no cover - requires nuPlan installation/data
+        scenario_limit = None if max_scenarios <= 0 else int(max_scenarios)
+        scenarios = self._get_real_nuplan_scenarios(max_scenarios)
+        # Do not materialize/copy the complete scenario iterable here.  More
+        # importantly, crash-resume skips the already committed prefix before
+        # touching history/agents/traffic lights/map geometry.
         for idx, scenario in enumerate(scenarios):
             if scenario_limit is not None and idx >= scenario_limit:
                 break
+            if idx < skip_scenarios:
+                if idx == skip_scenarios - 1 and expected_last_skipped_episode_id:
+                    token, log_name, _, _ = self._scenario_identity(scenario, idx)
+                    actual = self._episode_id(log_name, token)
+                    if actual != expected_last_skipped_episode_id:
+                        raise RuntimeError(
+                            "resume boundary mismatch: the filtered nuPlan scenario order changed. "
+                            f"expected last committed {expected_last_skipped_episode_id}, got {actual}; "
+                            "refusing to append to the existing partial files"
+                        )
+                continue
             yield self._extract_real_scenario(scenario, idx)
 
     def _extract_real_scenario(self, scenario: Any, idx: int) -> NuPlanScenarioRecord:  # pragma: no cover - requires nuPlan installation/data
@@ -389,8 +502,7 @@ class NuPlanAdapter:
             tls.append({"iteration": it, "statuses": [str(x) for x in (tl or [])]})
         route_polyline = self._extract_route_polyline(route_ids, map_api, pose0, mission_goal)
         route_len = self._estimate_route_length(route_ids, map_api, route_polyline)
-        stable = hashlib.sha1(f"{log_name}:{token}".encode()).hexdigest()[:12]
-        eid = f"nuplan_{stable}"
+        eid = self._episode_id(str(log_name), str(token))
         if not map_name or not token or not log_name:
             raise RuntimeError(f"nuPlan scenario missing critical identifiers: token={token}, log={log_name}, map={map_name}")
         scene = SceneRecord(
