@@ -411,24 +411,68 @@ triage_audits() {
       --new_evidence_csv "$EXT/audits/$city/new_evidence_required.csv" \
       --report_json "$REPORTS/pudo_audit_triage.${city}.json"
   done
+  audit_status
+}
+
+refresh_audit_public_sources() {
+  # Audit-specific refresh is intentionally non-strict: partial official-source
+  # recovery is useful and all failures are persisted to recommended_public_sources.json.
+  runlog fetch_recommended_public_sources.audit python scripts/fetch_recommended_public_sources.py \
+    --config "$CONFIG" --cities boston,singapore
+}
+
+audit_status() {
+  runlog pudo_audit_status python scripts/summarize_pudo_audit_status.py \
+    --external_root "$EXT" --reports_root "$REPORTS" \
+    --output "$REPORTS/pudo_audit_status.json"
+  runlog pudo_evidence_gap_manifest python scripts/export_pudo_evidence_gap_manifest.py \
+    --external_root "$EXT" \
+    --output_csv "$REPORTS/pudo_evidence_gap_manifest.csv" \
+    --report_json "$REPORTS/pudo_evidence_gap_manifest.json"
+}
+
+recover_audit_evidence() {
+  runlog pudo_audit_evidence_recovery python scripts/recover_pudo_audit_sources.py \
+    --external_root "$EXT" --cities boston,pittsburgh,vegas,singapore \
+    --report_json "$REPORTS/pudo_audit_evidence_recovery.json"
+  prefill_audit_worklists
+  classify_audits
+  triage_audits
 }
 
 render_audit_packets() {
   local max_rows="${CAP_AUDIT_RENDER_MAX_ROWS:-0}"
   local radius_m="${CAP_AUDIT_RENDER_RADIUS_M:-120}"
+  local scope="${CAP_AUDIT_RENDER_SCOPE:-auto}"
+  [[ "$scope" =~ ^(auto|visual|new_evidence)$ ]] || { echo "CAP_AUDIT_RENDER_SCOPE must be auto|visual|new_evidence" >&2; return 2; }
   for city in boston pittsburgh vegas singapore; do
-    local csv="$EXT/audits/$city/visual_review_required.csv"
-    if [[ ! -s "$csv" ]] || [[ $(wc -l < "$csv") -le 1 ]]; then
-      echo "INFO: no visual-review rows for $city; skip packet rendering"
+    local visual_csv="$EXT/audits/$city/visual_review_required.csv"
+    local evidence_csv="$EXT/audits/$city/new_evidence_required.csv"
+    local csv="" bucket="" outdir=""
+    if [[ "$scope" != "new_evidence" ]] && [[ -s "$visual_csv" ]] && [[ $(wc -l < "$visual_csv") -gt 1 ]]; then
+      csv="$visual_csv"; bucket="visual"; outdir="$REPORTS/audit_packets/$city/visual"
+    elif [[ "$scope" != "visual" ]] && [[ -s "$evidence_csv" ]] && [[ $(wc -l < "$evidence_csv") -gt 1 ]]; then
+      csv="$evidence_csv"; bucket="evidence_gap"; outdir="$REPORTS/audit_packets/$city/evidence_gap"
+      echo "INFO: no visual-review rows for $city; rendering NEW_EVIDENCE_REQUIRED diagnostic packets instead"
+    else
+      echo "INFO: no rows for audit packet scope=$scope city=$city; skip packet rendering"
       continue
     fi
-    runlog "pudo_audit_render.${city}" python scripts/render_pudo_audit_packets.py \
+    runlog "pudo_audit_render.${city}.${bucket}" python scripts/render_pudo_audit_packets.py \
       --input_csv "$csv" --data_root "$DATA_ROOT" \
       --georeference_json "$EXT/georeference/${city}.json" \
-      --output_dir "$EXT/audits/$city/visual_packets" \
+      --output_dir "$outdir" \
       --radius_m "$radius_m" --max_rows "$max_rows" \
-      --report_json "$REPORTS/pudo_audit_render.${city}.json"
+      --report_json "$REPORTS/pudo_audit_render.${city}.${bucket}.json"
   done
+}
+
+audit_review_bundle() {
+  runlog pudo_audit_review_bundle python scripts/build_audit_review_bundle.py \
+    --external_root "$EXT" --reports_root "$REPORTS" \
+    --max_rows "${CAP_AUDIT_BUNDLE_MAX_ROWS:-100}" \
+    --max_images "${CAP_AUDIT_BUNDLE_MAX_IMAGES:-24}" \
+    --output_zip "$REPORTS/capplan_audit_review_bundle.zip"
 }
 
 review_source_complete_audits() {
@@ -441,7 +485,12 @@ review_source_complete_audits() {
       review_csv="$EXT/audits/$city/source_complete_review_candidates.csv"
     fi
     if [[ ! -s "$review_csv" ]] || [[ $(wc -l < "$review_csv") -le 1 ]]; then
-      echo "INFO: no source-complete review candidates for $city; skip explicit source review"
+      local unresolved="$EXT/audits/$city/new_evidence_required.csv"
+      if [[ -s "$unresolved" ]] && [[ $(wc -l < "$unresolved") -gt 1 ]]; then
+        echo "INFO: no source-complete review candidates for $city; unresolved rows still require source/evidence recovery (see new_evidence_required.csv). Do NOT stamp them as human-reviewed."
+      else
+        echo "INFO: no source-complete review candidates for $city; skip explicit source review"
+      fi
       continue
     fi
     runlog "pudo_audit_source_review.${city}" python scripts/review_pudo_audit_worklist.py \
@@ -641,8 +690,12 @@ Stages:
   site-catalogs
   prefill-audits
   classify-audits
-  triage-audits                       # deterministic reject/missing/visual/explicit-source buckets
-  render-audit-packets                # offline topology packets for rows needing semantic review
+  triage-audits                       # deterministic reject/missing/visual/explicit-source buckets + status
+  audit-status                        # combined report + compact evidence-gap manifest; PASS != evidence complete
+  refresh-audit-public-sources        # retry Boston official physical layers + Singapore LTA entrance/source layers
+  recover-audit-evidence              # semantic source recovery + prefill/classify/triage rerun
+  render-audit-packets                # visual rows, or evidence-gap diagnostic packets when visual bucket is empty
+  audit-review-bundle                 # small uploadable ZIP under reports/ (no NPZ/full dataset)
   review-source-complete-audits
   import-source-complete-audits
   import-completed-manual-audits
@@ -685,7 +738,11 @@ case "${1:-}" in
   prefill-audits) prefill_audit_worklists ;;
   classify-audits) classify_audits ;;
   triage-audits) triage_audits ;;
+  audit-status) audit_status ;;
+  refresh-audit-public-sources) refresh_audit_public_sources ;;
+  recover-audit-evidence) recover_audit_evidence ;;
   render-audit-packets) render_audit_packets ;;
+  audit-review-bundle) audit_review_bundle ;;
   review-source-complete-audits) review_source_complete_audits ;;
   import-source-complete-audits) import_source_complete_audits ;;
   import-completed-manual-audits) import_completed_manual_audits ;;

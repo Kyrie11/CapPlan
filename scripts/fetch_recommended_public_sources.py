@@ -97,8 +97,14 @@ def main() -> None:
             out = fn()
             results.append({"city": city, "source": name, "status": "PASS", "output": str(out) if out else None})
         except Exception as exc:
+            import traceback
             failures += 1
-            results.append({"city": city, "source": name, "status": "FAIL", "error": f"{type(exc).__name__}: {exc}", "manual_fallback": fallback})
+            results.append({
+                "city": city, "source": name, "status": "FAIL",
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(limit=20),
+                "manual_fallback": fallback,
+            })
 
     if "boston" in cities:
         bbox = cfg["cities"]["boston"]["bbox"]
@@ -228,6 +234,7 @@ def main() -> None:
             ("Taxi Stand", "taxi_stand", "lta_taxi_stand", external / "normalized" / "candidates" / "singapore" / "taxi_stand.jsonl"),
             ("Footpath", "footpath", "lta_footpath", external / "normalized" / "city_gis" / "singapore" / "footpath.geojson"),
             ("Kerbline", "kerbline", "lta_kerbline", external / "normalized" / "city_gis" / "singapore" / "kerbline.geojson"),
+            ("Train Station Exit", "train_station_exit", "government_entrance", external / "normalized" / "entrances" / "singapore.geojson"),
         ]
         for label, dataset, profile, dst in lta_specs:
             def lta_work(label=label, dataset=dataset, profile=profile, dst=dst):
@@ -246,7 +253,7 @@ def main() -> None:
     report = {
         "status": "PASS" if failures == 0 else ("FAIL" if args.strict else "PARTIAL"),
         "results": results,
-        "note": "These are topology/candidate/dynamic layers. They do not by themselves satisfy paper PUDO legality/interface ground truth.",
+        "note": "Most fetched layers are topology/candidate/dynamic evidence. Explicit authoritative source semantics (for example Singapore LTA Passenger Pickup Bay stopping use or government entrance layers) are preserved, but missing physical interface facts are never invented.",
     }
     path = external / "reports" / "recommended_public_sources.json"
     path.parent.mkdir(parents=True, exist_ok=True)

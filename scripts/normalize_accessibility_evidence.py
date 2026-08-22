@@ -483,14 +483,30 @@ def normalize(profile: str, row: Dict[str, Any], index: int, source: str, args: 
             )
         rid = first(d, "OBJECTID", "UNITID", "METER_NO", "id", "TaxiCode", "TAXI_CODE") or f"{profile}_{index}"
         official_candidate = profile in {"vegas_parking_zone", "lta_taxi_stand", "lta_passenger_pickup_bay"}
+        # LTA's Passenger Pickup Bay layer is not merely a generic candidate: the
+        # official catalogue defines it as an area along the road designated for
+        # vehicles to pick up or drop off passengers.  Preserve that explicit
+        # static stopping-legality semantics while keeping physical interface
+        # fields (curb height/clearance/etc.) unknown. Taxi/parking layers remain
+        # candidate-only because their permitted service class is not equivalent
+        # to general passenger loading by an autonomous-mobility service.
+        lta_loading = profile == "lta_passenger_pickup_bay"
         return {
             "regulation_id": str(rid), "lon": xy[0], "lat": xy[1], "frame": "wgs84",
-            "legal_stop": False, "candidate_only": True, "requires_manual_legality_audit": True,
-            "service_class": ("passenger_pickup" if profile == "lta_passenger_pickup_bay" else "taxi" if profile in {"lta_taxi_stand", "vegas_parking_zone"} else "unknown"),
+            "legal_stop": True if lta_loading else False,
+            "legal_basis": (
+                "Singapore LTA DataMall Passenger Pickup Bay: designated roadside area for vehicles to pick up or drop off passengers"
+                if lta_loading else None
+            ),
+            "candidate_only": not lta_loading,
+            "requires_manual_legality_audit": not lta_loading,
+            "service_class": ("general_passenger_loading" if lta_loading else "taxi" if profile in {"lta_taxi_stand", "vegas_parking_zone"} else "unknown"),
+            "legal_linkage_method": "authoritative_source_relation" if lta_loading else None,
             "side": first(d, "SIDE"), "hours": first(d, "HOURS"), "days": first(d, "DAYS"),
             "restrictions": first(d, "RESTRICTIONS", "DESCRIPTION", "LOCATION"), "source": source,
-            "authoritative": official_candidate, "evidence_tier": "B_official_candidate_layer" if official_candidate else "C_parking_candidate_proxy",
-            "confidence": 0.75 if official_candidate else 0.6, "raw_properties": d,
+            "authoritative": official_candidate,
+            "evidence_tier": "A_authoritative_passenger_loading_bay" if lta_loading else "B_official_candidate_layer" if official_candidate else "C_parking_candidate_proxy",
+            "confidence": 0.95 if lta_loading else 0.75 if official_candidate else 0.6, "raw_properties": d,
         }
 
     if profile == "lta_footpath":

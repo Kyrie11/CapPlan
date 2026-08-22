@@ -234,7 +234,49 @@ def _nearest_with_field(lon: float, lat: float, rows: Iterable[Dict[str, Any]], 
 
 def _service_class_ok(value: Any) -> bool:
     s = _canon(value)
-    return s in {"autonomous_mobility", "all", "all_vehicles", "general_passenger_loading"}
+    return s in {
+        "autonomous_mobility", "all", "all_vehicles", "general_passenger_loading",
+        "passenger_loading", "passenger_pickup", "passenger_pickup_dropoff",
+    }
+
+
+def _regulation_id(row: Dict[str, Any]) -> str:
+    d = _flatten(row)
+    return str(d.get("regulation_id") or d.get("id") or d.get("feature_id") or "").strip()
+
+
+def _candidate_regulation_ids(site_row: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    for split in ("train", "val", "test"):
+        for anchor in str(site_row.get(f"candidate_anchor_ids_{split}") or "").split(";"):
+            anchor = anchor.strip()
+            if not anchor or ":candidate:" not in anchor:
+                continue
+            rid = anchor.split(":candidate:", 1)[1].strip()
+            if rid and rid not in out:
+                out.append(rid)
+    return out
+
+
+def _exact_regulation(site_row: Dict[str, Any], by_id: Dict[str, Dict[str, Any]], lon: float, lat: float) -> Optional[Tuple[bool, str, Dict[str, Any], float]]:
+    """Resolve a regulation only when the PUDO anchor names the same source feature.
+
+    This is a semantic source relation, not a nearest-neighbor promotion.
+    """
+    for rid in _candidate_regulation_ids(site_row):
+        row = by_id.get(rid)
+        if row is None:
+            continue
+        d = _flatten(row)
+        if not _authoritative(row):
+            continue
+        legal = _as_bool(d.get("legal_stop"))
+        basis = str(d.get("legal_basis") or "").strip()
+        if legal is None or not basis or not _service_class_ok(d.get("service_class") or "autonomous_mobility"):
+            continue
+        dist, _ = _distance_to_row(lon, lat, row)
+        return legal, basis, row, dist
+    return None
 
 
 def _nearest_regulation(lon: float, lat: float, rows: Iterable[Dict[str, Any]], max_m: float) -> Optional[Tuple[bool, str, Dict[str, Any], float]]:
@@ -294,6 +336,7 @@ def main() -> None:
 
     physical_rows = list(_iter_rows(city_gis)) + list(_iter_rows(curb_inventory))
     regulation_rows = list(_iter_rows(regulations_path))
+    regulation_by_id = {_regulation_id(x): x for x in regulation_rows if _regulation_id(x)}
     entrance_rows = list(_iter_rows(entrances_path))
 
     with Path(args.input_csv).open("r", encoding="utf-8-sig", newline="") as f:
@@ -308,6 +351,7 @@ def main() -> None:
         extra_fields += [f"{field}_source", f"{field}_evidence_tier", f"{field}_match_distance_m", f"{field}_evidence_as_of"]
     extra_fields += [
         "legal_stop_source", "legal_stop_evidence_tier", "legal_stop_match_distance_m", "legal_stop_evidence_as_of",
+        "legal_linkage_method", "legal_relation_id",
         "entrance_candidate_id", "entrance_candidate_lon", "entrance_candidate_lat", "entrance_candidate_source",
         "entrance_candidate_evidence_tier", "entrance_candidate_match_distance_m", "entrance_candidate_evidence_as_of",
         "auto_filled_fields", "remaining_required_fields", "audit_work_status",
@@ -339,7 +383,14 @@ def main() -> None:
             auto.append(field)
 
         if _blank(row.get("legal_stop")) or _blank(row.get("legal_basis")):
-            hit = _nearest_regulation(lon, lat, regulation_rows, args.regulation_match_m)
+            # Prefer an exact source-feature relation carried by the original
+            # PUDO candidate anchor. Only fall back to spatial matching when no
+            # such semantic relation exists; the latter remains reviewable.
+            hit = _exact_regulation(row, regulation_by_id, lon, lat)
+            linkage = "direct_feature_relation" if hit is not None else ""
+            if hit is None:
+                hit = _nearest_regulation(lon, lat, regulation_rows, args.regulation_match_m)
+                linkage = "nearest_authoritative_feature" if hit is not None else ""
             if hit is not None:
                 legal, basis, evidence, dist = hit
                 row["legal_stop"] = str(legal).lower()
@@ -348,6 +399,8 @@ def main() -> None:
                 row["legal_stop_evidence_tier"] = _evidence_tier(evidence)
                 row["legal_stop_match_distance_m"] = f"{dist:.3f}"
                 row["legal_stop_evidence_as_of"] = _evidence_time(evidence)
+                row["legal_linkage_method"] = linkage
+                row["legal_relation_id"] = _regulation_id(evidence)
                 auto += ["legal_stop", "legal_basis"]
 
         ent = _nearest_entrance(lon, lat, entrance_rows, args.entrance_candidate_m)

@@ -27,6 +27,7 @@ DATASETS: Dict[str, str] = {
     "taxi_stand": "TaxiStand",
     "footpath": "Footpath",
     "kerbline": "KerbLine",
+    "train_station_exit": "TrainStationExit",
 }
 
 
