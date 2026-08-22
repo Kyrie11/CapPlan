@@ -35,13 +35,16 @@ fleet_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/fleet/veh
 quality:
   # bootstrap: real nuPlan + pedestrian topology; missing attributes remain
   # unknown/fail-closed.  Useful for pipeline bring-up, not main results.
-  # paper: keeps uncertain candidates instead of fabricating fields, but requires
-  # a minimum set of evidence-complete PUDO anchors per episode for main-result
-  # evaluation. This matches the paper's uncertainty semantics.
+  # hybrid: real nuPlan + real GIS/OSM topology; observed/derived fields are
+  # preserved and only truly missing benchmark variables may be deterministically
+  # simulated with per-field provenance. Hybrid is benchmark truth, never a claim
+  # of exact real-city site ground truth.
+  # paper: audited/authoritative city evidence only; missing fields fail closed.
   source_policy: bootstrap
   min_graph_nodes: 100
   min_graph_edges: 150
   min_paper_eligible_pudos_per_episode: 2
+  min_hybrid_eligible_pudos_per_episode: 2
   min_episode_pudo_coverage_rate: 0.80
 
 service:
@@ -141,11 +144,15 @@ cities:
     osm_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/osm/vegas_sidewalks.geojson"
     opensidewalks_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/opensidewalks/vegas.geojson"
     city_gis_dir: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/city_gis/vegas"
-    # Las Vegas official layers are authoritative for the attributes they actually contain; leave false until curated/mapped.
-    city_gis_authoritative: false
-    city_gis_has_pedestrian_topology: false
-    pudo_candidate_sources:
-      - "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/candidates/vegas/taxi_zones.jsonl"
+    # nuPlan's Strip map is primarily unincorporated Clark County. The
+    # recommended fetcher now uses Clark County pwRamps/pwConcrete and the
+    # Strip sidewalk line layer. They are authoritative for geometry/topology,
+    # not for curb height, sidewalk clear width or general AV PUDO legality.
+    city_gis_authoritative: true
+    city_gis_has_pedestrian_topology: true
+    # City of Las Vegas taxi zones are jurisdiction-limited and intentionally
+    # excluded from the default Strip PUDO candidate set.
+    pudo_candidate_sources: []
     curb_inventory_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_inventory/vegas.jsonl"
     curb_regulation_jsonl: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/curb_regulations/vegas.jsonl"
     entrance_source: "/data0/senzeyu2/dataset/CapPlan/data/external/normalized/entrances/vegas.geojson"

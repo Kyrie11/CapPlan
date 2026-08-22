@@ -28,7 +28,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Validate external AbilityBench sources before GIS fusion. Rejects zero-byte, HTML/error-page and malformed files.")
     p.add_argument("--config", default="configs/abilitybench_nuplan_real.yaml")
     p.add_argument("--cities", default=None, help="Comma/plus-separated city subset; defaults to all configured cities.")
-    p.add_argument("--source_policy", choices=["bootstrap", "paper"], default=None)
+    p.add_argument("--source_policy", choices=["bootstrap", "hybrid", "paper"], default=None)
     p.add_argument("--output", default="{project_root}/data/outputs/reports/external_source_preflight.json")
     p.add_argument("--no_fail", action="store_true", help="Write report and return success even when blockers exist.")
     args = p.parse_args()

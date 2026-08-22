@@ -31,7 +31,7 @@ def run_step(name: str, cmd: List[str]) -> Dict[str, Any]:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", default="configs/abilitybench_nuplan_real.yaml")
-    p.add_argument("--source_policy", choices=["bootstrap", "paper"], default="bootstrap")
+    p.add_argument("--source_policy", choices=["bootstrap", "hybrid", "paper"], default="bootstrap")
     p.add_argument("--cities", default="boston,pittsburgh,vegas,singapore")
     p.add_argument("--splits", default="train,val,test", help="Comma-separated subset of train,val,test")
     p.add_argument("--dataset_dir", default=None, help="If set, also run schema + quality gates on the built dataset.")

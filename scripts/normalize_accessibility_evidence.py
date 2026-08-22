@@ -509,6 +509,45 @@ def normalize(profile: str, row: Dict[str, Any], index: int, source: str, args: 
             "confidence": 0.95 if lta_loading else 0.75 if official_candidate else 0.6, "raw_properties": d,
         }
 
+
+    if profile == "clark_county_ramp":
+        # Clark County Public Works pwRamps is authoritative for the existence
+        # and geometry of a public-works ramp asset.  Do not infer curb height,
+        # clear width or slope unless the source documents those quantities.
+        return standard_feature(row, {
+            "feature_id": str(first(d, "OBJECTID", "GlobalID", "RAMPID", "RAMP_ID") or f"clark_ramp_{index}"),
+            "kind": "curb_ramp",
+            "curb_ramp": True,
+            "source_role": "curb_ramp_geometry",
+            "physical_attributes_authoritative": False,
+            "raw_properties": d,
+        }, source=source, authoritative=True, tier="A_clark_county_public_works_geometry")
+
+    if profile == "clark_county_concrete":
+        return standard_feature(row, {
+            "feature_id": str(first(d, "OBJECTID", "GlobalID", "CONCRETEID", "CONCRETE_ID") or f"clark_concrete_{index}"),
+            "kind": "concrete_surface",
+            "source_role": "public_works_concrete_geometry",
+            "physical_attributes_authoritative": False,
+            "raw_properties": d,
+        }, source=source, authoritative=True, tier="A_clark_county_public_works_geometry")
+
+    if profile == "clark_strip_sidewalk":
+        geom = geometry(row)
+        if not isinstance(geom, dict) or geom.get("type") not in {"LineString", "MultiLineString"}:
+            raise ValueError(
+                "Clark County Strip sidewalk layer must contain line geometry; "
+                f"got {geom.get('type') if isinstance(geom, dict) else None}"
+            )
+        return standard_feature(row, {
+            "feature_id": str(first(d, "OBJECTID", "GlobalID", "ID") or f"clark_strip_sidewalk_{index}"),
+            "kind": "sidewalk",
+            "source_role": "pedestrian_topology",
+            "public_routable": True,
+            "physical_attributes_authoritative": False,
+            "raw_properties": d,
+        }, source=source, authoritative=True, tier="A_clark_county_strip_sidewalk_topology")
+
     if profile == "lta_footpath":
         return standard_feature(row, {
             "feature_id": str(first(d, "OBJECTID", "id") or f"lta_footpath_{index}"),
@@ -540,6 +579,7 @@ def main() -> None:
     p.add_argument("--profile", required=True, choices=[
         "boston_sidewalk", "boston_sidewalk_centerline", "boston_curb", "boston_ramp", "boston_pwd_sidewalk", "boston_pwd_ada_ramp", "pittsburgh_sidewalks_steps", "pittsburgh_address_point",
         "pittsburgh_street_closure", "vegas_parking_zone", "pittsburgh_parking_meter", "lta_taxi_stand", "lta_passenger_pickup_bay",
+        "clark_county_ramp", "clark_county_concrete", "clark_strip_sidewalk",
         "lta_footpath", "lta_kerbline", "generic_pudo_candidate", "government_entrance", "generic_city_gis",
     ])
     p.add_argument("--source", required=True)
@@ -567,6 +607,7 @@ def main() -> None:
     geojson_profiles = {
         "boston_sidewalk", "boston_sidewalk_centerline", "boston_curb", "boston_pwd_sidewalk",
         "pittsburgh_sidewalks_steps", "pittsburgh_address_point",
+        "clark_county_ramp", "clark_county_concrete", "clark_strip_sidewalk",
         "lta_footpath", "lta_kerbline",
         "government_entrance", "generic_city_gis",
     }

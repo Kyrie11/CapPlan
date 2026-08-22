@@ -266,9 +266,10 @@ class TransitionGenerator:
         label must still be marked missing and its supervised value must be
         ``None``. The raw aggregate is retained in ``observed`` for debugging.
         """
+        observed_value = kwargs.pop("observed", value)
         if missing or value is None:
-            return ResourceEvidence(resource_name, kind, None, observed=value, missing=True, reason=reason or "not_observed", **kwargs)
-        return ResourceEvidence(resource_name, kind, value, observed=value, missing=False, **kwargs)
+            return ResourceEvidence(resource_name, kind, None, observed=observed_value, missing=True, reason=reason or "not_observed", **kwargs)
+        return ResourceEvidence(resource_name, kind, value, observed=observed_value, missing=False, **kwargs)
 
     def _path_evidence(self, phase: str, path: Dict[str, Any]) -> List[ResourceEvidence]:
         prefix = "access" if phase == "access" else "egress"
@@ -288,11 +289,26 @@ class TransitionGenerator:
         ]
 
     def _interface_evidence(self, anchor: PUDOAnchor, vehicle: VehicleInterface, phase: str) -> List[ResourceEvidence]:
+        # Correct semantics for audited/hybrid rows:
+        #   anchor.deployment_clearance_m = AVAILABLE environmental clear space
+        #   vehicle.deployment_clearance_m = REQUIRED deployment envelope.
+        # Legacy generated anchors used one already-combined scalar; retain that
+        # behavior only when explicitly marked legacy_effective_clearance.
         clearance_missing = anchor.deployment_clearance_m is None
-        clearance = None if clearance_missing else min(vehicle.deployment_clearance_m, anchor.deployment_clearance_m)
+        required_clearance = max(0.0, float(vehicle.deployment_clearance_m))
+        semantics = str(getattr(anchor, "deployment_clearance_semantics", "legacy_effective_clearance") or "legacy_effective_clearance")
+        raw_clearance = None if clearance_missing else float(anchor.deployment_clearance_m)
+        if semantics == "available_environment_clear_space":
+            evidence_clearance = raw_clearance
+            clearance_source = "curbside_map+vehicle_requirement"
+        else:
+            # Backward-compatible interpretation for historical bootstrap PUDOs.
+            evidence_clearance = None if raw_clearance is None else min(raw_clearance, required_clearance)
+            clearance_source = "legacy_effective_interface_clearance"
+
         low_floor_kneeling_missing = anchor.curb_height_m is None
         low_floor_kneeling = None if low_floor_kneeling_missing else bool(vehicle.low_floor and vehicle.kneeling and anchor.curb_height_m <= 0.06)
-        side_obs = {"vehicle_side": vehicle.door_side, "curb_side": anchor.side, "observed": vehicle.door_side}
+        side_obs = {"vehicle_side": vehicle.door_side, "curb_side": anchor.side, "observed": anchor.side}
         return [
             ResourceEvidence("door_side", "categorical", side_obs, confidence=min(1.0, anchor.map_confidence), source="vehicle_spec+curbside_map", observed=side_obs, required=None, missing=anchor.side == "unknown"),
             ResourceEvidence("ramp", "categorical", vehicle.ramp, confidence=1.0, source="vehicle_spec"),
@@ -301,9 +317,9 @@ class TransitionGenerator:
             ResourceEvidence("kneeling", "categorical", vehicle.kneeling, confidence=1.0, source="vehicle_spec"),
             self._evidence_or_missing("low_floor_kneeling", "categorical", low_floor_kneeling, confidence=min(1.0, anchor.map_confidence), source="vehicle_spec+curbside_map", missing=low_floor_kneeling_missing, reason="curb_height_missing" if low_floor_kneeling_missing else None),
             ResourceEvidence("door_width_m", "lower", vehicle.door_width_m, sigma=0.01, confidence=1.0, source="vehicle_spec"),
-            self._evidence_or_missing("door_side_clearance_m", "lower", clearance, sigma=0.05, confidence=anchor.map_confidence, source="vehicle_spec+curbside_map", missing=clearance_missing, reason="deployment_clearance_missing" if clearance_missing else None),
-            self._evidence_or_missing("deployment_clearance_m", "lower", clearance, sigma=0.05, confidence=anchor.map_confidence, source="vehicle_spec+curbside_map", missing=clearance_missing, reason="deployment_clearance_missing" if clearance_missing else None),
-            self._evidence_or_missing("ramp_clearance_m", "lower", clearance, sigma=0.05, confidence=anchor.map_confidence, source="vehicle_spec+curbside_map", missing=clearance_missing, reason="deployment_clearance_missing" if clearance_missing else None),
+            self._evidence_or_missing("door_side_clearance_m", "lower", evidence_clearance, sigma=0.05, confidence=anchor.map_confidence, source=clearance_source, observed=raw_clearance, required=required_clearance, missing=clearance_missing, reason="deployment_clearance_missing" if clearance_missing else None),
+            self._evidence_or_missing("deployment_clearance_m", "lower", evidence_clearance, sigma=0.05, confidence=anchor.map_confidence, source=clearance_source, observed=raw_clearance, required=required_clearance, missing=clearance_missing, reason="deployment_clearance_missing" if clearance_missing else None),
+            self._evidence_or_missing("ramp_clearance_m", "lower", evidence_clearance, sigma=0.05, confidence=anchor.map_confidence, source=clearance_source, observed=raw_clearance, required=required_clearance, missing=clearance_missing, reason="deployment_clearance_missing" if clearance_missing else None),
             self._evidence_or_missing("curb_height_m", "upper", anchor.curb_height_m, sigma=0.01, confidence=anchor.map_confidence, source="curbside_map", missing=anchor.curb_height_m is None, reason="curb_height_missing" if anchor.curb_height_m is None else None),
             ResourceEvidence("dwell_time_s", "cumulative", vehicle.dwell_time_s, sigma=5.0, confidence=1.0, source="vehicle_spec"),
             ResourceEvidence("map_confidence", "lower", anchor.map_confidence, sigma=0.02, confidence=anchor.map_confidence, source="curbside_map"),
@@ -321,6 +337,9 @@ class TransitionGenerator:
             reasons.append("vehicle_door_side_incompatible_with_curb")
         if anchor.deployment_clearance_m is None or anchor.deployment_clearance_m <= 0:
             reasons.append("missing_or_zero_deployment_clearance")
+        elif str(getattr(anchor, "deployment_clearance_semantics", "legacy_effective_clearance")) == "available_environment_clear_space":
+            if float(anchor.deployment_clearance_m) + 1e-9 < max(0.0, float(vehicle.deployment_clearance_m)):
+                reasons.append("insufficient_environment_deployment_clearance")
         if vehicle.door_width_m <= 0:
             reasons.append("invalid_door_width")
         return len(reasons) == 0, reasons

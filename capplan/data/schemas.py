@@ -184,6 +184,10 @@ class AccessibilityEdge:
     obstacle_state: Optional[str] = None
     timestamp_s: float | None = None
     source: str = "synthetic_local"
+    # Optional per-field provenance for hybrid/derived benchmark overlays.
+    # Geometry remains anchored to the real graph; only explicitly missing
+    # attributes may be simulated, and those values must stay auditable.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -224,6 +228,20 @@ class PUDOAnchor:
     paper_eligible: bool = False
     evidence_status: str = "candidate_uncertain"
     evidence_notes: str | None = None
+    # Hybrid benchmark provenance. These fields never promote an anchor to
+    # paper_evidence_complete/paper_eligible; they only make simulated benchmark
+    # truth explicit and machine-auditable.
+    legal_basis: str | None = None
+    curb_ramp: bool | None = None
+    truth_mode: str = "observed_or_unknown"
+    evidence_kind: str = "unknown"
+    field_provenance: Dict[str, Any] = field(default_factory=dict)
+    hybrid_evidence_complete: bool = False
+    hybrid_eligible: bool = False
+    deployment_clearance_semantics: str = "legacy_effective_clearance"
+    hybrid_scenario_class: str | None = None
+    hybrid_seed: int | None = None
+    paper_claim_allowed: bool = True
 
     @property
     def x(self) -> float:

@@ -296,8 +296,8 @@ def _add_source_arg(cmd: List[str], flag: str, path: Path | None, dry_run: bool,
 
 def _source_policy(config: Dict[str, Any], override: str | None = None) -> str:
     pol = str(override or config.get("quality", {}).get("source_policy", config.get("source_policy", "bootstrap"))).lower()
-    if pol not in {"bootstrap", "paper"}:
-        raise RuntimeError(f"unsupported source_policy={pol}; expected bootstrap or paper")
+    if pol not in {"bootstrap", "hybrid", "paper"}:
+        raise RuntimeError(f"unsupported source_policy={pol}; expected bootstrap, hybrid, or paper")
     return pol
 
 
@@ -368,12 +368,14 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
     min_nodes = int(config.get("quality", {}).get("min_graph_nodes", 100))
     min_edges = int(config.get("quality", {}).get("min_graph_edges", 150))
     min_paper_eligible = int(config.get("quality", {}).get("min_paper_eligible_pudos_per_episode", 2))
+    min_hybrid_eligible = int(config.get("quality", {}).get("min_hybrid_eligible_pudos_per_episode", 2))
     min_episode_pudo_coverage = float(config.get("quality", {}).get("min_episode_pudo_coverage_rate", 0.80))
     endpoint = str(config.get("overpass", {}).get("endpoint", "https://overpass-api.de/api/interpreter"))
     timeout_s = int(config.get("overpass", {}).get("timeout_s", 180))
 
     scene_dirs: Dict[str, Path] = {}
-    graph_dir = prepared_root / "accessibility_graphs"
+    base_graph_dir = prepared_root / "accessibility_graphs"
+    graph_dir = prepared_root / ("accessibility_graphs_hybrid" if source_policy == "hybrid" else "accessibility_graphs")
     pudo_city_files: List[Path] = []
     dataset_city_dirs: List[Path] = []
 
@@ -546,7 +548,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--georeference_json",
                 str(georef),
                 "--output_graph_dir",
-                str(graph_dir),
+                str(base_graph_dir),
                 "--min_nodes_per_episode",
                 str(min_nodes),
                 "--min_edges_per_episode",
@@ -593,7 +595,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--scene_dataset_dir",
                 str(scene_dir),
                 "--accessibility_graph_dir",
-                str(graph_dir),
+                str(base_graph_dir),
                 "--output_pudo_evidence_jsonl",
                 str(city_pudo),
                 "--candidate_radius_m",
@@ -624,8 +626,13 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             print(f"[CAPPLAN_PROGRESS] split={split_name} city={city} stage=pudo", flush=True)
             _run(pudo_cmd, dry_run)
 
-    combined_pudo = prepared_root / "pudo_evidence.jsonl"
+    combined_pudo = prepared_root / ("pudo_hybrid_evidence.jsonl" if source_policy == "hybrid" else "pudo_evidence.jsonl")
     if ("pudo" in stages or "all" in stages) and not dry_run and not skip_pudo_concat:
+        if source_policy == "hybrid":
+            raise RuntimeError(
+                "hybrid policy consumes prebuilt pudo_hybrid_evidence.jsonl; "
+                "build base PUDOs under bootstrap/paper first, then run build_hybrid_pudo_evidence.py"
+            )
         _concat_jsonl(pudo_city_files, combined_pudo)
         print(f"wrote {combined_pudo}")
 
@@ -660,7 +667,9 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--num_requests_per_episode",
                 str(service_cfg.get("num_requests_per_episode", 3)),
                 "--source_name",
-                "abilitybench_calibrated_od" if source_policy == "paper" else "abilitybench_bootstrap_od_not_for_paper",
+                ("abilitybench_calibrated_od" if source_policy == "paper" else
+                 "abilitybench_hybrid_request_od" if source_policy == "hybrid" else
+                 "abilitybench_bootstrap_od_not_for_paper"),
                 "--report_json",
                 str(reports_root / "service_layer.json"),
                 "--seed",
@@ -668,7 +677,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 *( ["--episode_allowlist", str(episode_allowlist)] if episode_allowlist else [] ),
                 *( ["--require_trusted_entrances"] if source_policy == "paper" else [] ),
                 *( sum((["--trusted_entrance_source", src] for src in trusted_entrance_sources), []) if source_policy == "paper" else [] ),
-                *( ["--allow_non_entrance_od"] if source_policy == "bootstrap" else [] ),
+                *( ["--allow_non_entrance_od"] if source_policy in {"bootstrap", "hybrid"} else [] ),
             ],
             dry_run,
         )
@@ -677,7 +686,8 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
         city_cfg = config["cities"][city]
         city_db_dirs = _resolve_city_db_dirs(split_cfg, city_cfg, city)
         city_map_names = _split_csv(city_cfg.get("map_names"))
-        city_dataset = outputs_root / "datasets" / f"abilitybench_av_{split_name}_{city}"
+        city_dataset_name = f"abilitybench_av_hybrid_{split_name}_{city}" if source_policy == "hybrid" else f"abilitybench_av_{split_name}_{city}"
+        city_dataset = outputs_root / "datasets" / city_dataset_name
         dataset_city_dirs.append(city_dataset)
         if "dataset" in stages or "all" in stages:
             _require_artifact(graph_dir, "accessibility graphs", dry_run)
@@ -732,6 +742,8 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(min_edges),
                 "--min_paper_eligible_pudos_per_episode",
                 str(min_paper_eligible),
+                "--min_hybrid_eligible_pudos_per_episode",
+                str(min_hybrid_eligible),
                 "--output_dir",
                 str(city_dataset),
                 "--strict",
@@ -770,7 +782,8 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                     "--output", str(reports_root / f"dataset_diagnostics.{city}.json"),
                 ], dry_run)
 
-    merged_dataset = outputs_root / "datasets" / f"abilitybench_av_{split_name}"
+    merged_dataset_name = f"abilitybench_av_hybrid_{split_name}" if source_policy == "hybrid" else f"abilitybench_av_{split_name}"
+    merged_dataset = outputs_root / "datasets" / merged_dataset_name
     if "merge" in stages or "all" in stages:
         for city_dataset in dataset_city_dirs:
             _require_artifact(city_dataset / "dataset_manifest.json", f"city dataset manifest {city_dataset.name}", dry_run)
@@ -795,7 +808,7 @@ def main() -> None:
     p.add_argument("--stages", default="all", help="Comma list: queries,download,map_crs,preflight,extract,graphs,pudo,service,dataset,merge,all. Online download is never implied by all.")
     p.add_argument("--dry_run", action="store_true", help="Print commands without executing them.")
     p.add_argument("--disable_tqdm", action="store_true", help="Disable city/stage and dataset progress bars.")
-    p.add_argument("--source_policy", choices=["bootstrap", "paper"], default=None, help="bootstrap builds a real-data diagnostic dataset with fail-closed missing evidence; paper requires complete evidence categories; OSM and OpenSidewalks are alternatives, not both mandatory.")
+    p.add_argument("--source_policy", choices=["bootstrap", "hybrid", "paper"], default=None, help="bootstrap=source-only fail-closed bring-up; hybrid=real geometry/topology plus explicitly simulated missing benchmark truth; paper=audited city evidence only.")
     p.add_argument("--cities", default=None, help="Optional comma/plus-separated city subset for fast diagnostics, e.g. boston or boston+vegas.")
     p.add_argument("--max_scenarios_per_city", type=int, default=None, help="Override config split max_scenarios_per_city. For real nuPlan data, 0 means all matching scenarios.")
     p.add_argument("--episode_allowlist", default=None, help="Optional split-level text/JSON episode allowlist produced from audited paper evidence. Applied to service and dataset stages; candidate extraction/graphs/PUDO remain complete.")

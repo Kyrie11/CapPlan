@@ -110,8 +110,11 @@ def _assert_paper_mode_config(args: argparse.Namespace) -> None:
     synthetic/proxy layers before any dataset rows are written.  Smoke mode keeps
     the old lightweight pipeline for CI and quick debugging.
     """
-    if getattr(args, "source_policy", "bootstrap") == "paper" and not getattr(args, "paper_mode", False):
+    policy = getattr(args, "source_policy", "bootstrap")
+    if policy == "paper" and not getattr(args, "paper_mode", False):
         raise RuntimeError("--source_policy paper requires --paper_mode")
+    if policy == "hybrid" and getattr(args, "paper_mode", False):
+        raise RuntimeError("--source_policy hybrid is benchmark simulation truth and must not be combined with --paper_mode")
     if not getattr(args, "paper_mode", False):
         return
     if args.scene_source != "nuplan":
@@ -229,6 +232,40 @@ def _enforce_paper_episode_quality(args: argparse.Namespace, eid: str, graph: An
         )
 
 
+def _enforce_hybrid_episode_quality(args: argparse.Namespace, eid: str, graph: Any, pudo: List[PUDOAnchor]) -> None:
+    """Gate hybrid benchmark rows without conflating them with paper ground truth."""
+    if getattr(args, "source_policy", "bootstrap") != "hybrid":
+        return
+    if getattr(args, "paper_mode", False):
+        raise RuntimeError("hybrid source policy cannot run in paper_mode")
+    if len(graph.nodes) < args.min_graph_nodes or len(graph.edges) < args.min_graph_edges:
+        raise RuntimeError(
+            f"hybrid benchmark graph for {eid} is too small: {len(graph.nodes)} nodes/{len(graph.edges)} edges; "
+            f"required {args.min_graph_nodes}/{args.min_graph_edges}"
+        )
+    complete = [a for a in pudo if bool(getattr(a, "hybrid_evidence_complete", False))]
+    eligible = [a for a in pudo if bool(getattr(a, "hybrid_eligible", False)) and bool(a.legal_stop)]
+    required = int(getattr(args, "min_hybrid_eligible_pudos_per_episode", 2))
+    if len(eligible) < required:
+        raise RuntimeError(
+            f"hybrid benchmark requires >= {required} hybrid-eligible PUDOs for {eid}; "
+            f"found {len(eligible)} eligible / {len(complete)} complete / {len(pudo)} total. "
+            "Run scripts/build_hybrid_pudo_evidence.py and inspect its insufficient-episode report."
+        )
+    for a in complete:
+        fp = getattr(a, "field_provenance", {}) or {}
+        for field in ["curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "legal_stop", "legal_basis", "side", "adjacent_ped_node_id"]:
+            if field not in fp:
+                raise RuntimeError(f"hybrid PUDO {eid}/{a.anchor_id} is complete but missing field provenance for {field}")
+        if any(str((v or {}).get("kind")) == "simulated" for v in fp.values() if isinstance(v, dict)):
+            if bool(getattr(a, "paper_evidence_complete", False)) or bool(getattr(a, "paper_eligible", False)) or bool(getattr(a, "paper_claim_allowed", True)):
+                raise RuntimeError(
+                    f"hybrid PUDO {eid}/{a.anchor_id} contains simulated fields but is marked as paper truth; "
+                    "simulated benchmark evidence must remain publication-disjoint from audited city ground truth"
+                )
+
+
+
 def _make_accessibility_builder(args: argparse.Namespace):
     if args.accessibility_source in {"synthetic", "synthetic_local"}:
         return SyntheticAccessibilityBuilder(), True
@@ -267,6 +304,9 @@ def _apply_pudo_evidence_overrides(anchors: List[PUDOAnchor], evidence: Dict[tup
         "blockage_risk", "map_confidence", "dynamic_confidence",
         "lighting", "shelter", "legal_stop", "side", "legal_stop_source", "source",
         "paper_evidence_complete", "paper_eligible", "evidence_status", "evidence_notes",
+        "legal_basis", "curb_ramp", "truth_mode", "evidence_kind", "field_provenance",
+        "hybrid_evidence_complete", "hybrid_eligible", "deployment_clearance_semantics",
+        "hybrid_scenario_class", "hybrid_seed", "paper_claim_allowed",
     }
     updated: List[PUDOAnchor] = []
     for a in anchors:
@@ -369,6 +409,17 @@ def _pudo_anchors_from_evidence_rows(evidence: Dict[tuple[str | None, str], Dict
             paper_eligible=_as_bool_field(row.get("paper_eligible"), default=False),
             evidence_status=str(row.get("evidence_status") or "candidate_uncertain"),
             evidence_notes=row.get("evidence_notes"),
+            legal_basis=row.get("legal_basis"),
+            curb_ramp=_as_bool_field(row.get("curb_ramp"), default=False) if row.get("curb_ramp") not in (None, "") else None,
+            truth_mode=str(row.get("truth_mode") or "observed_or_unknown"),
+            evidence_kind=str(row.get("evidence_kind") or "unknown"),
+            field_provenance=dict(row.get("field_provenance") or {}) if isinstance(row.get("field_provenance"), dict) else {},
+            hybrid_evidence_complete=_as_bool_field(row.get("hybrid_evidence_complete"), default=False),
+            hybrid_eligible=_as_bool_field(row.get("hybrid_eligible"), default=False),
+            deployment_clearance_semantics=str(row.get("deployment_clearance_semantics") or "available_environment_clear_space"),
+            hybrid_scenario_class=row.get("hybrid_scenario_class"),
+            hybrid_seed=int(row["hybrid_seed"]) if row.get("hybrid_seed") not in (None, "") else None,
+            paper_claim_allowed=_as_bool_field(row.get("paper_claim_allowed"), default=True),
         ))
     return anchors
 
@@ -586,7 +637,7 @@ def main() -> None:
     p.add_argument("--episode_allowlist", default=None, help="Optional text/JSON episode-id allowlist for audited paper subsets.")
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
     p.add_argument("--paper_mode", action="store_true", help="Enable publication-grade data gates: no synthetic/proxy fallbacks, no missing core evidence, and real service/profile/fleet inputs required.")
-    p.add_argument("--source_policy", choices=["bootstrap", "paper"], default="bootstrap", help="Dataset evidence policy recorded in the manifest. paper requires --paper_mode and complete audited evidence.")
+    p.add_argument("--source_policy", choices=["bootstrap", "hybrid", "paper"], default="bootstrap", help="Evidence policy: bootstrap=fail-closed bring-up; hybrid=real geometry/topology plus explicitly simulated missing benchmark truth; paper=audited city evidence only and requires --paper_mode.")
     p.add_argument("--external_source_preflight_json", default=None, help="Optional preflight report from prepare_abilitybench_external.py copied into the dataset manifest for auditability.")
     p.add_argument("--require_validated_georeference", action="store_true", help="Paper-mode gate: fail if prepared graph metadata says georeference_validated=false.")
     p.add_argument("--service_layer_source", choices=["synthetic_smoke", "real_jsonl", "calibrated_od"], default="synthetic_smoke", help="Passenger-service request source. Paper mode rejects synthetic_smoke.")
@@ -600,6 +651,7 @@ def main() -> None:
     p.add_argument("--min_graph_edges", type=int, default=150)
     p.add_argument("--max_core_pudo_missing_rate", type=float, default=1.0, help="Deprecated compatibility flag. Missing candidate evidence is allowed; use --min_paper_eligible_pudos_per_episode for paper-mode gating.")
     p.add_argument("--min_paper_eligible_pudos_per_episode", type=int, default=2, help="Paper-mode gate: minimum PUDOs per episode with independent legality evidence, pedestrian binding, and complete curb/interface fields.")
+    p.add_argument("--min_hybrid_eligible_pudos_per_episode", type=int, default=2, help="Hybrid-mode gate: minimum PUDOs per episode with complete observed/derived/simulated benchmark evidence and explicit provenance.")
     p.add_argument("--min_edge_positive_rate", type=float, default=0.10)
     p.add_argument("--min_skeleton_positive_rate", type=float, default=0.10)
     p.add_argument("--accessibility_source", choices=["synthetic_local", "synthetic", "prepared_jsonl", "geojson", "opensidewalks"], default="synthetic_local")
@@ -611,7 +663,7 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--strict", action="store_true")
     p.add_argument("--disable_tqdm", action="store_true", help="Disable preprocessing progress bars.")
-    p.add_argument("--allow_bootstrap_service_nodes", action="store_true", help="Bootstrap-only: allow service OD anchors on non-entrance graph nodes. Paper mode always rejects this.")
+    p.add_argument("--allow_bootstrap_service_nodes", action="store_true", help="Non-paper benchmark modes: allow request-specific OD anchors on graph nodes when an authoritative entrance is unavailable. Paper mode always rejects this.")
     args = p.parse_args()
     if args.paper_mode and args.allow_bootstrap_service_nodes:
         raise RuntimeError("paper_mode rejects --allow_bootstrap_service_nodes")
@@ -768,6 +820,7 @@ def main() -> None:
             pudo = _apply_pudo_evidence_overrides(pudo, pudo_evidence_overrides)
         graph, pudo = attach_pudo_nodes_to_graph(graph, pudo)
         _enforce_paper_episode_quality(args, eid, graph, origin, destination, pudo)
+        _enforce_hybrid_episode_quality(args, eid, graph, pudo)
         write_accessibility_graph(out, graph)
         pudo_records.extend(to_dict(x) for x in pudo)
 
@@ -853,7 +906,12 @@ def main() -> None:
         "scene_source": args.scene_source,
         "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files_requested": resolved_db_files, "db_files_expanded": adapter.db_files if args.scene_source == "nuplan" else [], "map_version": args.nuplan_map_version},
         "accessibility_source": args.accessibility_source, "accessibility_graph_dir": args.accessibility_graph_dir, "pudo_source": args.pudo_source, "pudo_evidence_jsonl": args.pudo_evidence_jsonl,
-        "paper_mode": bool(args.paper_mode), "source_policy": args.source_policy, "publication_ready": bool(args.paper_mode and args.source_policy == "paper" and (preflight or {}).get("publication_ready", False)), "external_source_preflight": preflight, "service_layer_source": args.service_layer_source, "service_requests_jsonl": args.service_requests_jsonl, "capability_profiles_jsonl": args.capability_profiles_jsonl, "fleet_jsonl": args.fleet_jsonl,
+        "paper_mode": bool(args.paper_mode), "source_policy": args.source_policy,
+        "truth_mode": "hybrid_geometry_anchored_simulated_resource_truth_v1" if args.source_policy == "hybrid" else ("audited_city_evidence" if args.source_policy == "paper" else "bootstrap_unknowns_fail_closed"),
+        "benchmark_ready": bool(args.source_policy in {"hybrid", "paper"}),
+        "publication_ready": bool(args.paper_mode and args.source_policy == "paper" and (preflight or {}).get("publication_ready", False)),
+        "simulated_values_are_real_city_ground_truth": False if args.source_policy == "hybrid" else None,
+        "external_source_preflight": preflight, "service_layer_source": args.service_layer_source, "service_requests_jsonl": args.service_requests_jsonl, "capability_profiles_jsonl": args.capability_profiles_jsonl, "fleet_jsonl": args.fleet_jsonl,
         "builder_git_commit": _git_commit(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "strict_mode": bool(args.strict),

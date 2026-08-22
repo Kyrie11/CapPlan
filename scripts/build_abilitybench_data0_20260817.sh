@@ -378,6 +378,24 @@ build_site_catalogs() {
   done
 }
 
+
+site_disjoint_eval() {
+  local city
+  mkdir -p "$REPORTS/site_disjoint"
+  for city in boston pittsburgh vegas singapore; do
+    runlog "site_disjoint_eval.${city}" python scripts/build_site_disjoint_eval_allowlists.py \
+      --catalog_csv "$EXT/audits/$city/pudo_site_catalog.csv" --city "$city" \
+      --output_dir "$REPORTS/site_disjoint" --min_catalog_sites_per_episode "${CAP_SITE_DISJOINT_MIN_SITES:-2}" \
+      --report_json "$REPORTS/site_disjoint/${city}.json"
+  done
+  for split in train val test; do
+    : > "$REPORTS/site_disjoint/all.${split}.site_disjoint.txt"
+    for city in boston pittsburgh vegas singapore; do
+      cat "$REPORTS/site_disjoint/${city}.${split}.site_disjoint.txt" >> "$REPORTS/site_disjoint/all.${split}.site_disjoint.txt"
+    done
+  done
+}
+
 prefill_audit_worklists() {
   for city in boston pittsburgh vegas singapore; do
     runlog "pudo_audit_prefill.${city}" python scripts/prepare_pudo_audit_worklist.py \
@@ -418,7 +436,7 @@ refresh_audit_public_sources() {
   # Audit-specific refresh is intentionally non-strict: partial official-source
   # recovery is useful and all failures are persisted to recommended_public_sources.json.
   runlog fetch_recommended_public_sources.audit python scripts/fetch_recommended_public_sources.py \
-    --config "$CONFIG" --cities boston,singapore
+    --config "$CONFIG" --cities boston,pittsburgh,vegas,singapore
 }
 
 audit_status() {
@@ -531,6 +549,77 @@ import_completed_manual_audits() {
       echo "INFO: no completed manual audit CSV for $city at $csv"
     fi
   done
+}
+
+
+hybrid_evidence() {
+  # Build geometry-anchored benchmark truth without pretending simulated values
+  # are exact city measurements.  Source/audit values win; only missing fields
+  # are deterministically simulated and every field carries provenance.
+  local split city base_graph hybrid_graph allowlist base_pudo hybrid_city audit_csv
+  for split in train val test; do
+    base_graph="$DATA_ROOT/outputs/prepared/$split/accessibility_graphs"
+    hybrid_graph="$DATA_ROOT/outputs/prepared/$split/accessibility_graphs_hybrid"
+    mkdir -p "$hybrid_graph" "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid"
+    for city in boston pittsburgh vegas singapore; do
+      allowlist="$REPORTS/hybrid_episode_ids.${split}.${city}.txt"
+      python - "$DATA_ROOT/outputs/prepared/$split/scene_contexts/$city/episodes.jsonl" "$allowlist" <<'PYIDS'
+import json, sys
+from pathlib import Path
+src, dst = map(Path, sys.argv[1:])
+if not src.exists(): raise SystemExit(f"missing {src}")
+ids=[]
+for line in src.open():
+    if line.strip():
+        r=json.loads(line); eid=r.get("episode_id")
+        if eid: ids.append(str(eid))
+dst.parent.mkdir(parents=True, exist_ok=True)
+dst.write_text("\n".join(ids)+("\n" if ids else ""))
+print(f"wrote {dst}: {len(ids)} episode ids")
+PYIDS
+      base_pudo="$DATA_ROOT/outputs/prepared/$split/pudo/${city}.jsonl"
+      hybrid_city="$DATA_ROOT/outputs/prepared/$split/pudo_hybrid/${city}.jsonl"
+      audit_csv="$EXT/audits/$city/pudo_audit_worklist.csv"
+      runlog "hybrid_pudo.${split}.${city}" python scripts/build_hybrid_pudo_evidence.py \
+        --input_pudo_jsonl "$base_pudo" --output_pudo_jsonl "$hybrid_city" \
+        --city "$city" --split "$split" \
+        --audit_worklist_csv "$audit_csv" \
+        --seed "${CAP_HYBRID_SEED:-20260822}" \
+        --min_positive_per_episode "${CAP_HYBRID_MIN_PUDOS:-2}" \
+        --report_json "$REPORTS/hybrid_pudo.${split}.${city}.json"
+      runlog "hybrid_graph.${split}.${city}" python scripts/build_hybrid_accessibility_overlay.py \
+        --input_graph_dir "$base_graph" --output_graph_dir "$hybrid_graph" \
+        --city "$city" --split "$split" --episode_allowlist "$allowlist" \
+        --seed "${CAP_HYBRID_SEED:-20260822}" \
+        --report_json "$REPORTS/hybrid_graph.${split}.${city}.json"
+    done
+    runlog "hybrid_pudo.${split}.concat" python scripts/concat_jsonl_files.py \
+      --inputs \
+        "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid/boston.jsonl" \
+        "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid/pittsburgh.jsonl" \
+        "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid/vegas.jsonl" \
+        "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid/singapore.jsonl" \
+      --output "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid_evidence.jsonl"
+  done
+}
+
+hybrid_build() {
+  local split
+  for split in train val test; do
+    runlog "hybrid_build.${split}" python scripts/prepare_abilitybench_external.py \
+      --config "$CONFIG" --split "$split" --source_policy hybrid \
+      --cities boston+pittsburgh+vegas+singapore \
+      --stages preflight,service,dataset,merge
+  done
+}
+
+hybrid_from_existing() {
+  # Recommended continuation from the user's current 6000-scene heavy corpus.
+  refresh_audit_public_sources
+  recover_audit_evidence
+  site_disjoint_eval
+  hybrid_evidence
+  hybrid_build
 }
 
 rebuild_paper_evidence_full() {
@@ -688,12 +777,16 @@ Stages:
   bootstrap-candidates-full-staged    # legacy exhaustive heavy build; checkpointable but not recommended for paper sampling
   bootstrap-runtime-summary           # summarize profiler, excluding idle tail
   site-catalogs
+  site-disjoint-eval                  # secondary strict eval allowlists; never purge the main train split
   prefill-audits
   classify-audits
   triage-audits                       # deterministic reject/missing/visual/explicit-source buckets + status
   audit-status                        # combined report + compact evidence-gap manifest; PASS != evidence complete
-  refresh-audit-public-sources        # retry Boston official physical layers + Singapore LTA entrance/source layers
+  refresh-audit-public-sources        # refresh all four cities: Boston/Pittsburgh/Clark County/LTA official/public layers
   recover-audit-evidence              # semantic source recovery + prefill/classify/triage rerun
+  hybrid-evidence                      # explicit observed/derived/simulated benchmark truth overlays
+  hybrid-build                         # build benchmark datasets under outputs/datasets/abilitybench_av_hybrid_*
+  hybrid-from-existing                 # recommended continuation: source refresh -> recovery -> overlays -> build
   render-audit-packets                # visual rows, or evidence-gap diagnostic packets when visual bucket is empty
   audit-review-bundle                 # small uploadable ZIP under reports/ (no NPZ/full dataset)
   review-source-complete-audits
@@ -735,12 +828,16 @@ case "${1:-}" in
   bootstrap-candidates-full-staged) bootstrap_candidates_full_staged ;;
   bootstrap-runtime-summary) bootstrap_runtime_summary ;;
   site-catalogs) build_site_catalogs ;;
+  site-disjoint-eval) site_disjoint_eval ;;
   prefill-audits) prefill_audit_worklists ;;
   classify-audits) classify_audits ;;
   triage-audits) triage_audits ;;
   audit-status) audit_status ;;
   refresh-audit-public-sources) refresh_audit_public_sources ;;
   recover-audit-evidence) recover_audit_evidence ;;
+  hybrid-evidence) hybrid_evidence ;;
+  hybrid-build) hybrid_build ;;
+  hybrid-from-existing) hybrid_from_existing ;;
   render-audit-packets) render_audit_packets ;;
   audit-review-bundle) audit_review_bundle ;;
   review-source-complete-audits) review_source_complete_audits ;;

@@ -26,6 +26,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BOSTON_BASE = "https://gisportal.boston.gov/arcgis/rest/services/Infrastructure/OpenData/MapServer"
 BOSTON_PWD_BASE = "https://gisportal.boston.gov/ArcGIS/rest/services/PWD/Cartegraph_PWD_readonly/MapServer"
 VEGAS_TAXI = "https://mapdata.lasvegasnevada.gov/clvgis/rest/services/Transportation/CLV_ParkingServices_ParkingZones/MapServer/4"
+CLARK_PW_RAMP = "https://maps.clarkcountynv.gov/arcgis/rest/services/PW/pwEditLayers/FeatureServer/1"
+CLARK_PW_CONCRETE = "https://maps.clarkcountynv.gov/arcgis/rest/services/PW/pwEditLayers/FeatureServer/2"
+CLARK_STRIP_SIDEWALK = "https://maps.clarkcountynv.gov/arcgis/rest/services/AdminServ/Strip_Sidewalk_LinearFeet_Line/FeatureServer/0"
 PASDA_ALLEGHENY_ADDRESS_POINTS = "https://mapservices.pasda.psu.edu/server/rest/services/pasda/AlleghenyCounty/MapServer/32"
 WPRDC = "https://data.wprdc.org"
 
@@ -213,15 +216,38 @@ def main() -> None:
 
     if "vegas" in cities:
         bbox = cfg["cities"]["vegas"]["bbox"]
+        raw_dir = external / "raw" / "arcgis" / "vegas"
+        norm_dir = external / "normalized" / "city_gis" / "vegas"
+        clark_specs = [
+            ("clark_pw_ramps", CLARK_PW_RAMP, "clark_county_ramp", "clark_pw_ramps.geojson"),
+            ("clark_pw_concrete", CLARK_PW_CONCRETE, "clark_county_concrete", "clark_pw_concrete.geojson"),
+            ("clark_strip_sidewalk", CLARK_STRIP_SIDEWALK, "clark_strip_sidewalk", "clark_strip_sidewalk.geojson"),
+        ]
+        for label, endpoint, profile, norm_name in clark_specs:
+            def clark_work(label=label, endpoint=endpoint, profile=profile, norm_name=norm_name):
+                raw = raw_dir / f"{label}.geojson"
+                if args.force or not raw.exists():
+                    download_layer(endpoint, raw, bbox=bbox)
+                dst = norm_dir / norm_name
+                normalize(raw, dst, profile, f"Clark County Nevada GIS {label}")
+                return dst
+            attempt(
+                "vegas", f"Clark County {label}", clark_work,
+                f"Clark County ArcGIS REST layer {endpoint}; query the nuPlan Strip AOI with outSR=4326/f=geojson and save to {raw_dir}/{label}.geojson",
+            )
+
+        # Keep the City of Las Vegas taxi layer only as an optional jurisdiction-
+        # limited candidate.  The nuPlan Strip map is largely Clark County, so
+        # this layer must not be treated as Strip-wide stopping-legality truth.
         def vegas_taxi():
-            raw = external / "raw" / "arcgis" / "vegas" / "taxi_zones.geojson"
+            raw = raw_dir / "taxi_zones.geojson"
             if args.force or not raw.exists():
                 download_layer(VEGAS_TAXI, raw, bbox=bbox)
-            dst = external / "normalized" / "candidates" / "vegas" / "taxi_zones.jsonl"
-            normalize(raw, dst, "vegas_parking_zone", "City of Las Vegas Taxi Zones")
+            dst = external / "normalized" / "candidates" / "vegas" / "taxi_zones.city_of_las_vegas_only.jsonl"
+            normalize(raw, dst, "vegas_parking_zone", "City of Las Vegas Taxi Zones (jurisdiction-limited auxiliary candidate)")
             return dst
-        attempt("vegas", "Taxi Zones", vegas_taxi,
-                f"ArcGIS REST layer {VEGAS_TAXI}; Query -> GeoJSON; save to data/external/raw/arcgis/vegas/taxi_zones.geojson")
+        attempt("vegas", "City of Las Vegas Taxi Zones (auxiliary only)", vegas_taxi,
+                f"Optional auxiliary layer {VEGAS_TAXI}; do not use as Strip-wide legal-stop truth.")
 
     if "singapore" in cities:
         # Discover the current release URLs from LTA's official static-data

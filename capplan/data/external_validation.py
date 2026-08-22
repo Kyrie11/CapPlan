@@ -485,6 +485,9 @@ def validate_city_sources(
     project_root: Path,
     policy: str,
 ) -> Dict[str, Any]:
+    policy = str(policy).strip().lower()
+    if policy not in {"bootstrap", "hybrid", "paper"}:
+        raise ValueError(f"unsupported source policy: {policy}")
     paths = _source_paths(city, city_cfg, external_root, project_root)
     roles = {
         "osm_source": "osm",
@@ -563,11 +566,18 @@ def validate_city_sources(
         warnings.append("opensidewalks_source_is_only_an_osm_derived_candidate")
     if policy == "paper" and not require_audited_core:
         warnings.append("strict_audited_core_evidence_preflight_is_disabled")
-    if policy == "bootstrap":
+    if policy in {"bootstrap", "hybrid"}:
         missing_paper = [name for name in paper_required if not requirements[name]]
         if missing_paper:
-            warnings.append("bootstrap_dataset_is_not_publication_ready:" + ",".join(missing_paper))
+            prefix = "bootstrap" if policy == "bootstrap" else "hybrid_underlying_city_evidence"
+            warnings.append(prefix + "_is_not_publication_ready:" + ",".join(missing_paper))
+    if policy == "hybrid":
+        warnings.extend([
+            "hybrid_policy_allows_explicit_simulated_benchmark_truth_for_missing_fields",
+            "hybrid_outputs_must_not_be_claimed_as_exact_real_city_ground_truth",
+        ])
 
+    audited_city_evidence_ready = all(requirements[x] for x in paper_required)
     return {
         "city": city,
         "source_policy": policy,
@@ -577,7 +587,8 @@ def validate_city_sources(
         "blockers": blockers,
         "warnings": warnings,
         "ready": not blockers,
-        "publication_ready": all(requirements[x] for x in paper_required),
+        "audited_city_evidence_ready": audited_city_evidence_ready,
+        "publication_ready": bool(audited_city_evidence_ready and policy == "paper"),
     }
 
 
@@ -609,5 +620,6 @@ def validate_external_config(
         "cities": city_reports,
         "blockers": blockers,
         "ready_for_requested_policy": not blockers,
-        "publication_ready": all(r["publication_ready"] for r in city_reports),
+        "audited_city_evidence_ready": all(r.get("audited_city_evidence_ready", False) for r in city_reports),
+        "publication_ready": bool(policy == "paper" and all(r["publication_ready"] for r in city_reports)),
     }
