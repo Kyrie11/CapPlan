@@ -74,14 +74,29 @@ def _load_episode_allowlist(path: str | None) -> set[str] | None:
 def _resolve_db_inputs(args: argparse.Namespace) -> List[str] | str | None:
     """Resolve user-friendly DB-set folder arguments for nuPlan builds.
 
-    Users may pass either the original ``--nuplan_db_files`` argument or the new
-    pair ``--nuplan_db_root ... --nuplan_db_dirs train_boston train_pittsburgh``.
+    Users may pass a concrete-file manifest, the original ``--nuplan_db_files``
+    argument, or the pair ``--nuplan_db_root ... --nuplan_db_dirs
+    train_boston train_pittsburgh``.
     Relative folder names are resolved under ``nuplan_db_root`` when provided,
     otherwise under ``nuplan_data_root`` / ``nuplan_root``.  The adapter expands
     directories into concrete ``.db`` files.
     """
     tokens: List[str] = []
     root = Path(args.nuplan_db_root or args.nuplan_data_root or args.nuplan_root or ".")
+    manifest_arg = getattr(args, "nuplan_db_manifest", None)
+    if manifest_arg:
+        manifest = Path(manifest_arg)
+        if not manifest.exists():
+            raise FileNotFoundError(f"nuPlan DB manifest does not exist: {manifest}")
+        for raw in manifest.read_text(encoding="utf-8").splitlines():
+            token = raw.strip()
+            if not token or token.startswith("#"):
+                continue
+            p = Path(token)
+            tokens.append(str(p if p.is_absolute() else root / p))
+        if not tokens:
+            raise RuntimeError(f"nuPlan DB manifest is empty: {manifest}")
+        return tokens
     for token in _split_cli_path_list(args.nuplan_db_files):
         p = Path(token)
         tokens.append(str(p if p.is_absolute() else root / p))
@@ -91,6 +106,23 @@ def _resolve_db_inputs(args: argparse.Namespace) -> List[str] | str | None:
     if tokens:
         return tokens
     return args.nuplan_db_files
+
+
+def _adapter_scenario_limit(args: argparse.Namespace, episode_allowlist: set[str] | None) -> int:
+    """Choose how far the nuPlan adapter must scan before allowlist filtering.
+
+    Paper allowlists are selected from a full evidence pass and can therefore
+    contain episodes anywhere in the DB stream; those must scan all matching
+    scenarios.  Hybrid-ready allowlists, however, are generated from the same
+    first-N heavy scene corpus used by this dataset build.  The explicit
+    ``--episode_allowlist_within_max_scenarios`` flag preserves that first-N
+    boundary and avoids rescanning millions of unrelated scenarios.
+    """
+    if episode_allowlist is None:
+        return int(args.max_scenarios)
+    if bool(getattr(args, "episode_allowlist_within_max_scenarios", False)):
+        return int(args.max_scenarios)
+    return 0
 
 
 
@@ -623,6 +655,7 @@ def main() -> None:
     p.add_argument("--nuplan_data_root", default=None)
     p.add_argument("--nuplan_map_root", default=None)
     p.add_argument("--nuplan_sensor_root", default=None)
+    p.add_argument("--nuplan_db_manifest", default=None, help="Text file containing one concrete nuPlan .db path per line. Relative DB entries resolve under --nuplan_db_root or --nuplan_data_root.")
     p.add_argument("--nuplan_db_files", default=None, help="nuPlan .db file, folder, glob, or comma/plus-separated list. Relative entries resolve under --nuplan_db_root or --nuplan_data_root.")
     p.add_argument("--nuplan_db_root", default=None, help="Root directory containing nuPlan DB-set folders such as train_boston, train_pittsburgh, val.")
     p.add_argument("--nuplan_db_dirs", nargs="*", default=None, help="One or more DB-set folder names/paths, e.g. train_boston train_pittsburgh or train_boston+train_pittsburgh.")
@@ -633,8 +666,9 @@ def main() -> None:
     # Backward-compatible alias; mapped to nuplan_data_root only when provided.
     p.add_argument("--nuplan_root", default=None)
     p.add_argument("--split", default="mini")
-    p.add_argument("--max_scenarios", type=int, default=4, help="Maximum matching scenarios; for real nuPlan data, 0 means all. When --episode_allowlist is supplied, all DB scenarios are scanned and only allowlisted IDs are materialized.")
+    p.add_argument("--max_scenarios", type=int, default=4, help="Maximum matching scenarios; for real nuPlan data, 0 means all. With a general --episode_allowlist the full filtered DB population is scanned; --episode_allowlist_within_max_scenarios keeps this first-N boundary for allowlists derived from the same heavy corpus.")
     p.add_argument("--episode_allowlist", default=None, help="Optional text/JSON episode-id allowlist for audited paper subsets.")
+    p.add_argument("--episode_allowlist_within_max_scenarios", action="store_true", help="The allowlist was derived from this build's first --max_scenarios matching scenes. Keep the first-N adapter limit instead of scanning the full DB split. Intended for hybrid-ready allowlists, not arbitrary paper allowlists.")
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
     p.add_argument("--paper_mode", action="store_true", help="Enable publication-grade data gates: no synthetic/proxy fallbacks, no missing core evidence, and real service/profile/fleet inputs required.")
     p.add_argument("--source_policy", choices=["bootstrap", "hybrid", "paper"], default="bootstrap", help="Evidence policy: bootstrap=fail-closed bring-up; hybrid=real geometry/topology plus explicitly simulated missing benchmark truth; paper=audited city evidence only and requires --paper_mode.")
@@ -726,10 +760,13 @@ def main() -> None:
     # so it may contain IDs that occur late in the DB stream. Do not apply the
     # old first-N limit before filtering or the resulting paper subset would be
     # order-dependent and silently incomplete.
-    adapter_limit = 0 if episode_allowlist is not None else args.max_scenarios
+    adapter_limit = _adapter_scenario_limit(args, episode_allowlist)
     scenario_iter = adapter.iter_scenarios(adapter_limit)
     if not args.disable_tqdm:
-        total = len(episode_allowlist) if episode_allowlist is not None else (None if args.max_scenarios <= 0 else args.max_scenarios)
+        if episode_allowlist is not None and args.episode_allowlist_within_max_scenarios:
+            total = None if args.max_scenarios <= 0 else args.max_scenarios
+        else:
+            total = len(episode_allowlist) if episode_allowlist is not None else (None if args.max_scenarios <= 0 else args.max_scenarios)
         scenario_iter = tqdm(scenario_iter, total=total, desc=f"build {args.scene_source} dataset", unit="scenario")
 
     scanned_scenarios = 0

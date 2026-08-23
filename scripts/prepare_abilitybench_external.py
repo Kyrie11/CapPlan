@@ -264,6 +264,40 @@ def _write_db_manifest(path: Path, db_files: Iterable[str]) -> None:
     part.replace(path)
 
 
+def _city_db_cli_args(
+    *, split_name: str, city: str, split_cfg: Dict[str, Any], city_cfg: Dict[str, Any],
+    db_root: Path, external_root: Path, reports_root: Path, dry_run: bool,
+) -> tuple[List[str], str]:
+    """Return one canonical DB-selection CLI fragment for every nuPlan stage.
+
+    Train uses the configured city-specific DB directories.  Mixed val/test
+    directories preferentially reuse ``inspect-nuplan``'s SQLite ``log.location``
+    classification when (and only when) its complete DB-inventory fingerprint
+    still matches.  This exact helper is used by index, extract, and final
+    dataset construction so those stages cannot silently disagree about which
+    DB files belong to a city.
+    """
+    city_db_dirs = _resolve_city_db_dirs(split_cfg, city_cfg, city)
+    inspected_city_db_files, reason = _trusted_city_db_files_from_inspection(
+        split_name=split_name,
+        city=city,
+        split_cfg=split_cfg,
+        db_root=db_root,
+        external_root=external_root,
+    )
+    if inspected_city_db_files:
+        manifest = reports_root / f"nuplan_db_inputs.{city}.txt"
+        if not dry_run:
+            _write_db_manifest(manifest, inspected_city_db_files)
+        return ["--nuplan_db_manifest", str(manifest)], f"inspection_manifest:{len(inspected_city_db_files)}db"
+    if not city_db_dirs:
+        raise RuntimeError(
+            f"no nuPlan DB directories resolved for split={split_name} city={city}; "
+            f"db_root={db_root} inspection_reason={reason}"
+        )
+    return ["--nuplan_db_dirs", *city_db_dirs], f"dirs:{city_db_dirs} fallback_reason={reason}"
+
+
 def _city_source(city: str, city_cfg: Dict[str, Any], key: str, default_root: Path, default_name: str) -> Path:
     explicit = city_cfg.get(key)
     if explicit:
@@ -438,13 +472,13 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
         city_cfg = config["cities"][city]
         scene_dir = prepared_root / "scene_contexts" / city
         scene_dirs[city] = scene_dir
-        city_db_dirs = _resolve_city_db_dirs(split_cfg, city_cfg, city)
         city_map_names = _split_csv(city_cfg.get("map_names"))
         db_root_path = _path(nuplan.get("db_root", nuplan["data_root"]))
         assert db_root_path is not None
-        inspected_city_db_files, db_selection_reason = _trusted_city_db_files_from_inspection(
-            split_name=split_name, city=city, split_cfg=split_cfg, db_root=db_root_path,
-            external_root=external_root,
+        db_cli_args, db_desc = _city_db_cli_args(
+            split_name=split_name, city=city, split_cfg=split_cfg, city_cfg=city_cfg,
+            db_root=db_root_path, external_root=external_root, reports_root=reports_root,
+            dry_run=dry_run,
         )
 
         if "index" in stages:
@@ -463,15 +497,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 "--manifest_json", str(index_manifest),
                 "--resume",
             ]
-            if inspected_city_db_files:
-                db_manifest = reports_root / f"nuplan_db_inputs.{city}.txt"
-                if not dry_run:
-                    _write_db_manifest(db_manifest, inspected_city_db_files)
-                cmd.extend(["--nuplan_db_manifest", str(db_manifest)])
-                db_desc = f"inspection_manifest:{len(inspected_city_db_files)}db"
-            else:
-                cmd.extend(["--nuplan_db_dirs", *_split_csv(city_db_dirs).split("+")])
-                db_desc = f"dirs:{city_db_dirs} fallback_reason={db_selection_reason}"
+            cmd.extend(db_cli_args)
             if city_map_names:
                 cmd.extend(["--nuplan_map_names", city_map_names])
             if disable_tqdm:
@@ -511,15 +537,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 cmd.extend(["--ego_displacement_minimum_m", str(ego_displacement_minimum_m)])
             if adopt_extract_partial:
                 cmd.append("--adopt_existing_partial")
-            if inspected_city_db_files:
-                db_manifest = reports_root / f"nuplan_db_inputs.{city}.txt"
-                if not dry_run:
-                    _write_db_manifest(db_manifest, inspected_city_db_files)
-                cmd.extend(["--nuplan_db_manifest", str(db_manifest)])
-                db_desc = f"inspection_manifest:{len(inspected_city_db_files)}db"
-            else:
-                cmd.extend(["--nuplan_db_dirs", *_split_csv(city_db_dirs).split("+")])
-                db_desc = f"dirs:{city_db_dirs} fallback_reason={db_selection_reason}"
+            cmd.extend(db_cli_args)
             if city_map_names:
                 cmd.extend(["--nuplan_map_names", city_map_names])
             if disable_tqdm:
@@ -684,8 +702,14 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
 
     for city in _progress(cities, f"{split_name}: dataset build", disable_tqdm):
         city_cfg = config["cities"][city]
-        city_db_dirs = _resolve_city_db_dirs(split_cfg, city_cfg, city)
         city_map_names = _split_csv(city_cfg.get("map_names"))
+        db_root_path = _path(nuplan.get("db_root", nuplan["data_root"]))
+        assert db_root_path is not None
+        db_cli_args, db_desc = _city_db_cli_args(
+            split_name=split_name, city=city, split_cfg=split_cfg, city_cfg=city_cfg,
+            db_root=db_root_path, external_root=external_root, reports_root=reports_root,
+            dry_run=dry_run,
+        )
         city_dataset_name = f"abilitybench_av_hybrid_{split_name}_{city}" if source_policy == "hybrid" else f"abilitybench_av_{split_name}_{city}"
         city_dataset = outputs_root / "datasets" / city_dataset_name
         dataset_city_dirs.append(city_dataset)
@@ -748,10 +772,25 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(city_dataset),
                 "--strict",
             ]
+            cmd.extend(db_cli_args)
+            if source_policy == "hybrid":
+                hybrid_ready_allowlist = prepared_root / "hybrid_ready_episode_ids" / f"{city}.txt"
+                _require_artifact(hybrid_ready_allowlist, f"hybrid-ready episode allowlist for {city}", dry_run)
+                cmd.extend([
+                    "--episode_allowlist", str(hybrid_ready_allowlist),
+                    "--episode_allowlist_within_max_scenarios",
+                ])
+            elif episode_allowlist is not None:
+                # Paper allowlists are selected after the evidence pass and may
+                # contain IDs anywhere in the complete city DB stream.  Do not
+                # mark them as first-N bounded; build_dataset will correctly
+                # scan the full filtered population before applying the list.
+                cmd.extend(["--episode_allowlist", str(episode_allowlist)])
             if disable_tqdm:
                 cmd.append("--disable_tqdm")
             if city_map_names:
                 cmd.extend(["--nuplan_map_names", city_map_names])
+            print(f"[CAPPLAN_PROGRESS] split={split_name} city={city} stage=dataset db_selection={db_desc} workers={num_workers}", flush=True)
             _run(cmd, dry_run)
             if not dry_run:
                 audit_cmd = [
@@ -799,6 +838,17 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             ],
             dry_run,
         )
+        if not dry_run:
+            # Keep the two most useful merged-dataset artifacts in reports/ so
+            # a later review never requires uploading the full dataset tree.
+            for src_name, dst_name in (
+                ("dataset_manifest.json", f"merged_dataset_manifest.{source_policy}.json"),
+                ("validation_report.json", f"merged_validation_report.{source_policy}.json"),
+            ):
+                src = merged_dataset / src_name
+                if src.exists():
+                    dst = reports_root / dst_name
+                    dst.write_bytes(src.read_bytes())
 
 
 def main() -> None:

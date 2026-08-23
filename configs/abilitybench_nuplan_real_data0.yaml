@@ -18,8 +18,14 @@ scene_selection:
   ego_displacement_minimum_m: null
 
 nuplan:
-  # Official nuPlan layout:
-  # data/nuplan/nuplan-v1.1/splits/{mini,trainval,test,...}/*.db
+  # This machine's nuPlan v1.1 layout.  Train has been organized into four
+  # city-specific folders; val/test intentionally remain mixed-city folders.
+  # `inspect-nuplan` classifies each mixed DB from SQLite log.location and
+  # writes fingerprint-guarded per-city manifests.  map_names is retained as a
+  # second safety filter; DB files are never copied or moved merely to split by
+  # city.
+  # data/nuplan/nuplan-v1.1/splits/train_{boston,pittsburgh,vegas,singapore}/*.db
+  # data/nuplan/nuplan-v1.1/splits/{val,test}/*.db
   # data/nuplan/maps/nuplan-maps-v1.0.json
   # data/nuplan/maps/<map-name>/<location-version>/map.gpkg
   data_root: "/data0/senzeyu2/dataset/CapPlan/data/nuplan"
@@ -81,13 +87,16 @@ splits:
       singapore: [train_singapore]
     max_scenarios_per_city: 1000
   val:
-    # The official val DB directory may contain logs from multiple maps/cities.
-    # City separation is done by nuPlan ScenarioFilter(map_names=...), not by
-    # copying/moving DB files.
+    # The official val DB directory contains multiple cities. inspect-nuplan
+    # reads SQLite log.location and creates fingerprint-guarded per-city DB
+    # manifests; ScenarioFilter(map_names=...) is retained as a second guard.
+    # DB files are never copied/moved merely to create city subsets.
     cities: [boston, pittsburgh, vegas, singapore]
     db_dirs: [val]
     max_scenarios_per_city: 250
   test:
+    # Same mixed-DB policy as val: SQLite log.location manifest first, map_names
+    # as a second guard.
     cities: [boston, pittsburgh, vegas, singapore]
     db_dirs: [test]
     max_scenarios_per_city: 250

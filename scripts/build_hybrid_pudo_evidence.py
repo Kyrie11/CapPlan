@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl, write_jsonl
 
-VERSION = "abilitybench_hybrid_pudo_v1_20260822"
+VERSION = "abilitybench_hybrid_pudo_v2_20260823"
 PHYSICAL_FIELDS = ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp")
 REQUIRED_FIELDS = (*PHYSICAL_FIELDS, "legal_stop", "legal_basis", "side", "adjacent_ped_node_id")
 
@@ -364,8 +364,21 @@ def main() -> None:
             legal_prov = _prov.get("legal_stop") if isinstance(_prov.get("legal_stop"), Mapping) else {}
             observed_illegal = legal is False and str(legal_prov.get("kind")) == "observed"
             if not observed_illegal and row.get("adjacent_ped_node_id"):
-                forceable.append(idx)
-        forced = set(forceable[: max(0, args.min_positive_per_episode)])
+                # Prefer candidates that are already dynamically available.
+                # A previous implementation selected the first N anchors and
+                # could force an ``accessible_loading`` scenario onto a row
+                # whose observed/preexisting blockage_risk was >= 0.85.  The
+                # fill logic correctly refuses to overwrite that real dynamic
+                # fact, so the supposedly forced-positive row stayed
+                # ineligible.  Stable sorting by availability fixes that
+                # avoidable loss without modifying any observed value.
+                try:
+                    blockage = float(row.get("blockage_risk") or 0.0)
+                except Exception:
+                    blockage = 1.0
+                forceable.append((blockage >= 0.85, blockage, idx))
+        forceable.sort()
+        forced = {idx for _blocked, _risk, idx in forceable[: max(0, args.min_positive_per_episode)]}
 
         eligible_count = 0
         complete_count = 0

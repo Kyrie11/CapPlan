@@ -552,15 +552,13 @@ import_completed_manual_audits() {
 }
 
 
-hybrid_evidence() {
-  # Build geometry-anchored benchmark truth without pretending simulated values
-  # are exact city measurements.  Source/audit values win; only missing fields
-  # are deterministically simulated and every field carries provenance.
-  local split city base_graph hybrid_graph allowlist base_pudo hybrid_city audit_csv
+hybrid_pudo_evidence_only() {
+  # Cheap/idempotent PUDO overlay refresh.  This is deliberately separate from
+  # the very large accessibility-graph overlay so an interrupted hybrid build
+  # can pick up PUDO-policy fixes without repeating hours of graph work.
+  local split city allowlist base_pudo hybrid_city audit_csv
   for split in train val test; do
-    base_graph="$DATA_ROOT/outputs/prepared/$split/accessibility_graphs"
-    hybrid_graph="$DATA_ROOT/outputs/prepared/$split/accessibility_graphs_hybrid"
-    mkdir -p "$hybrid_graph" "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid"
+    mkdir -p "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid"
     for city in boston pittsburgh vegas singapore; do
       allowlist="$REPORTS/hybrid_episode_ids.${split}.${city}.txt"
       python - "$DATA_ROOT/outputs/prepared/$split/scene_contexts/$city/episodes.jsonl" "$allowlist" <<'PYIDS'
@@ -574,7 +572,7 @@ for line in src.open():
         r=json.loads(line); eid=r.get("episode_id")
         if eid: ids.append(str(eid))
 dst.parent.mkdir(parents=True, exist_ok=True)
-dst.write_text("\n".join(ids)+("\n" if ids else ""))
+dst.write_text("\n".join(ids)+( "\n" if ids else ""))
 print(f"wrote {dst}: {len(ids)} episode ids")
 PYIDS
       base_pudo="$DATA_ROOT/outputs/prepared/$split/pudo/${city}.jsonl"
@@ -587,11 +585,6 @@ PYIDS
         --seed "${CAP_HYBRID_SEED:-20260822}" \
         --min_positive_per_episode "${CAP_HYBRID_MIN_PUDOS:-2}" \
         --report_json "$REPORTS/hybrid_pudo.${split}.${city}.json"
-      runlog "hybrid_graph.${split}.${city}" python scripts/build_hybrid_accessibility_overlay.py \
-        --input_graph_dir "$base_graph" --output_graph_dir "$hybrid_graph" \
-        --city "$city" --split "$split" --episode_allowlist "$allowlist" \
-        --seed "${CAP_HYBRID_SEED:-20260822}" \
-        --report_json "$REPORTS/hybrid_graph.${split}.${city}.json"
     done
     runlog "hybrid_pudo.${split}.concat" python scripts/concat_jsonl_files.py \
       --inputs \
@@ -603,7 +596,64 @@ PYIDS
   done
 }
 
+hybrid_graph_evidence_only() {
+  # Expensive graph overlay.  Real nodes/topology and observed attributes are
+  # preserved; only missing typed-resource attributes receive deterministic,
+  # provenance-tagged benchmark values.
+  local split city base_graph hybrid_graph allowlist
+  for split in train val test; do
+    base_graph="$DATA_ROOT/outputs/prepared/$split/accessibility_graphs"
+    hybrid_graph="$DATA_ROOT/outputs/prepared/$split/accessibility_graphs_hybrid"
+    mkdir -p "$hybrid_graph"
+    for city in boston pittsburgh vegas singapore; do
+      allowlist="$REPORTS/hybrid_episode_ids.${split}.${city}.txt"
+      [[ -s "$allowlist" ]] || { echo "Missing hybrid episode inventory: $allowlist" >&2; return 2; }
+      runlog "hybrid_graph.${split}.${city}" python scripts/build_hybrid_accessibility_overlay.py \
+        --input_graph_dir "$base_graph" --output_graph_dir "$hybrid_graph" \
+        --city "$city" --split "$split" --episode_allowlist "$allowlist" \
+        --seed "${CAP_HYBRID_SEED:-20260822}" \
+        --report_json "$REPORTS/hybrid_graph.${split}.${city}.json"
+    done
+  done
+}
+
+hybrid_evidence() {
+  # Geometry-anchored benchmark truth without pretending simulated values are
+  # exact city measurements.  PUDO and graph stages are split so PUDO policy
+  # updates can be replayed cheaply on an already-built heavy corpus.
+  hybrid_pudo_evidence_only
+  hybrid_graph_evidence_only
+}
+
+hybrid_ready_allowlists() {
+  # Final hybrid membership is evidence-driven.  Do not fabricate new PUDO
+  # geometry merely to satisfy the >=N anchor gate: select only episodes whose
+  # already-built hybrid PUDO layer has enough complete/legal/unblocked anchors.
+  local split city src out rejected
+  for split in train val test; do
+    mkdir -p "$DATA_ROOT/outputs/prepared/$split/hybrid_ready_episode_ids"
+    for city in boston pittsburgh vegas singapore; do
+      src="$DATA_ROOT/outputs/prepared/$split/pudo_hybrid/$city.jsonl"
+      out="$DATA_ROOT/outputs/prepared/$split/hybrid_ready_episode_ids/$city.txt"
+      rejected="$DATA_ROOT/outputs/prepared/$split/hybrid_ready_episode_ids/$city.rejected.txt"
+      [[ -s "$src" ]] || { echo "Missing hybrid PUDO evidence: $src" >&2; return 2; }
+      runlog "hybrid_ready.${split}.${city}" python scripts/build_hybrid_ready_allowlist.py \
+        --input_pudo_jsonl "$src" \
+        --output_allowlist "$out" \
+        --output_rejected "$rejected" \
+        --min_hybrid_eligible_pudos "${CAP_HYBRID_MIN_PUDOS:-2}" \
+        --city "$city" --split "$split" \
+        --report_json "$REPORTS/hybrid_ready.${split}.${city}.json"
+    done
+  done
+}
+
 hybrid_build() {
+  # Refresh only the cheap PUDO overlay first.  This picks up evidence-policy
+  # fixes on an interrupted run while reusing the already-built large graph
+  # overlay.  Final membership is then evidence-driven.
+  hybrid_pudo_evidence_only
+  hybrid_ready_allowlists
   local split
   for split in train val test; do
     runlog "hybrid_build.${split}" python scripts/prepare_abilitybench_external.py \
@@ -611,6 +661,23 @@ hybrid_build() {
       --cities boston+pittsburgh+vegas+singapore \
       --stages preflight,service,dataset,merge
   done
+}
+
+hybrid_full_build() {
+  # End-to-end benchmark construction from the immutable nuPlan substrate.
+  # The full official DB inventory is indexed, while heavy graph/PUDO
+  # materialization intentionally follows the paper-scale split caps from the
+  # config (train=1000/city and val/test=250/city unless overridden there).
+  inspect_nuplan
+  index_nuplan_full
+  bootstrap_preflight
+  bootstrap_candidates_paper_scale_staged
+  build_site_catalogs
+  refresh_audit_public_sources
+  recover_audit_evidence
+  site_disjoint_eval
+  hybrid_evidence
+  hybrid_build
 }
 
 hybrid_from_existing() {
@@ -784,9 +851,12 @@ Stages:
   audit-status                        # combined report + compact evidence-gap manifest; PASS != evidence complete
   refresh-audit-public-sources        # refresh all four cities: Boston/Pittsburgh/Clark County/LTA official/public layers
   recover-audit-evidence              # semantic source recovery + prefill/classify/triage rerun
+  hybrid-pudo-refresh                   # cheap PUDO-only hybrid overlay refresh; reuses existing graph overlay
   hybrid-evidence                      # explicit observed/derived/simulated benchmark truth overlays
+  hybrid-ready-allowlists              # select evidence-valid hybrid episodes; no geometry synthesis
   hybrid-build                         # build benchmark datasets under outputs/datasets/abilitybench_av_hybrid_*
   hybrid-from-existing                 # recommended continuation: source refresh -> recovery -> overlays -> build
+  hybrid-full-build                    # complete from-zero four-city train/val/test hybrid benchmark pipeline
   render-audit-packets                # visual rows, or evidence-gap diagnostic packets when visual bucket is empty
   audit-review-bundle                 # small uploadable ZIP under reports/ (no NPZ/full dataset)
   review-source-complete-audits
@@ -835,9 +905,12 @@ case "${1:-}" in
   audit-status) audit_status ;;
   refresh-audit-public-sources) refresh_audit_public_sources ;;
   recover-audit-evidence) recover_audit_evidence ;;
+  hybrid-pudo-refresh) hybrid_pudo_evidence_only ;;
   hybrid-evidence) hybrid_evidence ;;
+  hybrid-ready-allowlists) hybrid_ready_allowlists ;;
   hybrid-build) hybrid_build ;;
   hybrid-from-existing) hybrid_from_existing ;;
+  hybrid-full-build) hybrid_full_build ;;
   render-audit-packets) render_audit_packets ;;
   audit-review-bundle) audit_review_bundle ;;
   review-source-complete-audits) review_source_complete_audits ;;
