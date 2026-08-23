@@ -656,7 +656,27 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
 
     service_requests = prepared_root / "service_requests.validated.jsonl"
     capability_profiles = prepared_root / "capability_profiles.generated.jsonl"
-    fleet_jsonl = _path(config["fleet_jsonl"])
+    service_cfg = config.get("service", {}) or {}
+    service_episode_allowlist = episode_allowlist
+    if source_policy == "hybrid" and episode_allowlist is None:
+        # Hybrid membership is decided per city from PUDO evidence. Build one
+        # split-level union for request generation so rejected episodes do not
+        # linger in service_requests.validated.jsonl and confuse downstream QA.
+        ready_dir = prepared_root / "hybrid_ready_episode_ids"
+        ready_files = [ready_dir / f"{city}.txt" for city in cities]
+        if not dry_run:
+            missing_ready = [str(x) for x in ready_files if not x.exists()]
+            if missing_ready:
+                raise RuntimeError("hybrid service generation requires hybrid-ready allowlists first: " + "; ".join(missing_ready))
+            ids: list[str] = []
+            for f in ready_files:
+                ids.extend(x.strip() for x in f.read_text(encoding="utf-8").splitlines() if x.strip() and not x.lstrip().startswith("#"))
+            union_path = ready_dir / "all.txt"
+            union_path.write_text("\n".join(dict.fromkeys(ids)) + ("\n" if ids else ""), encoding="utf-8")
+            service_episode_allowlist = union_path
+        else:
+            service_episode_allowlist = ready_dir / "all.txt"
+    fleet_jsonl = _path(service_cfg.get("hybrid_fleet")) if source_policy == "hybrid" and service_cfg.get("hybrid_fleet") else _path(config["fleet_jsonl"])
     if "service" in stages or "all" in stages:
         _require_artifact(graph_dir, "accessibility graphs", dry_run)
         if not dry_run and not fleet_jsonl.exists():
@@ -664,7 +684,6 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 f"missing fleet interface file: {fleet_jsonl}. For bootstrap diagnostics you may copy "
                 "configs/fleet.abilitybench.example.jsonl to that path. Paper results require measured/verified fleet interface metadata."
             )
-        service_cfg = config.get("service", {}) or {}
         profile_source = _path(service_cfg["capability_profiles"]) if service_cfg.get("capability_profiles") else None
         trusted_entrance_sources = [str(x) for x in (service_cfg.get("trusted_entrance_sources") or [])]
         demand_cfg = _path(service_cfg["demand_sources_config"]) if service_cfg.get("demand_sources_config") else None
@@ -672,6 +691,10 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
             [
                 sys.executable,
                 "scripts/build_service_layer.py",
+                "--scene_dataset_dir",
+                str(prepared_root / "scene_contexts"),
+                "--source_policy",
+                source_policy,
                 "--accessibility_graph_dir",
                 str(graph_dir),
                 "--fleet_jsonl",
@@ -692,7 +715,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(reports_root / "service_layer.json"),
                 "--seed",
                 str(seed),
-                *( ["--episode_allowlist", str(episode_allowlist)] if episode_allowlist else [] ),
+                *( ["--episode_allowlist", str(service_episode_allowlist)] if service_episode_allowlist else [] ),
                 *( ["--require_trusted_entrances"] if source_policy == "paper" else [] ),
                 *( sum((["--trusted_entrance_source", src] for src in trusted_entrance_sources), []) if source_policy == "paper" else [] ),
                 *( ["--allow_non_entrance_od"] if source_policy in {"bootstrap", "hybrid"} else [] ),
@@ -770,6 +793,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 str(min_hybrid_eligible),
                 "--output_dir",
                 str(city_dataset),
+                *( ["--clean_output"] if source_policy == "hybrid" else [] ),
                 "--strict",
             ]
             cmd.extend(db_cli_args)
@@ -820,6 +844,15 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                     "--pudo_evidence_jsonl", str(combined_pudo),
                     "--output", str(reports_root / f"dataset_diagnostics.{city}.json"),
                 ], dry_run)
+                if source_policy == "hybrid":
+                    _run([
+                        sys.executable,
+                        "scripts/audit_hybrid_benchmark.py",
+                        "--dataset_dir", str(city_dataset),
+                        "--expected_requests_per_episode", str(int((config.get("service", {}) or {}).get("num_requests_per_episode", 8))),
+                        "--output", str(reports_root / f"hybrid_dataset_audit.{city}.json"),
+                        "--fail_on_error",
+                    ], dry_run)
 
     merged_dataset_name = f"abilitybench_av_hybrid_{split_name}" if source_policy == "hybrid" else f"abilitybench_av_{split_name}"
     merged_dataset = outputs_root / "datasets" / merged_dataset_name
@@ -834,6 +867,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 *[str(x) for x in dataset_city_dirs],
                 "--output_dir",
                 str(merged_dataset),
+                *( ["--clean_output"] if source_policy == "hybrid" else [] ),
                 "--strict",
             ],
             dry_run,
@@ -849,6 +883,15 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 if src.exists():
                     dst = reports_root / dst_name
                     dst.write_bytes(src.read_bytes())
+            if source_policy == "hybrid":
+                _run([
+                    sys.executable,
+                    "scripts/audit_hybrid_benchmark.py",
+                    "--dataset_dir", str(merged_dataset),
+                    "--expected_requests_per_episode", str(int((config.get("service", {}) or {}).get("num_requests_per_episode", 8))),
+                    "--output", str(reports_root / "hybrid_dataset_audit.merged.json"),
+                    "--fail_on_error",
+                ], dry_run)
 
 
 def main() -> None:

@@ -875,6 +875,88 @@ def _edge_attrs_from_feature(f: GISFeature) -> Dict[str, Any]:
     }
 
 
+def _elevation_resolution_m(f: GISFeature) -> Optional[float]:
+    t = f.tags or {}
+    for key in ("nominal_resolution_m", "source_resolution_m", "resolution_m", "pixel_size_m"):
+        v = _as_float(t.get(key))
+        if v is not None and v > 0:
+            return v
+    # The normalized DEM records also carry source_resolution + unit.
+    v = _as_float(t.get("source_resolution"))
+    unit = str(t.get("source_resolution_unit") or "").lower()
+    if v is not None and v > 0 and unit in {"m", "meter", "meters", "metre", "metres"}:
+        return v
+    return None
+
+
+def _is_elevation_only_point(f: GISFeature) -> bool:
+    """Identify DEM sample points that are evidence, not graph vertices.
+
+    Normalized DEM JSONL records contain lon/lat + elevation but no pedestrian
+    semantic tag.  Older code classified them as generic POIs and inserted them
+    into the pedestrian node set, which inflated graphs and only incidentally
+    transferred elevation when a DEM point quantized onto a sidewalk vertex.
+    """
+    if not f.is_point or _node_attrs_from_feature(f).get("elevation_m") is None:
+        return False
+    if f.kind not in {"poi", "elevation", "dem", "terrain", "height_sample"}:
+        return False
+    t = {str(k).lower(): str(v).lower() for k, v in (f.tags or {}).items() if v is not None}
+    semantic_keys = {"entrance", "building", "door", "highway", "footway", "crossing", "kerb", "curb_ramp", "public_transport", "railway", "barrier"}
+    return not any(k in t for k in semantic_keys)
+
+
+class _ElevationPointSampler:
+    """Small metric-grid nearest-neighbour sampler for high-resolution DEM.
+
+    Only <=5 m DEM is used for local pedestrian grade.  Coarser DSM/DEM (for
+    example Singapore GLO-30) remains terrain context and is not promoted to
+    sidewalk-scale slope truth.
+    """
+    def __init__(self, features: Sequence[GISFeature], max_resolution_m: float = 5.0) -> None:
+        self.cell_m = max(3.0, float(max_resolution_m))
+        self.grid: Dict[Tuple[int, int], List[Tuple[float, float, float, float, str, float]]] = {}
+        self.samples = 0
+        self.skipped_coarse = 0
+        for f in features:
+            if not _is_elevation_only_point(f):
+                continue
+            res = _elevation_resolution_m(f)
+            if res is None or res > max_resolution_m:
+                self.skipped_coarse += 1
+                continue
+            z = _node_attrs_from_feature(f).get("elevation_m")
+            if z is None:
+                continue
+            x, y = float(f.geometry[0][0]), float(f.geometry[0][1])
+            key = (math.floor(x / self.cell_m), math.floor(y / self.cell_m))
+            self.grid.setdefault(key, []).append((x, y, float(z), float(res), str(f.source), float(f.confidence)))
+            self.samples += 1
+
+    def nearest(self, x: float, y: float) -> Optional[Dict[str, Any]]:
+        if not self.grid:
+            return None
+        cx, cy = math.floor(x / self.cell_m), math.floor(y / self.cell_m)
+        best = None
+        best_d = float("inf")
+        # <=5 m samples with a 5 m cell only need the surrounding cells.
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for sx, sy, z, res, source, conf in self.grid.get((cx + dx, cy + dy), []):
+                    d = math.hypot(x - sx, y - sy)
+                    max_d = max(3.0, 2.5 * res)
+                    if d <= max_d and d < best_d:
+                        best_d = d
+                        best = {
+                            "elevation_m": z,
+                            "distance_m": d,
+                            "resolution_m": res,
+                            "source": source,
+                            "confidence": conf,
+                        }
+        return best
+
+
 class AccessibilityFusionBuilder:
     """Build per-scenario accessibility graphs from OSM/OpenSidewalks/city GIS."""
 
@@ -898,6 +980,11 @@ class AccessibilityFusionBuilder:
         t_stage = time.perf_counter()
         feats = self._crop(features, scene)
         timing["crop_s"] = time.perf_counter() - t_stage
+        # DEM samples are evidence points, never pedestrian graph vertices.  A
+        # high-resolution sampler transfers elevation to nearby semantic nodes;
+        # coarse DSM/DEM is deliberately not used for sidewalk-scale grade.
+        elevation_sampler = _ElevationPointSampler(feats, max_resolution_m=5.0)
+        semantic_feats = [f for f in feats if not _is_elevation_only_point(f)]
         nodes: Dict[str, AccessibilityNode] = {}
         node_extra: Dict[str, Dict[str, Any]] = {}
         edges: List[AccessibilityEdge] = []
@@ -908,10 +995,23 @@ class AccessibilityFusionBuilder:
             return f"{kind}:{qx}:{qy}"
 
         def add_node(x: float, y: float, kind: str, source: str, conf: float, fid: str, attrs: Dict[str, Any] | None = None) -> str:
+            attrs2 = dict(attrs or {})
+            if attrs2.get("elevation_m") is None:
+                sample = elevation_sampler.nearest(float(x), float(y))
+                if sample is not None:
+                    attrs2["elevation_m"] = float(sample["elevation_m"])
+                    attrs2["elevation_provenance"] = {
+                        "kind": "derived",
+                        "source": sample["source"],
+                        "method": "nearest_high_resolution_dem_sample",
+                        "match_distance_m": round(float(sample["distance_m"]), 3),
+                        "source_resolution_m": float(sample["resolution_m"]),
+                        "confidence": float(sample["confidence"]),
+                    }
             nid = node_id(x, y, kind if kind in {"entrance", "curb", "curb_ramp", "transit_stop"} else "ped", source, fid)
             if nid not in nodes:
                 nodes[nid] = AccessibilityNode(nid, x, y, kind, conf, None, source, Pose2D(x, y, 0.0, "map"))
-                node_extra[nid] = dict(attrs or {})
+                node_extra[nid] = attrs2
             else:
                 # Keep the more specific kind/source and higher confidence.
                 n = nodes[nid]
@@ -920,14 +1020,14 @@ class AccessibilityFusionBuilder:
                 n.confidence = max(float(n.confidence), float(conf))
                 if source not in str(n.source):
                     n.source = f"{n.source}+{source}"
-                node_extra[nid].update({k: v for k, v in (attrs or {}).items() if v is not None})
+                node_extra[nid].update({k: v for k, v in attrs2.items() if v is not None})
             return nid
 
         routable_linear_kinds = {"sidewalk", "crossing", "path", "steps"}
         point_kinds = {"entrance", "entrance_proxy", "curb", "curb_ramp", "transit_stop", "poi"}
         skipped_linear_kinds: Dict[str, int] = {}
         t_stage = time.perf_counter()
-        for f in feats:
+        for f in semantic_feats:
             if f.is_point:
                 attrs = _node_attrs_from_feature(f)
                 # Entrance proxies are deliberately kept distinct from verified entrances.
@@ -951,13 +1051,23 @@ class AccessibilityFusionBuilder:
                     geom = [[a.x, a.y], [b.x, b.y]]
                     length = math.hypot(b.x - a.x, b.y - a.y)
                     ea = edge_attrs_base
+                    edge_metadata: Dict[str, Any] = {}
                     if ea.get("slope") is None and node_extra.get(previous, {}).get("elevation_m") is not None and node_extra.get(nid, {}).get("elevation_m") is not None:
                         ea = dict(edge_attrs_base)
                         ea["slope"] = abs(float(node_extra[nid]["elevation_m"]) - float(node_extra[previous]["elevation_m"])) / max(length, 0.001)
+                        p0 = node_extra.get(previous, {}).get("elevation_provenance")
+                        p1 = node_extra.get(nid, {}).get("elevation_provenance")
+                        edge_metadata = {"field_provenance": {"slope": {
+                            "kind": "derived",
+                            "source": "high_resolution_dem_endpoint_elevation",
+                            "method": "absolute_endpoint_grade",
+                            "endpoint_elevation_provenance": [p0, p1],
+                            "claim_scope": "terrain_derived_path_grade_not_curb_height",
+                        }}}
                     eid = f"{f.feature_id}:{i-1}:{i}"
-                    edges.append(AccessibilityEdge(eid, previous, nid, max(0.001, length), confidence=f.confidence, geometry=geom, source=f.source, **ea))
+                    edges.append(AccessibilityEdge(eid, previous, nid, max(0.001, length), confidence=f.confidence, geometry=geom, source=f.source, metadata=edge_metadata, **ea))
                     if add_bidirectional and str(f.tags.get("oneway", "")).lower() not in {"yes", "true", "1"}:
-                        edges.append(AccessibilityEdge(eid + ":rev", nid, previous, max(0.001, length), confidence=f.confidence, geometry=list(reversed(geom)), source=f.source, **ea))
+                        edges.append(AccessibilityEdge(eid + ":rev", nid, previous, max(0.001, length), confidence=f.confidence, geometry=list(reversed(geom)), source=f.source, metadata=dict(edge_metadata), **ea))
                 previous = nid
         timing["topology_s"] = time.perf_counter() - t_stage
 
@@ -981,6 +1091,10 @@ class AccessibilityFusionBuilder:
             "pudo_connector_radius_m": pudo_connector_radius_m,
             "node_attributes": node_extra,
             "features_cropped": len(feats),
+            "semantic_features_cropped": len(semantic_feats),
+            "high_resolution_elevation_samples_cropped": elevation_sampler.samples,
+            "coarse_elevation_samples_ignored_for_local_grade": elevation_sampler.skipped_coarse,
+            "dem_point_nodes_inserted": 0,
             "skipped_non_routable_linear_features": skipped_linear_kinds,
             "crop_mode": "lossless_chunked_route_envelope" if scene.route_polyline and scene.corridor_radius_m > 0 else "bbox",
             "corridor_radius_m": float(scene.corridor_radius_m or 0.0),

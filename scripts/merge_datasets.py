@@ -50,13 +50,15 @@ def _episode_ids(dataset_dir: Path) -> List[str]:
     return [str(r["episode_id"]) for r in read_jsonl(dataset_dir / "episodes.jsonl") if r.get("episode_id")]
 
 
-def merge_datasets(input_dirs: List[Path], output_dir: Path, strict: bool = False) -> Dict[str, Any]:
+def merge_datasets(input_dirs: List[Path], output_dir: Path, strict: bool = False, clean_output: bool = False) -> Dict[str, Any]:
     if not input_dirs:
         raise RuntimeError("at least one input dataset is required")
     for d in input_dirs:
         if not (d / "dataset_manifest.json").exists():
             raise RuntimeError(f"input is not a CapPlan dataset directory: {d}")
 
+    if clean_output and output_dir.exists():
+        shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "accessibility_graphs").mkdir(parents=True, exist_ok=True)
 
@@ -136,8 +138,9 @@ def main() -> None:
     p.add_argument("--input_dirs", nargs="+", required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--strict", action="store_true")
+    p.add_argument("--clean_output", action="store_true", help="Remove an existing merged target before copying graphs, preventing stale episodes after allowlist changes.")
     args = p.parse_args()
-    report = merge_datasets([Path(x) for x in args.input_dirs], Path(args.output_dir), strict=args.strict)
+    report = merge_datasets([Path(x) for x in args.input_dirs], Path(args.output_dir), strict=args.strict, clean_output=args.clean_output)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

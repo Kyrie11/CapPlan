@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import subprocess
+import shutil
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -670,6 +671,7 @@ def main() -> None:
     p.add_argument("--episode_allowlist", default=None, help="Optional text/JSON episode-id allowlist for audited paper subsets.")
     p.add_argument("--episode_allowlist_within_max_scenarios", action="store_true", help="The allowlist was derived from this build's first --max_scenarios matching scenes. Keep the first-N adapter limit instead of scanning the full DB split. Intended for hybrid-ready allowlists, not arbitrary paper allowlists.")
     p.add_argument("--output_dir", default="outputs/datasets/synthetic")
+    p.add_argument("--clean_output", action="store_true", help="Remove an existing target dataset directory before writing. Use for deterministic rebuilds to prevent stale graph files from rejected episodes.")
     p.add_argument("--paper_mode", action="store_true", help="Enable publication-grade data gates: no synthetic/proxy fallbacks, no missing core evidence, and real service/profile/fleet inputs required.")
     p.add_argument("--source_policy", choices=["bootstrap", "hybrid", "paper"], default="bootstrap", help="Evidence policy: bootstrap=fail-closed bring-up; hybrid=real geometry/topology plus explicitly simulated missing benchmark truth; paper=audited city evidence only and requires --paper_mode.")
     p.add_argument("--external_source_preflight_json", default=None, help="Optional preflight report from prepare_abilitybench_external.py copied into the dataset manifest for auditability.")
@@ -715,6 +717,8 @@ def main() -> None:
     profile_contracts_by_episode = load_contracts_from_profiles(args.capability_profiles_jsonl, service_requests_by_episode) if args.capability_profiles_jsonl else {}
 
     out = Path(args.output_dir)
+    if args.clean_output and out.exists():
+        shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "accessibility_graphs").mkdir(parents=True, exist_ok=True)
 
@@ -944,7 +948,7 @@ def main() -> None:
         "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files_requested": resolved_db_files, "db_files_expanded": adapter.db_files if args.scene_source == "nuplan" else [], "map_version": args.nuplan_map_version},
         "accessibility_source": args.accessibility_source, "accessibility_graph_dir": args.accessibility_graph_dir, "pudo_source": args.pudo_source, "pudo_evidence_jsonl": args.pudo_evidence_jsonl,
         "paper_mode": bool(args.paper_mode), "source_policy": args.source_policy,
-        "truth_mode": "hybrid_geometry_anchored_simulated_resource_truth_v1" if args.source_policy == "hybrid" else ("audited_city_evidence" if args.source_policy == "paper" else "bootstrap_unknowns_fail_closed"),
+        "truth_mode": "hybrid_geometry_anchored_site_feature_correlated_simulated_resource_truth_v2" if args.source_policy == "hybrid" else ("audited_city_evidence" if args.source_policy == "paper" else "bootstrap_unknowns_fail_closed"),
         "benchmark_ready": bool(args.source_policy in {"hybrid", "paper"}),
         "publication_ready": bool(args.paper_mode and args.source_policy == "paper" and (preflight or {}).get("publication_ready", False)),
         "simulated_values_are_real_city_ground_truth": False if args.source_policy == "hybrid" else None,

@@ -648,11 +648,10 @@ hybrid_ready_allowlists() {
   done
 }
 
-hybrid_build() {
-  # Refresh only the cheap PUDO overlay first.  This picks up evidence-policy
-  # fixes on an interrupted run while reusing the already-built large graph
-  # overlay.  Final membership is then evidence-driven.
-  hybrid_pudo_evidence_only
+hybrid_dataset_build_only() {
+  # Build service/labels/datasets from already-materialized hybrid graph+PUDO.
+  # Kept separate so from-zero/full flows do not regenerate the cheap PUDO
+  # overlay twice after hybrid_evidence has already produced it.
   hybrid_ready_allowlists
   local split
   for split in train val test; do
@@ -661,6 +660,47 @@ hybrid_build() {
       --cities boston+pittsburgh+vegas+singapore \
       --stages preflight,service,dataset,merge
   done
+}
+
+hybrid_build() {
+  # Resume path when the large hybrid graph overlay is already valid: refresh
+  # only the cheap PUDO layer and then rebuild service/labels/datasets.
+  hybrid_pudo_evidence_only
+  hybrid_dataset_build_only
+}
+
+hybrid_reality_refresh() {
+  # Minimal rebuild after hybrid-prior/service semantics changes. Reuse immutable
+  # nuPlan extraction + real accessibility topology + base PUDO candidates, but
+  # regenerate the hybrid graph overlay (static correlated priors), PUDO overlay,
+  # service requests, labels, city datasets and merged train/val/test outputs.
+  hybrid_graph_evidence_only
+  hybrid_build
+}
+
+hybrid_realism_rebuild() {
+  # Recommended rebuild for the 2026-08-23 realism-v3 fix.  Scene extraction,
+  # full nuPlan identity indexes and downloaded external sources are reused.
+  # Base accessibility graphs must be regenerated because DEM samples are now
+  # evidence (<=5 m endpoint elevation -> derived grade) instead of accidental
+  # generic POI graph nodes; PUDO/site/audit/hybrid/service labels therefore
+  # follow the corrected graph semantics.
+  local graph_jobs="${CAP_GRAPH_CITY_JOBS:-2}"
+  local pudo_jobs="${CAP_PUDO_CITY_JOBS:-4}"
+  local split
+  for split in train val test; do
+    runlog "realism_v3_preflight.${split}" python scripts/prepare_abilitybench_external.py \
+      --config "$CONFIG" --split "$split" --source_policy bootstrap \
+      --cities boston+pittsburgh+vegas+singapore --stages preflight
+    run_city_stage_parallel "$split" bootstrap graphs "$graph_jobs" realism_v3_base config
+    run_city_stage_parallel "$split" bootstrap pudo "$pudo_jobs" realism_v3_base config
+    concat_split_pudo "$split" realism_v3_base
+  done
+  build_site_catalogs
+  recover_audit_evidence
+  site_disjoint_eval
+  hybrid_evidence
+  hybrid_dataset_build_only
 }
 
 hybrid_full_build() {
@@ -677,7 +717,7 @@ hybrid_full_build() {
   recover_audit_evidence
   site_disjoint_eval
   hybrid_evidence
-  hybrid_build
+  hybrid_dataset_build_only
 }
 
 hybrid_from_existing() {
@@ -686,7 +726,7 @@ hybrid_from_existing() {
   recover_audit_evidence
   site_disjoint_eval
   hybrid_evidence
-  hybrid_build
+  hybrid_dataset_build_only
 }
 
 rebuild_paper_evidence_full() {
@@ -857,6 +897,8 @@ Stages:
   hybrid-build                         # build benchmark datasets under outputs/datasets/abilitybench_av_hybrid_*
   hybrid-from-existing                 # recommended continuation: source refresh -> recovery -> overlays -> build
   hybrid-full-build                    # complete from-zero four-city train/val/test hybrid benchmark pipeline
+  hybrid-reality-refresh               # Rebuild hybrid priors/service/labels only when base graph semantics are already current
+  hybrid-realism-rebuild               # RECOMMENDED for realism-v3: rebuild base graph/PUDO + downstream hybrid; reuse scene extraction/downloads
   render-audit-packets                # visual rows, or evidence-gap diagnostic packets when visual bucket is empty
   audit-review-bundle                 # small uploadable ZIP under reports/ (no NPZ/full dataset)
   review-source-complete-audits
@@ -911,6 +953,8 @@ case "${1:-}" in
   hybrid-build) hybrid_build ;;
   hybrid-from-existing) hybrid_from_existing ;;
   hybrid-full-build) hybrid_full_build ;;
+  hybrid-reality-refresh) hybrid_reality_refresh ;;
+  hybrid-realism-rebuild) hybrid_realism_rebuild ;;
   render-audit-packets) render_audit_packets ;;
   audit-review-bundle) audit_review_bundle ;;
   review-source-complete-audits) review_source_complete_audits ;;

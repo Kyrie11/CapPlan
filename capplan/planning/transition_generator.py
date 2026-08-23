@@ -41,8 +41,8 @@ class TransitionGenerator:
         out: List[CandidateTransition] = []
 
         for pu in pickups:
-            out.append(self._access_transition(episode_id, graph, origin_anchor, pu))
-            out.append(self._wait_transition(episode_id, pu, vehicle))
+            out.append(self._access_transition(episode_id, graph, origin_anchor, pu, scene_context))
+            out.append(self._wait_transition(episode_id, pu, vehicle, scene_context))
             out.append(self._board_transition(episode_id, pu, vehicle))
 
         for pu in pickups:
@@ -51,14 +51,14 @@ class TransitionGenerator:
                     continue
                 out.append(self._ride_transition(episode_id, pu, do, vehicle, scene_context))
                 out.append(self._alight_transition(episode_id, pu, do, vehicle))
-                out.append(self._egress_transition(episode_id, graph, do, destination_anchor, pu.anchor_id))
+                out.append(self._egress_transition(episode_id, graph, do, destination_anchor, pu.anchor_id, scene_context))
                 out.append(self._destination_transition(episode_id, do, pu.anchor_id, destination_anchor))
 
         if self.config.include_replan:
             out.extend(self._replan_transitions(episode_id, pickups, dropoffs))
         return out
 
-    def _access_transition(self, episode_id: str, graph: AccessibilityGraph, origin_anchor: str, pu: PUDOAnchor) -> CandidateTransition:
+    def _access_transition(self, episode_id: str, graph: AccessibilityGraph, origin_anchor: str, pu: PUDOAnchor, scene_context: Dict[str, Any]) -> CandidateTransition:
         start = origin_anchor
         end = pu.adjacent_ped_node_id or pu.anchor_id
         try:
@@ -67,7 +67,7 @@ class TransitionGenerator:
         except NoAccessiblePathError as e:
             path = {"distance": None, "width": None, "slope": None, "cross_slope": None, "curb_ramp": None, "step_free": None, "surface": None, "obstacle": False, "blockage_risk": 1.0, "confidence": 0.0, "missing_fields": ["path"], "lighting": None, "shelter": None, "path_edge_ids": []}
             tests = TransitionTests(True, False, False, False, True, False, [str(e)])
-        evidence = self._path_evidence("access", path)
+        evidence = self._path_evidence("access", path, scene_context)
         return self._make_transition(
             episode_id,
             f"{episode_id}:access:{origin_anchor}->{pu.anchor_id}",
@@ -85,12 +85,12 @@ class TransitionGenerator:
             metadata={"path_edge_ids": path.get("path_edge_ids", []), "adjacent_ped_node_id": end},
         )
 
-    def _wait_transition(self, episode_id: str, pu: PUDOAnchor, vehicle: VehicleInterface) -> CandidateTransition:
+    def _wait_transition(self, episode_id: str, pu: PUDOAnchor, vehicle: VehicleInterface, scene_context: Dict[str, Any]) -> CandidateTransition:
         blocked = pu.blockage_risk >= 0.85
         evidence = [
             ResourceEvidence("wait_exposure_s", "cumulative", self.config.deterministic_wait_s, sigma=20.0, confidence=pu.dynamic_confidence, source="service_trace"),
             ResourceEvidence("identification_modality", "categorical", list(vehicle.notification_modes), confidence=1.0, source="vehicle_spec"),
-            ResourceEvidence("lighting", "categorical", pu.lighting, confidence=pu.map_confidence, source="curbside_map", missing=pu.lighting is None),
+            ResourceEvidence("lighting", "categorical", self._resolve_lighting(pu.lighting, scene_context), confidence=pu.map_confidence, source="curbside_map+scene_time", missing=pu.lighting is None),
             ResourceEvidence("shelter", "categorical", pu.shelter, confidence=pu.map_confidence, source="curbside_map", missing=pu.shelter is None),
             ResourceEvidence("map_confidence", "lower", pu.map_confidence, sigma=0.02, confidence=pu.map_confidence, source="curbside_map"),
             ResourceEvidence("dynamic_confidence", "lower", pu.dynamic_confidence, sigma=0.02, confidence=pu.dynamic_confidence, source="perception"),
@@ -177,7 +177,7 @@ class TransitionGenerator:
             completion_value=0.82,
         )
 
-    def _egress_transition(self, episode_id: str, graph: AccessibilityGraph, do: PUDOAnchor, destination_anchor: str, pickup_id: str) -> CandidateTransition:
+    def _egress_transition(self, episode_id: str, graph: AccessibilityGraph, do: PUDOAnchor, destination_anchor: str, pickup_id: str, scene_context: Dict[str, Any]) -> CandidateTransition:
         start = do.adjacent_ped_node_id or do.anchor_id
         end = destination_anchor
         try:
@@ -186,7 +186,7 @@ class TransitionGenerator:
         except NoAccessiblePathError as e:
             path = {"distance": None, "width": None, "slope": None, "cross_slope": None, "curb_ramp": None, "step_free": None, "surface": None, "obstacle": False, "blockage_risk": 1.0, "confidence": 0.0, "missing_fields": ["path"], "lighting": None, "shelter": None, "path_edge_ids": []}
             tests = TransitionTests(True, False, False, False, True, False, [str(e)])
-        evidence = self._path_evidence("egress", path)
+        evidence = self._path_evidence("egress", path, scene_context)
         return self._make_transition(
             episode_id,
             f"{episode_id}:egress:{do.anchor_id}->{destination_anchor}:from_{pickup_id}",
@@ -271,7 +271,29 @@ class TransitionGenerator:
             return ResourceEvidence(resource_name, kind, None, observed=observed_value, missing=True, reason=reason or "not_observed", **kwargs)
         return ResourceEvidence(resource_name, kind, value, observed=observed_value, missing=False, **kwargs)
 
-    def _path_evidence(self, phase: str, path: Dict[str, Any]) -> List[ResourceEvidence]:
+    @staticmethod
+    def _resolve_lighting(raw: Any, scene_context: Dict[str, Any]) -> Any:
+        """Resolve static lighting infrastructure against the request local time.
+
+        Hybrid overlays store whether the infrastructure is lit, not an
+        impossible per-edge time-of-day label.  Daylight automatically satisfies
+        lighting requirements; after dark, only lit infrastructure remains lit.
+        If local time is unavailable we preserve the raw evidence.
+        """
+        if raw is None:
+            return None
+        hour = scene_context.get("request_local_hour")
+        try:
+            hour = float(hour)
+        except (TypeError, ValueError):
+            return raw
+        if 7.0 <= hour < 19.0:
+            return "day"
+        norm = str(raw).strip().lower()
+        return "lit" if norm in {"lit", "well_lit", "day_or_lit"} else "unlit"
+
+    def _path_evidence(self, phase: str, path: Dict[str, Any], scene_context: Dict[str, Any] | None = None) -> List[ResourceEvidence]:
+        scene_context = scene_context or {}
         prefix = "access" if phase == "access" else "egress"
         missing = set(path.get("missing_fields") or [])
         conf = path.get("confidence", 0.0)
@@ -283,7 +305,7 @@ class TransitionGenerator:
             self._evidence_or_missing("curb_ramp", "categorical", path.get("curb_ramp"), confidence=conf, source="accessibility_map", missing="curb_ramp" in missing or path.get("curb_ramp") is None, reason="partial_path_curb_ramp_missing" if "curb_ramp" in missing else None),
             self._evidence_or_missing("step_free", "categorical", path.get("step_free"), confidence=conf, source="accessibility_map", missing="step_free" in missing or path.get("step_free") is None, reason="partial_path_step_free_missing" if "step_free" in missing else None),
             self._evidence_or_missing("surface", "categorical", path.get("surface"), confidence=conf, source="accessibility_map", missing="surface" in missing or path.get("surface") is None, reason="partial_path_surface_missing" if "surface" in missing else None),
-            self._evidence_or_missing("lighting", "categorical", path.get("lighting"), confidence=conf, source="accessibility_map", missing=path.get("lighting") is None),
+            self._evidence_or_missing("lighting", "categorical", self._resolve_lighting(path.get("lighting"), scene_context), confidence=conf, source="accessibility_map+scene_time", missing=path.get("lighting") is None),
             self._evidence_or_missing("map_confidence", "lower", path.get("confidence"), sigma=0.02, confidence=conf, source="accessibility_map", missing=path.get("confidence") is None),
             ResourceEvidence("blockage_risk", "probabilistic", path.get("blockage_risk", 0.02), sigma=0.02, confidence=conf, source="perception"),
         ]

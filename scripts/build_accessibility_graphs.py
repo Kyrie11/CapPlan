@@ -25,7 +25,7 @@ from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, Accessib
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 from capplan.utils.build_fingerprint import fingerprint
 
-GRAPH_BUILD_VERSION = "20260821_episode_fingerprint_v4"
+GRAPH_BUILD_VERSION = "20260823_dem_evidence_v5"
 
 try:
     from tqdm.auto import tqdm  # type: ignore
@@ -178,6 +178,10 @@ def _write_graph(out: Path, graph: AccessibilityGraph, compact_storage: bool = F
         "source": (graph.metadata or {}).get("source"),
         "nodes": len(graph.nodes), "edges": len(graph.edges),
         "features_cropped": int((graph.metadata or {}).get("features_cropped", 0) or 0),
+        "semantic_features_cropped": int((graph.metadata or {}).get("semantic_features_cropped", 0) or 0),
+        "high_resolution_elevation_samples_cropped": int((graph.metadata or {}).get("high_resolution_elevation_samples_cropped", 0) or 0),
+        "coarse_elevation_samples_ignored_for_local_grade": int((graph.metadata or {}).get("coarse_elevation_samples_ignored_for_local_grade", 0) or 0),
+        "dem_point_nodes_inserted": int((graph.metadata or {}).get("dem_point_nodes_inserted", 0) or 0),
         "compact_storage": bool(compact_storage),
         "build_version": GRAPH_BUILD_VERSION,
         "build_fingerprint": build_fingerprint,
@@ -386,6 +390,10 @@ def _build_one_graph_episode(scene: Any, builder: AccessibilityFusionBuilder, fe
         "nodes": len(graph.nodes),
         "edges": len(graph.edges),
         "features_cropped": int((graph.metadata or {}).get("features_cropped", 0) or 0),
+        "semantic_features_cropped": int((graph.metadata or {}).get("semantic_features_cropped", 0) or 0),
+        "high_resolution_elevation_samples_cropped": int((graph.metadata or {}).get("high_resolution_elevation_samples_cropped", 0) or 0),
+        "coarse_elevation_samples_ignored_for_local_grade": int((graph.metadata or {}).get("coarse_elevation_samples_ignored_for_local_grade", 0) or 0),
+        "dem_point_nodes_inserted": int((graph.metadata or {}).get("dem_point_nodes_inserted", 0) or 0),
         "build_s": build_s,
         "write_stats": write_stats,
         "graph_timing": graph_timing,
@@ -442,6 +450,10 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
         timing_rows: List[Dict[str, Any]] = []
         total_nodes = 0
         total_edges = 0
+        total_semantic_features_cropped = 0
+        total_high_res_dem_samples_cropped = 0
+        total_coarse_dem_samples_ignored = 0
+        total_dem_point_nodes_inserted = 0
         resumed = 0
         build_breakdown = {"crop_s": 0.0, "topology_s": 0.0, "snap_s": 0.0, "pudo_connector_s": 0.0, "dedupe_s": 0.0, "write_s": 0.0}
         build_started = time.perf_counter()
@@ -449,7 +461,7 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
         progress = None if args.disable_tqdm else tqdm(total=expected_contexts, desc="accessibility graphs", unit="episode", mininterval=1.0, dynamic_ncols=True)
 
         def absorb_result(result: Dict[str, Any]) -> None:
-            nonlocal total_nodes, total_edges
+            nonlocal total_nodes, total_edges, total_semantic_features_cropped, total_high_res_dem_samples_cropped, total_coarse_dem_samples_ignored, total_dem_point_nodes_inserted
             write_stats = result["write_stats"]
             graph_timing = result.get("graph_timing") or {}
             for key in ["crop_s", "topology_s", "snap_s", "pudo_connector_s", "dedupe_s"]:
@@ -460,15 +472,23 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
             episode_ids_out.append(str(result["episode_id"]))
             total_nodes += int(result["nodes"])
             total_edges += int(result["edges"])
+            total_semantic_features_cropped += int(result.get("semantic_features_cropped", 0) or 0)
+            total_high_res_dem_samples_cropped += int(result.get("high_resolution_elevation_samples_cropped", 0) or 0)
+            total_coarse_dem_samples_ignored += int(result.get("coarse_elevation_samples_ignored_for_local_grade", 0) or 0)
+            total_dem_point_nodes_inserted += int(result.get("dem_point_nodes_inserted", 0) or 0)
             if progress is not None:
                 progress.update(1)
                 progress.set_postfix(nodes=result["nodes"], edges=result["edges"], cropped=result["features_cropped"], workers=max(1, worker_count), refresh=False)
 
         def absorb_resume(scene: Any, resume_stats: Dict[str, Any]) -> None:
-            nonlocal total_nodes, total_edges, resumed
+            nonlocal total_nodes, total_edges, total_semantic_features_cropped, total_high_res_dem_samples_cropped, total_coarse_dem_samples_ignored, total_dem_point_nodes_inserted, resumed
             episode_ids_out.append(scene.episode_id)
             total_nodes += int(resume_stats.get("nodes", 0) or 0)
             total_edges += int(resume_stats.get("edges", 0) or 0)
+            total_semantic_features_cropped += int(resume_stats.get("semantic_features_cropped", 0) or 0)
+            total_high_res_dem_samples_cropped += int(resume_stats.get("high_resolution_elevation_samples_cropped", 0) or 0)
+            total_coarse_dem_samples_ignored += int(resume_stats.get("coarse_elevation_samples_ignored_for_local_grade", 0) or 0)
+            total_dem_point_nodes_inserted += int(resume_stats.get("dem_point_nodes_inserted", 0) or 0)
             resumed += 1
             if progress is not None:
                 progress.update(1)
@@ -530,6 +550,11 @@ def build_graphs(args: argparse.Namespace) -> Dict[str, Any]:
             "build_fingerprint": build_fp,
             "fingerprint_scope": "static_evidence_plus_per_episode_route_context",
             "features_loaded": len(features),
+            "semantic_features_cropped_total": total_semantic_features_cropped,
+            "high_resolution_elevation_samples_cropped_total": total_high_res_dem_samples_cropped,
+            "coarse_elevation_samples_ignored_for_local_grade_total": total_coarse_dem_samples_ignored,
+            "dem_point_nodes_inserted_total": total_dem_point_nodes_inserted,
+            "dem_integration_semantics": "<=5m DEM is nearest-sampled onto semantic pedestrian nodes for derived endpoint grade; coarser DEM/DSM is not used as sidewalk-scale grade; DEM samples are never graph vertices",
             "resumed_episodes": resumed,
             "compact_storage": bool(args.compact_storage),
             "elapsed_s": build_elapsed,

@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import random
 import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import yaml
 
@@ -89,15 +93,69 @@ def _load_nodes(graph_dir: Path, eid: str) -> List[AccessibilityNode]:
     return [node_from_dict(x) for x in read_jsonl(f)]
 
 
+def _stable_seed(base: int, *parts: str) -> int:
+    payload = "|".join([str(base), *map(str, parts)]).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & 0x7FFFFFFF
+
+
+def _load_scene_metadata(scene_dataset_dir: str | None) -> Dict[str, Dict[str, Any]]:
+    """Load compact per-episode nuPlan metadata from extracted ``episodes.jsonl``.
+
+    ``scene_dataset_dir`` may be one city directory or the split-level
+    ``scene_contexts`` directory containing city subdirectories.  We read
+    ``episodes.jsonl`` rather than the much larger ``scenes.jsonl`` so service
+    generation stays cheap even for the paper-scale corpus.
+    """
+    if not scene_dataset_dir:
+        return {}
+    root = Path(scene_dataset_dir)
+    if not root.exists():
+        raise FileNotFoundError(root)
+    files = [root / "episodes.jsonl"] if (root / "episodes.jsonl").exists() else sorted(root.glob("**/episodes.jsonl"))
+    out: Dict[str, Dict[str, Any]] = {}
+    for f in files:
+        for row in read_jsonl(f):
+            eid = str(row.get("episode_id") or row.get("scenario_id") or "")
+            if not eid:
+                continue
+            rc = row.get("route_corridor") or (row.get("metadata") or {}).get("route_corridor") or {}
+            out[eid] = {
+                "episode_id": eid,
+                "map_name": row.get("map_name"),
+                "request_time_s": row.get("request_time_s"),
+                "route_corridor": rc,
+                "source_file": str(f),
+            }
+    return out
+
+
+def _route_polyline(scene_meta: Mapping[str, Any] | None) -> List[Tuple[float, float]]:
+    if not scene_meta:
+        return []
+    rc = scene_meta.get("route_corridor") if isinstance(scene_meta.get("route_corridor"), Mapping) else {}
+    out: List[Tuple[float, float]] = []
+    for pt in (rc.get("polyline") or []):
+        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+            try:
+                out.append((float(pt[0]), float(pt[1])))
+            except Exception:
+                pass
+    return out
+
+
+def _dist(a: AccessibilityNode, xy: Tuple[float, float]) -> float:
+    return math.hypot(float(a.x) - float(xy[0]), float(a.y) - float(xy[1]))
+
+
 def _entrance_nodes(
     nodes: Sequence[AccessibilityNode],
-    allow_non_entrance_od: bool = False,
     trusted_source_tokens: Sequence[str] | None = None,
+    *,
+    require_minimum: bool = True,
 ) -> List[AccessibilityNode]:
-    # Bootstrap diagnostics may use a mapped transit stop as an OD-like anchor,
-    # but paper mode is explicitly entrance-to-entrance.  When trusted-source
-    # filtering is enabled (the paper path), do not silently promote a
-    # transit_stop into origin/destination entrance truth.
+    # A transit stop is a useful service anchor in hybrid/bootstrap mode, but
+    # paper mode keeps the stricter entrance-only semantics through
+    # trusted-source filtering.
     allowed_kinds = {"entrance", "origin_entrance", "destination_entrance"}
     if trusted_source_tokens is None:
         allowed_kinds.add("transit_stop")
@@ -105,15 +163,212 @@ def _entrance_nodes(
     if trusted_source_tokens is not None:
         tokens = [str(x).lower() for x in trusted_source_tokens]
         entrances = [n for n in entrances if any(t in str(n.source or "").lower() for t in tokens)]
-    if len(entrances) >= 2:
+    if len(entrances) >= 2 or not require_minimum:
         return entrances
-    if allow_non_entrance_od:
-        fallback = [n for n in nodes if n.kind in {"sidewalk", "crossing", "curb", "curb_ramp", "pudo"}]
-        if len(fallback) >= 2:
-            return fallback
     qualifier = "trusted audited " if trusted_source_tokens is not None else "real "
-    raise RuntimeError(f"service layer generation requires at least two {qualifier}entrance nodes per episode; use --allow_non_entrance_od only for bootstrap diagnostics, not paper experiments")
+    raise RuntimeError(f"service layer generation requires at least two {qualifier}entrance nodes per episode")
 
+
+def _entrance_proxy_nodes(nodes: Sequence[AccessibilityNode]) -> List[AccessibilityNode]:
+    """Building/address-linked candidate points usable only as hybrid anchors.
+
+    ``entrance_proxy`` nodes are not promoted to observed entrance truth.  They
+    merely help choose a nearby connected sidewalk node when the city data lacks
+    a verified doorway, keeping the constructed request close to plausible
+    building frontage rather than an arbitrary point along the route.
+    """
+    return [n for n in nodes if n.kind == "entrance_proxy"]
+
+
+def _frontage_nodes(nodes: Sequence[AccessibilityNode]) -> List[AccessibilityNode]:
+    """Return physically plausible *access points* for synthetic hybrid OD.
+
+    We intentionally do not use curb/crossing/PUDO vertices as entrances.  A
+    sidewalk vertex is interpreted as the public-realm access point immediately
+    outside a constructed building entrance.  The building-door geometry itself
+    is not claimed to have been observed.
+    """
+    good = []
+    for n in nodes:
+        if n.kind != "sidewalk":
+            continue
+        src = str(n.source or "").lower()
+        # Hybrid source geometry must still be anchored in a real/curated map.
+        if src.startswith("synthetic") or "mock" in src or "toy" in src:
+            continue
+        good.append(n)
+    return good
+
+
+def _nearest_distinct(candidates: Sequence[AccessibilityNode], xy: Tuple[float, float], avoid: str | None = None) -> AccessibilityNode | None:
+    pool = [n for n in candidates if n.node_id != avoid]
+    return min(pool, key=lambda n: (_dist(n, xy), n.node_id)) if pool else None
+
+
+def _farthest_from(candidates: Sequence[AccessibilityNode], origin: AccessibilityNode) -> AccessibilityNode | None:
+    pool = [n for n in candidates if n.node_id != origin.node_id]
+    return max(pool, key=lambda n: ((n.x-origin.x)**2 + (n.y-origin.y)**2, n.node_id)) if pool else None
+
+
+def _frontage_near_route_or_proxy(
+    nodes: Sequence[AccessibilityNode],
+    route_xy: Tuple[float, float],
+    *,
+    avoid: str | None = None,
+    max_proxy_route_distance_m: float = 250.0,
+    max_proxy_frontage_distance_m: float = 80.0,
+) -> Tuple[AccessibilityNode | None, str, Dict[str, Any]]:
+    frontage = _frontage_nodes(nodes)
+    proxies = _entrance_proxy_nodes(nodes)
+    proxy = _nearest_distinct(proxies, route_xy)
+    if proxy is not None and _dist(proxy, route_xy) <= max_proxy_route_distance_m:
+        f = _nearest_distinct(frontage, (proxy.x, proxy.y), avoid=avoid)
+        if f is not None:
+            d = math.hypot(f.x-proxy.x, f.y-proxy.y)
+            if d <= max_proxy_frontage_distance_m:
+                return f, "simulated_frontage_from_entrance_proxy", {
+                    "entrance_proxy_node_id": proxy.node_id,
+                    "entrance_proxy_source": proxy.source,
+                    "proxy_to_frontage_m": round(d, 3),
+                    "proxy_to_route_endpoint_m": round(_dist(proxy, route_xy), 3),
+                }
+    f = _nearest_distinct(frontage, route_xy, avoid=avoid)
+    return f, "simulated_frontage_access_point", {}
+
+
+def _choose_realistic_od(
+    nodes: Sequence[AccessibilityNode],
+    scene_meta: Mapping[str, Any] | None,
+    rng: random.Random,
+    *,
+    allow_non_entrance_od: bool,
+    trusted_source_tokens: Sequence[str] | None,
+    max_entrance_route_distance_m: float,
+    min_od_separation_m: float,
+) -> Tuple[AccessibilityNode, AccessibilityNode, Dict[str, Any]]:
+    """Choose OD anchored to nuPlan route endpoints and mapped pedestrian space.
+
+    Real entrance/transit nodes are preferred when they are close to the route
+    endpoints.  When the hybrid branch lacks one, we use the nearest *sidewalk
+    frontage access point* as the request-level entrance anchor.  This is a
+    transparent simulated service anchor, not a claim that a building doorway
+    was measured at that coordinate.
+    """
+    route = _route_polyline(scene_meta)
+    entrances = _entrance_nodes(nodes, trusted_source_tokens=trusted_source_tokens, require_minimum=False)
+    if not route:
+        if len(entrances) >= 2:
+            o = rng.choice(entrances); d = _farthest_from(entrances, o) or rng.choice([x for x in entrances if x.node_id != o.node_id])
+            return o, d, {"origin_kind": "observed_entrance", "destination_kind": "observed_entrance", "method": "mapped_entrance_fallback_without_route"}
+        if not allow_non_entrance_od:
+            raise RuntimeError("service layer requires at least two trusted entrance nodes when route context is unavailable")
+        frontage = _frontage_nodes(nodes)
+        if len(frontage) < 2:
+            raise RuntimeError("hybrid service layer requires at least two real-map sidewalk frontage nodes when mapped entrances are unavailable")
+        o = rng.choice(frontage); d = _farthest_from(frontage, o)
+        assert d is not None
+        return o, d, {"origin_kind": "simulated_frontage_access_point", "destination_kind": "simulated_frontage_access_point", "method": "frontage_fallback_without_route"}
+
+    start_xy, end_xy = route[0], route[-1]
+    o_real = _nearest_distinct(entrances, start_xy)
+    d_real = _nearest_distinct(entrances, end_xy, avoid=o_real.node_id if o_real else None)
+    o_use_real = o_real is not None and _dist(o_real, start_xy) <= max_entrance_route_distance_m
+    d_use_real = d_real is not None and _dist(d_real, end_xy) <= max_entrance_route_distance_m
+
+    frontage = _frontage_nodes(nodes) if allow_non_entrance_od and (not o_use_real or not d_use_real) else []
+    o_extra: Dict[str, Any] = {}
+    d_extra: Dict[str, Any] = {}
+    if not o_use_real:
+        if not allow_non_entrance_od:
+            raise RuntimeError(f"no trusted entrance within {max_entrance_route_distance_m:.1f} m of nuPlan route origin")
+        o, o_kind, o_extra = _frontage_near_route_or_proxy(
+            nodes, start_xy, max_proxy_route_distance_m=max_entrance_route_distance_m
+        )
+    else:
+        o = o_real; o_kind = "observed_entrance"
+    if o is None:
+        raise RuntimeError("no physically anchored origin access point available")
+
+    if not d_use_real:
+        if not allow_non_entrance_od:
+            raise RuntimeError(f"no trusted entrance within {max_entrance_route_distance_m:.1f} m of nuPlan route destination")
+        d, d_kind, d_extra = _frontage_near_route_or_proxy(
+            nodes, end_xy, avoid=o.node_id, max_proxy_route_distance_m=max_entrance_route_distance_m
+        )
+    else:
+        d = d_real; d_kind = "observed_entrance"
+    if d is None:
+        pool = entrances if len(entrances) >= 2 else frontage
+        d = _farthest_from(pool, o)
+        d_kind = "observed_entrance" if d in entrances else "simulated_frontage_access_point"
+    if d is None:
+        raise RuntimeError("no physically anchored destination access point available")
+
+    sep = math.hypot(d.x-o.x, d.y-o.y)
+    if sep < min_od_separation_m:
+        # Preserve route anchoring where possible, but avoid degenerate OD pairs.
+        pool = list(entrances) + [n for n in frontage if n.node_id not in {x.node_id for x in entrances}]
+        far = _farthest_from(pool, o)
+        if far is not None and math.hypot(far.x-o.x, far.y-o.y) > sep:
+            d = far
+            d_kind = "observed_entrance" if far in entrances else "simulated_frontage_access_point"
+            sep = math.hypot(d.x-o.x, d.y-o.y)
+
+    prov = {
+        "origin_kind": o_kind,
+        "destination_kind": d_kind,
+        "method": "nuplan_route_endpoint_to_mapped_entrance_or_frontage",
+        "route_origin_distance_m": round(_dist(o, start_xy), 3),
+        "route_destination_distance_m": round(_dist(d, end_xy), 3),
+        "od_euclidean_separation_m": round(sep, 3),
+        "claim_scope": "request_level_benchmark_anchor_not_measured_building_door" if "simulated" in (o_kind+d_kind) else "mapped_entrance_anchor",
+        "origin_proxy_context": o_extra,
+        "destination_proxy_context": d_extra,
+    }
+    return o, d, prov
+
+
+def _local_time_metadata(request_time_s: float, map_name: str | None) -> Dict[str, Any]:
+    tz_name = {
+        "us-ma-boston": "America/New_York",
+        "us-pa-pittsburgh-hazelwood": "America/New_York",
+        "us-nv-las-vegas-strip": "America/Los_Angeles",
+        "sg-one-north": "Asia/Singapore",
+    }.get(str(map_name or ""))
+    if request_time_s >= 10_000_000 and tz_name:
+        try:
+            dt = datetime.fromtimestamp(request_time_s, ZoneInfo(tz_name))
+            return {"timezone": tz_name, "local_hour": round(dt.hour + dt.minute/60.0, 3), "local_iso": dt.isoformat()}
+        except Exception:
+            pass
+    hour = (request_time_s % 86400.0) / 3600.0
+    return {"timezone": tz_name or "unknown", "local_hour": round(hour, 3), "local_iso": None}
+
+
+def _curb_side_for_map(map_name: str | None) -> str:
+    return "left" if str(map_name or "") == "sg-one-north" else "right"
+
+
+def _select_vehicle_id(fleet_jsonl: str | None, eid: str, map_name: str | None, seed: int) -> Tuple[str | None, Dict[str, Any]]:
+    if not fleet_jsonl:
+        return None, {}
+    fleet = load_fleet_interfaces(fleet_jsonl)
+    vehicles = fleet.get(eid) or fleet.get("*") or []
+    if not vehicles:
+        return None, {}
+    curb_side = _curb_side_for_map(map_name)
+    compatible = [v for v in vehicles if v.door_side in {curb_side, "both"} or curb_side in set(v.boarding_sides or [])]
+    pool = compatible or vehicles
+    # Deterministic per episode, deliberately diverse across the benchmark.
+    idx = _stable_seed(seed, eid, "primary_vehicle") % len(pool)
+    v = sorted(pool, key=lambda x: x.vehicle_id)[idx]
+    return v.vehicle_id, {
+        "vehicle_assignment_method": "deterministic_city_curb_side_compatible_hybrid_fleet",
+        "city_curb_side": curb_side,
+        "vehicle_door_side": v.door_side,
+        "vehicle_fleet_type": v.fleet_type,
+        "vehicle_source": (v.metadata or {}).get("source"),
+    }
 
 def _three_layer_profiles(source: str = "calibrated_three_layer_profiles") -> List[Dict[str, Any]]:
     """Functional planning profiles, not demographic labels."""
@@ -159,7 +414,7 @@ def _three_layer_profiles(source: str = "calibrated_three_layer_profiles") -> Li
             },
             "wait": {"max_wait_exposure_s": 600.0, "shelter_required": False, "min_lighting": "day_or_lit", "identification_modalities_any_of": ["visual", "audio", "app", "haptic"]},
             "interface": {
-                "preferred_door_side": "right",
+                "preferred_door_side": "curb_side",
                 "min_door_width_m": 0.82,
                 "min_deployment_clearance_m": 1.2,
                 "boarding_any_of": [{"ramp": True}, {"lift": True}, {"low_floor": True, "kneeling": True, "curb_height_m_max": 0.06}],
@@ -188,7 +443,7 @@ def _three_layer_profiles(source: str = "calibrated_three_layer_profiles") -> Li
             },
             "wait": {"max_wait_exposure_s": 420.0, "shelter_required": True, "min_lighting": "lit", "identification_modalities_any_of": ["audio", "haptic", "app"]},
             "interface": {
-                "preferred_door_side": "right",
+                "preferred_door_side": "curb_side",
                 "min_door_width_m": 0.90,
                 "min_deployment_clearance_m": 1.4,
                 "boarding_any_of": [{"ramp": True}, {"lift": True}],
@@ -198,15 +453,6 @@ def _three_layer_profiles(source: str = "calibrated_three_layer_profiles") -> Li
             "uncertainty": {"min_map_confidence": 0.80, "max_blockage_risk": 0.25, "max_deployment_risk": 0.15, "beta_tau": 1.5, "missing_policy": "fail_closed"},
         },
     ]
-
-
-def _choose_od(entrances: Sequence[AccessibilityNode], rng: random.Random) -> Tuple[AccessibilityNode, AccessibilityNode]:
-    if len(entrances) < 2:
-        raise RuntimeError("at least two entrances are required")
-    origin = rng.choice(list(entrances))
-    candidates = [e for e in entrances if e.node_id != origin.node_id]
-    destination = max(candidates, key=lambda e: (e.x - origin.x) ** 2 + (e.y - origin.y) ** 2) if rng.random() < 0.5 else rng.choice(candidates)
-    return origin, destination
 
 
 def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -221,8 +467,7 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
         if not episode_ids:
             raise RuntimeError(f"episode allowlist {args.episode_allowlist} has no episodes present in {graph_dir}")
     profile_ids = [str(p["profile_id"]) for p in profiles]
-    profile_mix = cfg.get("profile_mix") or profile_ids
-    profile_mix = [str(x) for x in profile_mix]
+    profile_mix = [str(x) for x in (cfg.get("profile_mix") or profile_ids)]
     if len(set(profile_mix)) != len(profile_mix):
         raise RuntimeError("profile_mix must contain unique profile ids; duplicate profiles would create duplicate passenger contracts within an episode")
     if args.num_requests_per_episode > len(profile_mix):
@@ -234,23 +479,38 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
     purposes = cfg.get("trip_purposes") or ["medical", "work", "shopping", "social", "other"]
     request_time_start = float(cfg.get("request_time_start_s", 8 * 3600))
     request_time_span = float(cfg.get("request_time_span_s", 12 * 3600))
-    rng = random.Random(args.seed)
+    max_entrance_route_distance_m = float(cfg.get("max_entrance_route_distance_m", 250.0))
+    min_od_separation_m = float(cfg.get("min_od_separation_m", 80.0))
+    scene_meta = _load_scene_metadata(args.scene_dataset_dir)
     rows: List[Dict[str, Any]] = []
     trusted_tokens = None
     if args.require_trusted_entrances:
         trusted_tokens = ["reviewed_audit:", "manual_audit:"] + list(args.trusted_entrance_source or [])
     for eid in episode_ids:
+        rng = random.Random(_stable_seed(args.seed, eid, "service_request"))
         nodes = _load_nodes(graph_dir, str(eid))
-        entrances = _entrance_nodes(nodes, allow_non_entrance_od=args.allow_non_entrance_od, trusted_source_tokens=trusted_tokens)
-        # AbilityBench counterfactuals intentionally keep the traffic scene and
-        # passenger OD fixed while changing only the capability contract. The
-        # previous code sampled a fresh OD for every profile, which made T4
-        # impossible to interpret and conflicted with build_dataset.py (which
-        # binds one OD per scene episode).
-        o, d = _choose_od(entrances, rng)
-        request_time_s = round(request_time_start + rng.random() * request_time_span, 3)
+        emeta = scene_meta.get(eid, {})
+        o, d, od_prov = _choose_realistic_od(
+            nodes, emeta, rng,
+            allow_non_entrance_od=args.allow_non_entrance_od,
+            trusted_source_tokens=trusted_tokens,
+            max_entrance_route_distance_m=max_entrance_route_distance_m,
+            min_od_separation_m=min_od_separation_m,
+        )
+        raw_scene_time = emeta.get("request_time_s")
+        try:
+            request_time_s = float(raw_scene_time)
+            if not math.isfinite(request_time_s) or request_time_s <= 0:
+                raise ValueError
+            request_time_source = "nuplan_scene_timestamp"
+        except Exception:
+            request_time_s = round(request_time_start + rng.random() * request_time_span, 3)
+            request_time_source = "deterministic_city_agnostic_time_prior"
+        time_meta = _local_time_metadata(request_time_s, emeta.get("map_name"))
+        vehicle_id, vehicle_meta = _select_vehicle_id(args.fleet_jsonl, eid, emeta.get("map_name"), args.seed)
         cf_group_id = f"{eid}:cf_od0"
         base_profile_id = str(cfg.get("counterfactual_base_profile_id") or profile_mix[0])
+        hybrid_proxy = str(od_prov.get("origin_kind") or "").startswith("simulated_frontage") or str(od_prov.get("destination_kind") or "").startswith("simulated_frontage")
         for i in range(args.num_requests_per_episode):
             pid = str(profile_mix[i])
             if pid not in profile_ids:
@@ -260,31 +520,39 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
             relation = str(pmeta.get("counterfactual_relation") or "stricter_or_equal")
             if relation not in {"stricter_or_equal", "different_modality", "different_interface"}:
                 raise RuntimeError(f"profile {pid} has unsupported counterfactual_relation={relation!r}")
-            rows.append({
+            row = {
                 "request_id": f"{eid}:req_{i:04d}",
                 "episode_id": str(eid),
                 "origin_entrance_id": o.node_id,
                 "destination_entrance_id": d.node_id,
-                "origin_confidence": o.confidence,
-                "destination_confidence": d.confidence,
+                "origin_confidence": min(float(o.confidence), 0.72 if str(od_prov.get("origin_kind") or "").startswith("simulated_frontage") else 1.0),
+                "destination_confidence": min(float(d.confidence), 0.72 if str(od_prov.get("destination_kind") or "").startswith("simulated_frontage") else 1.0),
                 "request_time_s": request_time_s,
+                "request_time_source": request_time_source,
+                "request_local_hour": time_meta.get("local_hour"),
+                "request_timezone": time_meta.get("timezone"),
+                "request_local_iso": time_meta.get("local_iso"),
                 "passenger_profile_id": pid,
                 "trip_purpose": purposes[i % len(purposes)],
                 "party_size": 1,
                 "demand_weight": float(cfg.get("default_demand_weight", 1.0)),
                 "modifiers": dict(cfg.get("modifiers", {})),
                 "source": args.source_name,
+                "map_name": emeta.get("map_name"),
+                "vehicle_id": vehicle_id,
                 "counterfactual_group_id": cf_group_id,
                 "counterfactual_role": "base" if is_base else "variant",
                 "counterfactual_base_profile_id": base_profile_id,
                 "counterfactual_axis": pmeta.get("counterfactual_axis") or ("base" if is_base else pmeta.get("archetype")),
                 "counterfactual_relation": relation,
                 "expected_monotonic": bool(pmeta.get("expected_monotonic", not is_base and relation == "stricter_or_equal")),
-                "bootstrap_non_entrance_od": bool(args.allow_non_entrance_od and o.kind not in {"entrance", "origin_entrance", "destination_entrance", "transit_stop"}),
-            })
+                "bootstrap_non_entrance_od": bool(args.allow_non_entrance_od and hybrid_proxy),
+                "hybrid_frontage_proxy_od": bool(args.source_policy == "hybrid" and hybrid_proxy),
+                "od_provenance": {**od_prov, "kind": "simulated" if hybrid_proxy else "observed_or_derived", "source": "nuplan_route+prepared_accessibility_graph"},
+                **vehicle_meta,
+            }
+            rows.append(row)
     return rows
-
-
 def _validate_refs(rows: List[Dict[str, Any]], profiles: List[Dict[str, Any]], fleet_jsonl: str | None) -> tuple[int, int]:
     profile_ids = {str(p.get("profile_id") or p.get("passenger_id")) for p in profiles}
     missing_profiles = sorted({str(r.get("passenger_profile_id")) for r in rows} - profile_ids)
@@ -350,6 +618,11 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
         "unique_output_episodes": len({str(r.get("episode_id")) for r in rows}),
         "require_trusted_entrances": bool(args.require_trusted_entrances),
         "trusted_entrance_source_tokens": (["reviewed_audit:", "manual_audit:"] + list(args.trusted_entrance_source or [])) if args.require_trusted_entrances else [],
+        "source_policy": args.source_policy,
+        "od_provenance_counts": {k: sum(1 for r in rows if str((r.get("od_provenance") or {}).get("kind")) == k) for k in ["observed_or_derived", "simulated"]},
+        "frontage_proxy_request_count": sum(1 for r in rows if bool(r.get("hybrid_frontage_proxy_od"))),
+        "request_time_source_counts": {k: sum(1 for r in rows if str(r.get("request_time_source")) == k) for k in sorted({str(r.get("request_time_source")) for r in rows})},
+        "vehicle_assignment_counts": {k: sum(1 for r in rows if str(r.get("vehicle_id")) == k) for k in sorted({str(r.get("vehicle_id")) for r in rows if r.get("vehicle_id")})},
     }
     if args.report_json:
         dump_json(args.report_json, report)
@@ -358,7 +631,8 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Build calibrated passenger service requests and three-layer capability profiles for AbilityBench-AV.")
-    p.add_argument("--scene_dataset_dir", default=None)
+    p.add_argument("--scene_dataset_dir", default=None, help="City scene directory or split-level scene_contexts root; used to anchor OD and request time to nuPlan.")
+    p.add_argument("--source_policy", choices=["bootstrap", "hybrid", "paper"], default="bootstrap")
     p.add_argument("--accessibility_graph_dir", default=None)
     p.add_argument("--demand_sources_config", default=None, help="YAML/JSON with optional service_requests or OD sampling settings/profile mix.")
     p.add_argument("--service_requests_jsonl", default=None, help="Materialized real/calibrated service requests; if omitted, requests are sampled from graph entrances.")
@@ -369,7 +643,7 @@ def main() -> None:
     p.add_argument("--num_requests_per_episode", type=int, default=3)
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--source_name", default="calibrated_service_layer")
-    p.add_argument("--allow_non_entrance_od", action="store_true", help="Bootstrap-only: sample OD from sidewalk/curb nodes if entrance nodes are absent. Not valid for paper-mode datasets.")
+    p.add_argument("--allow_non_entrance_od", action="store_true", help="Bootstrap/hybrid only: if mapped entrances are unavailable near route endpoints, use a real-map sidewalk frontage access point with explicit simulated OD provenance. Never valid for paper-mode datasets.")
     p.add_argument("--episode_allowlist", default=None, help="Optional text/JSON episode-id allowlist. Paper builds should use an allowlist selected from audited PUDO + entrance evidence instead of forcing every nuPlan scenario into the main-result set.")
     p.add_argument("--require_trusted_entrances", action="store_true", help="Restrict O/D sampling to independently audited/trusted entrance nodes. Manual/reviewed-audit sources are trusted by default.")
     p.add_argument("--trusted_entrance_source", action="append", default=[], help="Additional trusted entrance source substring; repeat as needed.")

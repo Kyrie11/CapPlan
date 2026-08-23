@@ -54,6 +54,10 @@ quality:
   min_episode_pudo_coverage_rate: 0.80
 
 service:
+  # Hybrid benchmark fleet is intentionally separate from the strict paper fleet.
+  # Values are plausible simulated interface specifications with explicit
+  # provenance; they are not manufacturer/site ground truth.
+  hybrid_fleet: "{project_root}/configs/fleet.abilitybench.hybrid.jsonl"
   # Eight same-scene/same-OD contracts: one base plus seven stricter variants
   # covering the axes used by the paper's T4 counterfactual experiment.
   capability_profiles: "{project_root}/configs/capability_profiles.counterfactual.yaml"

@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl, write_jsonl
 
-VERSION = "abilitybench_hybrid_pudo_v2_20260823"
+VERSION = "abilitybench_hybrid_pudo_v3_20260823"
 PHYSICAL_FIELDS = ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp")
 REQUIRED_FIELDS = (*PHYSICAL_FIELDS, "legal_stop", "legal_basis", "side", "adjacent_ped_node_id")
 
@@ -177,97 +177,242 @@ def _profile(city: str) -> Dict[str, Any]:
     if city == "singapore":
         return {
             "name": "SG_physically_plausible_accessibility_prior_v1",
-            "positive_sidewalk": (1.55, 3.20),
+            "positive_sidewalk": (1.35, 3.20),
             "positive_clearance": (1.55, 2.20),
-            "narrow_sidewalk": (0.85, 1.25),
-            "narrow_clearance": (0.65, 1.05),
+            "narrow_sidewalk": (0.80, 1.20),
+            "narrow_clearance": (0.65, 1.10),
             "standard_reference": "Singapore BCA Code on Accessibility 2025 used as design-context reference; numeric simulation ranges are benchmark priors, not site measurements.",
         }
     return {
         "name": "US_accessible_loading_geometry_prior_v1",
-        "positive_sidewalk": (1.70, 3.40),
+        "positive_sidewalk": (1.20, 3.40),
         "positive_clearance": (1.55, 2.25),
-        "narrow_sidewalk": (0.85, 1.30),
+        "narrow_sidewalk": (0.75, 1.10),
         "narrow_clearance": (0.65, 1.10),
         "standard_reference": "ADA/PROWAG passenger-loading access aisle 60 in (1.525 m) used as a plausibility lower-bound for accessible simulated loading scenarios; not a claim about the mapped site.",
     }
 
 
-def _scenario_for(rng: random.Random) -> str:
+def _xy(row: Mapping[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    x = _as_float(row.get("x")); y = _as_float(row.get("y"))
+    if x is not None and y is not None:
+        return x, y
+    pose = row.get("curb_pose") if isinstance(row.get("curb_pose"), Mapping) else {}
+    return _as_float(pose.get("x")), _as_float(pose.get("y"))
+
+
+def _site_key(row: Mapping[str, Any], city: str, radius_m: float = 5.0) -> str:
+    """Stable physical-site key shared across episodes and official splits.
+
+    Static simulated curb/interface facts must not flip just because the same
+    curb is observed in another nuPlan snapshot.  Prefer the stable adjacent
+    pedestrian node and include a 5 m geometry cell as a guard.
+    """
+    x, y = _xy(row)
+    q = "unknown"
+    if x is not None and y is not None:
+        q = f"{round(x/max(radius_m,0.1))}:{round(y/max(radius_m,0.1))}"
+    ped = str(row.get("adjacent_ped_node_id") or "")
+    lane = str(row.get("lane_id") or row.get("roadblock_id") or "")
+    return f"{city}|{ped or 'no_ped'}|{lane or 'no_lane'}|{q}"
+
+
+def _static_site_class(rng: random.Random) -> str:
+    # Most urban curb candidates remain operationally usable; the minority of
+    # coherent negative sites create T4/T5 counterfactual pressure without an
+    # IID negative on every nearby anchor.
     u = rng.random()
-    if u < 0.45: return "accessible_loading"
-    if u < 0.60: return "narrow_clearance"
-    if u < 0.72: return "no_curb_ramp"
-    if u < 0.80: return "high_curb"
-    if u < 0.90: return "simulated_loading_prohibited"
-    return "temporary_blockage"
+    if u < 0.78: return "accessible_loading"
+    if u < 0.85: return "narrow_clearance"
+    if u < 0.90: return "no_curb_ramp"
+    if u < 0.94: return "high_curb"
+    return "simulated_loading_prohibited"
 
 
-def _fill_missing(row: MutableMapping[str, Any], prov: MutableMapping[str, Any], *, city: str, split: str, scenario: str, seed_value: int, profile: Mapping[str, Any]) -> None:
-    rng = random.Random(seed_value)
+def _observed_site_class(row: Mapping[str, Any]) -> Optional[str]:
+    """Return a site class forced by real/derived evidence, if any.
+
+    The hybrid prior must complete missing facts *around* observed evidence, not
+    sample a contradictory latent class.  The precedence is conservative:
+    explicit prohibition > high curb > narrow interface > missing ramp >
+    observed accessible ramp/flush curb.
+    """
+    legal = _as_bool(row.get("legal_stop"))
+    curb_h = _as_float(row.get("curb_height_m"))
+    sw = _as_float(row.get("sidewalk_width_m"))
+    cl = _as_float(row.get("deployment_clearance_m"))
+    ramp = _as_bool(row.get("curb_ramp"))
+    if legal is False:
+        return "simulated_loading_prohibited"
+    if curb_h is not None and curb_h >= 0.18:
+        return "high_curb"
+    if (sw is not None and sw < 1.20) or (cl is not None and cl < 1.20):
+        return "narrow_clearance"
+    if ramp is False:
+        return "no_curb_ramp"
+    if ramp is True or (curb_h is not None and curb_h <= 0.04):
+        return "accessible_loading"
+    return None
+
+
+def _resolve_site_class(observed: Iterable[str], rng: random.Random) -> str:
+    """Resolve one physical-site latent class shared across snapshots."""
+    forced = set(observed)
+    for cls in (
+        "simulated_loading_prohibited",
+        "high_curb",
+        "narrow_clearance",
+        "no_curb_ramp",
+        "accessible_loading",
+    ):
+        if cls in forced:
+            return cls
+    return _static_site_class(rng)
+
+
+def _scenario_from_row(row: Mapping[str, Any]) -> str:
+    legal = _as_bool(row.get("legal_stop"))
+    blocked = float(row.get("blockage_risk") or 0.0) >= 0.85
+    curb_h = _as_float(row.get("curb_height_m"))
+    sw = _as_float(row.get("sidewalk_width_m"))
+    cl = _as_float(row.get("deployment_clearance_m"))
+    ramp = _as_bool(row.get("curb_ramp"))
+    if legal is False:
+        base = "simulated_or_observed_loading_prohibited"
+    elif curb_h is not None and curb_h >= 0.18:
+        base = "high_curb"
+    elif ramp is False:
+        base = "no_curb_ramp"
+    elif (sw is not None and sw < 1.20) or (cl is not None and cl < 1.20):
+        base = "narrow_clearance"
+    else:
+        base = "accessible_loading"
+    return base + ("+temporary_blockage" if blocked else "")
+
+def _default_curb_side(city: str) -> str:
+    # Singapore keeps left; the three US nuPlan cities keep right.  This is a
+    # traffic-side prior only when map geometry did not already determine side.
+    return "left" if city == "singapore" else "right"
+
+
+def _fill_missing(
+    row: MutableMapping[str, Any],
+    prov: MutableMapping[str, Any],
+    *,
+    city: str,
+    split: str,
+    site_class: str,
+    site_seed: int,
+    dynamic_seed: int,
+    site_key: str,
+    profile: Mapping[str, Any],
+) -> None:
+    static_rng = random.Random(site_seed)
+    dyn_rng = random.Random(dynamic_seed)
     profile_name = str(profile["name"])
+    eid = str(row.get("episode_id")); aid = str(row.get("anchor_id") or row.get("pudo_id"))
 
-    def put(field: str, value: Any, method: str) -> None:
+    def put_static(field: str, value: Any, method: str) -> None:
         if row.get(field) is None or _blank(row.get(field)) or (field == "side" and str(row.get(field)).lower() == "unknown"):
             row[field] = value
-            prov[field] = _sim_prov(city, split, str(row.get("episode_id")), str(row.get("anchor_id") or row.get("pudo_id")), field, seed_value, profile_name, method)
+            pv = _sim_prov(city, split, eid, aid, field, site_seed, profile_name, method)
+            pv.update({"physical_site_key": site_key, "correlation_scope": "physical_site_across_splits"})
+            prov[field] = pv
 
-    accessible_geometry = scenario not in {"narrow_clearance", "no_curb_ramp", "high_curb"}
-    if scenario == "narrow_clearance":
+    def put_dynamic(field: str, value: Any, method: str) -> None:
+        if row.get(field) is None or _blank(row.get(field)):
+            row[field] = value
+            pv = _sim_prov(city, split, eid, aid, field, dynamic_seed, profile_name, method)
+            pv.update({"physical_site_key": site_key, "correlation_scope": "episode_time_at_physical_site"})
+            prov[field] = pv
+
+    if site_class == "narrow_clearance":
         sw_lo, sw_hi = profile["narrow_sidewalk"]
         cl_lo, cl_hi = profile["narrow_clearance"]
     else:
         sw_lo, sw_hi = profile["positive_sidewalk"]
         cl_lo, cl_hi = profile["positive_clearance"]
-    sidewalk = round(rng.uniform(float(sw_lo), float(sw_hi)), 3)
-    clearance = round(min(sidewalk - 0.05, rng.uniform(float(cl_lo), float(cl_hi))), 3)
-    clearance = max(0.40, clearance)
+    sidewalk = round(static_rng.uniform(float(sw_lo), float(sw_hi)), 3)
+    clearance = round(static_rng.uniform(float(cl_lo), float(cl_hi)), 3)
 
-    if scenario in {"no_curb_ramp", "high_curb"}:
-        ramp = False
-        curb_h = round(rng.uniform(0.10 if scenario == "no_curb_ramp" else 0.14, 0.18 if scenario == "no_curb_ramp" else 0.22), 3)
-    else:
+    observed_ramp = _as_bool(row.get("curb_ramp"))
+    observed_curb_h = _as_float(row.get("curb_height_m"))
+    # Keep simulated curb height/ramp mutually coherent with any observed
+    # counterpart. A verified ramp should not be paired with a simulated
+    # 25-cm barrier at the same anchor, and an observed missing-ramp curb should
+    # not be completed as a nearly flush 1-cm lip.
+    if observed_ramp is True:
         ramp = True
-        curb_h = round(rng.uniform(0.0, 0.025), 3)
+        curb_h = round(static_rng.uniform(0.0, 0.035), 3)
+    elif observed_ramp is False:
+        ramp = False
+        curb_h = round(static_rng.uniform(0.18, 0.25), 3) if site_class == "high_curb" else round(static_rng.uniform(0.08, 0.18), 3)
+    elif observed_curb_h is not None:
+        curb_h = observed_curb_h
+        ramp = bool(observed_curb_h <= 0.04) if site_class not in {"no_curb_ramp", "high_curb"} else False
+    elif site_class == "high_curb":
+        ramp = False; curb_h = round(static_rng.uniform(0.18, 0.25), 3)
+    elif site_class == "no_curb_ramp":
+        ramp = False; curb_h = round(static_rng.uniform(0.10, 0.18), 3)
+    else:
+        # Accessible sites are not all flush.  A majority have a curb ramp/low
+        # lip; others retain a normal curb that can still be served by a vehicle
+        # ramp/lift, creating meaningful interface dependence.
+        ramp = static_rng.random() < (0.82 if city == "singapore" else 0.76)
+        curb_h = round(static_rng.uniform(0.0, 0.035), 3) if ramp else round(static_rng.uniform(0.08, 0.16), 3)
 
-    put("sidewalk_width_m", sidewalk, "conditional_physical_prior")
-    put("deployment_clearance_m", clearance, "conditional_clear_space_prior_bounded_by_sidewalk_width")
-    put("curb_ramp", ramp, "conditional_curb_interface_prior")
-    put("curb_height_m", curb_h, "conditional_curb_height_prior")
+    put_static("sidewalk_width_m", sidewalk, "site_correlated_pedestrian_clear_width_prior")
+    put_static("deployment_clearance_m", clearance, "site_correlated_loading_clear_space_prior")
+    put_static("curb_ramp", ramp, "site_correlated_curb_ramp_prior")
+    put_static("curb_height_m", curb_h, "site_correlated_curb_height_prior")
     if str(row.get("side") or "unknown").lower() == "unknown":
-        put("side", "right", "benchmark_vehicle_side_context")
+        put_static("side", _default_curb_side(city), "city_traffic_side_prior_when_geometry_unknown")
 
     if _as_bool(row.get("legal_stop")) is None:
-        legal = scenario != "simulated_loading_prohibited"
+        legal = site_class != "simulated_loading_prohibited"
         row["legal_stop"] = legal
-        prov["legal_stop"] = _sim_prov(city, split, str(row.get("episode_id")), str(row.get("anchor_id") or row.get("pudo_id")), "legal_stop", seed_value, profile_name, "scenario_level_simulated_service_permission")
+        pv = _sim_prov(city, split, eid, aid, "legal_stop", site_seed, profile_name, "site_correlated_simulated_service_permission")
+        pv.update({"physical_site_key": site_key, "correlation_scope": "physical_site_across_splits"})
+        prov["legal_stop"] = pv
     if _blank(row.get("legal_basis")):
         legal = bool(_as_bool(row.get("legal_stop")))
         row["legal_basis"] = "SIMULATED_BENCHMARK_LOADING_PERMISSION" if legal else "SIMULATED_BENCHMARK_LOADING_PROHIBITION"
-        prov["legal_basis"] = _sim_prov(city, split, str(row.get("episode_id")), str(row.get("anchor_id") or row.get("pudo_id")), "legal_basis", seed_value, profile_name, "scenario_level_simulated_legal_context_not_municipal_law")
+        pv = _sim_prov(city, split, eid, aid, "legal_basis", site_seed, profile_name, "site_correlated_legal_context_not_municipal_law")
+        pv.update({"physical_site_key": site_key, "correlation_scope": "physical_site_across_splits"})
+        prov["legal_basis"] = pv
         if "legal_stop" not in prov:
-            prov["legal_stop"] = dict(prov["legal_basis"])
+            prov["legal_stop"] = dict(pv)
     if not _source_is_real(row.get("legal_stop_source")) and str(prov.get("legal_stop", {}).get("kind")) == "simulated":
         row["legal_stop_source"] = VERSION + ":simulated_service_permission"
 
-    # Dynamic blockage is an explicitly allowed simulator/counterfactual field.
-    if scenario == "temporary_blockage" and float(row.get("blockage_risk") or 0.0) < 0.85:
-        row["blockage_risk"] = round(rng.uniform(0.88, 0.98), 3)
-        prov["blockage_risk"] = _sim_prov(city, split, str(row.get("episode_id")), str(row.get("anchor_id") or row.get("pudo_id")), "blockage_risk", seed_value, profile_name, "controlled_dynamic_counterfactual")
-    elif row.get("blockage_risk") is None:
-        row["blockage_risk"] = round(rng.uniform(0.01, 0.08), 3)
-        prov["blockage_risk"] = _sim_prov(city, split, str(row.get("episode_id")), str(row.get("anchor_id") or row.get("pudo_id")), "blockage_risk", seed_value, profile_name, "controlled_dynamic_baseline")
+    # Dynamic availability is intentionally episode/time dependent even at the
+    # same physical site. Existing observed blockage is never overwritten.
+    if row.get("blockage_risk") is None:
+        blocked = dyn_rng.random() < 0.05
+        row["blockage_risk"] = round(dyn_rng.uniform(0.88, 0.98) if blocked else dyn_rng.uniform(0.01, 0.10), 3)
+        pv = _sim_prov(city, split, eid, aid, "blockage_risk", dynamic_seed, profile_name, "episode_time_dynamic_blockage_prior")
+        pv.update({"physical_site_key": site_key, "correlation_scope": "episode_time_at_physical_site"})
+        prov["blockage_risk"] = pv
 
-    # Keep map confidence about the geometry/map source separate from simulated
-    # truth certainty. Do not inflate a low real-map confidence.
+    # Lighting/shelter are site amenities, not IID edge noise.  Time-of-day is
+    # resolved later in TransitionGenerator using the nuPlan request timestamp.
+    if row.get("lighting") is None:
+        lit_probability = 0.94 if city == "singapore" else 0.90
+        put_static("lighting", "lit" if static_rng.random() < lit_probability else "unlit", "site_correlated_lighting_infrastructure_prior")
+    if row.get("shelter") is None:
+        shelter_probability = 0.18 if city == "singapore" else 0.10
+        put_static("shelter", bool(static_rng.random() < shelter_probability), "site_correlated_wait_shelter_prior")
+
     if row.get("map_confidence") is None:
         row["map_confidence"] = 0.85
-        prov["map_confidence"] = _sim_prov(city, split, str(row.get("episode_id")), str(row.get("anchor_id") or row.get("pudo_id")), "map_confidence", seed_value, profile_name, "benchmark_default_map_confidence")
+        pv = _sim_prov(city, split, eid, aid, "map_confidence", site_seed, profile_name, "benchmark_default_map_confidence")
+        pv.update({"physical_site_key": site_key})
+        prov["map_confidence"] = pv
     if row.get("dynamic_confidence") is None:
         row["dynamic_confidence"] = 0.95
-        prov["dynamic_confidence"] = _sim_prov(city, split, str(row.get("episode_id")), str(row.get("anchor_id") or row.get("pudo_id")), "dynamic_confidence", seed_value, profile_name, "simulator_state_confidence")
-
-
+        pv = _sim_prov(city, split, eid, aid, "dynamic_confidence", dynamic_seed, profile_name, "simulator_state_confidence")
+        pv.update({"physical_site_key": site_key})
+        prov["dynamic_confidence"] = pv
 def _copy_observed_from_audit(row: MutableMapping[str, Any], audit: Mapping[str, Any], prov: MutableMapping[str, Any]) -> None:
     for field in (*PHYSICAL_FIELDS, "legal_stop", "legal_basis"):
         p = _audit_provenance(audit, field)
@@ -290,7 +435,11 @@ def _normalize_base(row: Dict[str, Any]) -> Dict[str, Any]:
         val = _as_bool(out.get(field))
         if val is not None:
             out[field] = val
-    out["blockage_risk"] = float(out.get("blockage_risk") or 0.0)
+    # Preserve UNKNOWN. Turning a missing dynamic state into 0.0 would silently
+    # assert "definitely unblocked" and prevent the hybrid dynamic prior from
+    # being applied. Eligibility code already treats None conservatively after
+    # the overlay has had a chance to fill it.
+    out["blockage_risk"] = _as_float(out.get("blockage_risk"))
     return out
 
 
@@ -321,14 +470,21 @@ def main() -> None:
     output: List[Dict[str, Any]] = []
     field_kinds: Dict[str, Counter] = defaultdict(Counter)
     scenarios = Counter()
+    curb_sides = Counter()
+    physical_site_keys: set[str] = set()
+    numeric_minmax: Dict[str, List[Optional[float]]] = {k: [None, None] for k in ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "blockage_risk")}
     complete_eps = 0
     eligible_eps = 0
     insufficient_eps: List[Dict[str, Any]] = []
     simulated_rows = 0
 
+    # Apply all available evidence before sampling any static site class.  This
+    # lets the same physical curb reuse one evidence-consistent latent class
+    # across temporal snapshots and official splits rather than contradicting an
+    # observed ramp/width/legality on another row for that site.
+    prepared_by_episode: Dict[str, List[tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    observed_classes_by_site: Dict[str, List[str]] = defaultdict(list)
     for eid, rows in sorted(by_episode.items()):
-        # First apply observed/audited evidence so forced-positive scenario slots
-        # never overwrite a real negative legality observation.
         prepared: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
         for row in sorted(rows, key=lambda r: str(r.get("anchor_id") or r.get("pudo_id"))):
             aid = str(row.get("anchor_id") or row.get("pudo_id"))
@@ -339,11 +495,6 @@ def main() -> None:
                 bp = _base_provenance(row, field)
                 if bp is not None:
                     prov[field] = bp
-            # Bootstrap PUDO generation uses legal_stop=False as fail-closed when
-            # legality is unknown.  In hybrid mode that boolean is not allowed to
-            # masquerade as an observed prohibition: if there is no legality
-            # provenance, restore UNKNOWN so the explicit benchmark-scenario
-            # legality overlay can fill it.
             if "legal_stop" not in prov:
                 row["legal_stop"] = None
                 if str(row.get("legal_basis") or "").lower().startswith(("unknown", "no_", "bootstrap")):
@@ -356,47 +507,49 @@ def main() -> None:
                     row["entrance_candidate_id"] = audit.get("entrance_candidate_id")
                     row["entrance_candidate_source"] = audit.get("entrance_candidate_source")
                     row["entrance_candidate_match_distance_m"] = _as_float(audit.get("entrance_candidate_match_distance_m"))
+            site_key = _site_key(row, args.city)
+            forced = _observed_site_class(row)
+            if forced is not None:
+                observed_classes_by_site[site_key].append(forced)
             prepared.append((row, prov))
+        prepared_by_episode[eid] = prepared
 
-        forceable = []
-        for idx, (row, _prov) in enumerate(prepared):
-            legal = _as_bool(row.get("legal_stop"))
-            legal_prov = _prov.get("legal_stop") if isinstance(_prov.get("legal_stop"), Mapping) else {}
-            observed_illegal = legal is False and str(legal_prov.get("kind")) == "observed"
-            if not observed_illegal and row.get("adjacent_ped_node_id"):
-                # Prefer candidates that are already dynamically available.
-                # A previous implementation selected the first N anchors and
-                # could force an ``accessible_loading`` scenario onto a row
-                # whose observed/preexisting blockage_risk was >= 0.85.  The
-                # fill logic correctly refuses to overwrite that real dynamic
-                # fact, so the supposedly forced-positive row stayed
-                # ineligible.  Stable sorting by availability fixes that
-                # avoidable loss without modifying any observed value.
-                try:
-                    blockage = float(row.get("blockage_risk") or 0.0)
-                except Exception:
-                    blockage = 1.0
-                forceable.append((blockage >= 0.85, blockage, idx))
-        forceable.sort()
-        forced = {idx for _blocked, _risk, idx in forceable[: max(0, args.min_positive_per_episode)]}
+    site_class_by_key: Dict[str, str] = {}
+    for prepared in prepared_by_episode.values():
+        for row, _prov in prepared:
+            site_key = _site_key(row, args.city)
+            if site_key not in site_class_by_key:
+                site_seed = _seed(args.seed, args.city, site_key, "static")
+                site_class_by_key[site_key] = _resolve_site_class(
+                    observed_classes_by_site.get(site_key, []), random.Random(site_seed)
+                )
+    site_prior_classes = Counter(site_class_by_key.values())
 
+    for eid, prepared in sorted(prepared_by_episode.items()):
+        # Static simulated physical/site facts are keyed by physical location,
+        # not by episode/split. This prevents the same curb from becoming narrow
+        # in train and wide in test merely because it was observed at another time.
         eligible_count = 0
         complete_count = 0
         for idx, (row, prov) in enumerate(prepared):
             aid = str(row.get("anchor_id") or row.get("pudo_id"))
-            s = _seed(args.seed, args.city, args.split, eid, aid)
-            rng = random.Random(s)
-            scenario = "accessible_loading" if idx in forced else _scenario_for(rng)
-            _fill_missing(row, prov, city=args.city, split=args.split, scenario=scenario, seed_value=s, profile=profile)
-
-            # Consistency repair is allowed only for simulated fields. Observed
-            # facts are never modified to make an episode pass.
-            sw = _as_float(row.get("sidewalk_width_m"))
-            cl = _as_float(row.get("deployment_clearance_m"))
-            if sw is not None and cl is not None and cl > sw:
-                if str((prov.get("deployment_clearance_m") or {}).get("kind")) == "simulated":
-                    row["deployment_clearance_m"] = max(0.40, round(sw - 0.05, 3))
-                    prov["deployment_clearance_m"]["consistency_clamp"] = "clearance<=sidewalk_width"
+            site_key = _site_key(row, args.city)
+            site_seed = _seed(args.seed, args.city, site_key, "static")
+            dynamic_seed = _seed(args.seed, args.city, eid, site_key, "dynamic")
+            site_class = site_class_by_key[site_key]
+            _fill_missing(
+                row, prov, city=args.city, split=args.split, site_class=site_class,
+                site_seed=site_seed, dynamic_seed=dynamic_seed, site_key=site_key,
+                profile=profile,
+            )
+            scenario = _scenario_from_row(row)
+            physical_site_keys.add(site_key)
+            curb_sides[str(row.get("side") or "unknown")] += 1
+            for field, bounds in numeric_minmax.items():
+                val = _as_float(row.get(field))
+                if val is not None:
+                    bounds[0] = val if bounds[0] is None else min(float(bounds[0]), val)
+                    bounds[1] = val if bounds[1] is None else max(float(bounds[1]), val)
 
             simulated = any(isinstance(v, Mapping) and str(v.get("kind")) == "simulated" for v in prov.values())
             if simulated:
@@ -424,14 +577,17 @@ def main() -> None:
             legal = bool(_as_bool(row.get("legal_stop")))
             eligible = complete and legal and float(row.get("blockage_risk") or 0.0) < 0.85 and float(row.get("deployment_clearance_m") or 0.0) > 0
             row.update({
-                "truth_mode": "hybrid_geometry_anchored_simulated_interface_v1",
+                "truth_mode": "hybrid_geometry_anchored_site_correlated_simulated_interface_v2",
                 "evidence_kind": "mixed" if simulated and any(isinstance(v, Mapping) and str(v.get("kind")) in {"observed", "derived"} for v in prov.values()) else ("simulated" if simulated else "observed_or_derived"),
                 "field_provenance": prov,
                 "hybrid_evidence_complete": complete,
                 "hybrid_eligible": eligible,
                 "deployment_clearance_semantics": "available_environment_clear_space",
                 "hybrid_scenario_class": scenario,
-                "hybrid_seed": s,
+                "hybrid_site_prior_class": site_class,
+                "hybrid_seed": site_seed,
+                "hybrid_dynamic_seed": dynamic_seed,
+                "hybrid_physical_site_key": site_key,
                 "hybrid_standard_profile": profile["name"],
                 "hybrid_missing_fields": sorted(set(missing)),
                 "evidence_status": "hybrid_ready" if complete else "hybrid_incomplete",
@@ -464,12 +620,16 @@ def main() -> None:
         "min_positive_per_episode": args.min_positive_per_episode,
         "simulated_overlay_rows": simulated_rows,
         "scenario_class_counts": dict(scenarios),
+        "physical_site_prior_class_counts": dict(site_prior_classes),
+        "physical_site_key_count": len(physical_site_keys),
+        "curb_side_counts": dict(curb_sides),
+        "numeric_field_ranges": {k: {"min": v[0], "max": v[1]} for k, v in numeric_minmax.items()},
         "field_provenance_kind_counts": {k: dict(v) for k, v in sorted(field_kinds.items())},
         "insufficient_episode_count": len(insufficient_eps),
         "insufficient_episode_examples": insufficient_eps[:50],
         "standard_profile": profile,
         "paper_claim_allowed_for_simulated_rows": False,
-        "interpretation": "Benchmark-ready hybrid truth may contain simulated typed-resource values. Simulated fields are scenario truth only and must not be reported as measured city ground truth.",
+        "interpretation": "Benchmark-ready hybrid truth may contain simulated typed-resource values. Static simulated curb/interface facts are physical-site correlated across official splits; dynamic blockage remains episode/time-specific. Simulated fields are scenario truth only and must not be reported as measured city ground truth.",
         "output_pudo_jsonl": str(out),
     }
     rp = Path(args.report_json); rp.parent.mkdir(parents=True, exist_ok=True)

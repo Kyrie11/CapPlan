@@ -84,6 +84,12 @@ def compatible(evidence: Any, threshold: Any, operator: str = "requires") -> boo
             observed = evidence.get("observed") or evidence.get("door_side") or evidence.get("vehicle_side")
             curb_side = evidence.get("curb_side") or evidence.get("anchor_side")
             vehicle_side = evidence.get("vehicle_side") or observed
+            # ``curb_side`` is a policy-level requirement: board/alight from the
+            # side facing the service curb.  It avoids hard-coding right-side
+            # traffic assumptions into a four-city benchmark (Singapore drives
+            # on the left while the US cities drive on the right).
+            if required == "curb_side":
+                return curb_side not in (None, "unknown") and (vehicle_side == curb_side or vehicle_side == "both" or curb_side == "both")
             if vehicle_side == "both":
                 side_ok = curb_side in (required, "both", None) or required in ("either", "both")
             else:

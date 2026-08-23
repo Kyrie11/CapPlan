@@ -270,7 +270,7 @@ profiles:
     - app
     - haptic
   interface:
-    preferred_door_side: right
+    preferred_door_side: curb_side
     min_door_width_m: 0.72
     min_deployment_clearance_m: 1.2
     boarding_any_of: []
