@@ -1,39 +1,45 @@
 #!/usr/bin/env python
-"""Package the small reports needed to audit a four-city hybrid benchmark run.
+"""Package and *validate* the reports needed to audit a hybrid benchmark run.
 
-The bundle intentionally excludes the materialized dataset, accessibility graph
-JSONLs, PUDO JSONLs, nuPlan DBs, and large CSV audit catalogs.  It is meant to be
-uploaded after a build so a remote reviewer can determine pipeline identity,
-rebuild coverage, per-city provenance, hybrid-ready retention, dataset semantic
-quality, and merged train/val/test status without receiving the large corpus.
+Unlike the original packager, this script does not equate "a ZIP was created"
+with "the benchmark build passed".  It anchors freshness to the latest realism
+pipeline identity file, checks expected artifact versions, requires all per-city
+and merged semantic audits, and records stale/missing/failed artifacts in the
+manifest.  The ZIP is still produced for INCOMPLETE/FAIL states so a remote
+reviewer receives enough evidence to diagnose the run.
 """
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
-import os
+import re
 import zipfile
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
-VERSION = "capplan_hybrid_review_bundle_v1_20260824"
+VERSION = "capplan_hybrid_review_bundle_v2_20260824"
+EXPECTED_GRAPH_VERSION = "abilitybench_hybrid_accessibility_v2_20260823"
+EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v4_20260824"
+EXPECTED_READY_VERSION = "abilitybench_hybrid_ready_allowlist_v1_20260823"
+EXPECTED_AUDIT_VERSION = "abilitybench_hybrid_dataset_audit_v3_20260824"
+SPLITS = ("train", "val", "test")
+CITIES = ("boston", "pittsburgh", "vegas", "singapore")
 
-# These reports collectively prove source/DB identity, base rebuild semantics,
-# hybrid provenance, readiness selection, and final dataset labels.
 REPORT_GLOBS = (
     "nuplan_db_cities.*.json",
     "nuplan_map_crs*.json",
     "georeference*.json",
     "dem*.json",
     "paper_site_catalog.*.json",
-    "pudo_audit_status.json",
+    "pudo_audit_*.json",
     "pudo_evidence_gap_manifest.json",
-    "pudo_audit_evidence_recovery.json",
     "site_disjoint/*.json",
     "hybrid_graph.*.json",
     "hybrid_pudo.*.json",
     "hybrid_ready.*.json",
+    "hybrid_site_consistency.json",
     "build/*/external_source_preflight.json",
     "build/*/service_layer*.json",
     "build/*/dataset_quality*.json",
@@ -45,11 +51,21 @@ REPORT_GLOBS = (
 
 COMMAND_GLOBS = (
     "commands/pipeline_identity*.txt",
+    "commands/hybrid_realism*.log",
     "commands/realism_v4_*.log",
+    "commands/paper_site_catalog.*.log",
+    "commands/pudo_audit_evidence_recovery.log",
+    "commands/pudo_audit_prefill.*.log",
+    "commands/pudo_audit_classify.*.log",
+    "commands/pudo_audit_triage.*.log",
+    "commands/pudo_audit_status.log",
+    "commands/pudo_evidence_gap_manifest.log",
+    "commands/site_disjoint_eval.*.log",
     "commands/hybrid_graph.*.log",
     "commands/hybrid_pudo.*.log",
     "commands/hybrid_ready.*.log",
     "commands/hybrid_build.*.log",
+    "commands/hybrid_site_consistency.log",
 )
 
 
@@ -74,10 +90,113 @@ def _copy_log_for_zip(path: Path, max_bytes: int) -> bytes:
     data = path.read_bytes()
     if max_bytes <= 0 or len(data) <= max_bytes:
         return data
-    # Preserve both command/startup identity and final traceback/END marker.
     half = max(1, max_bytes // 2)
     marker = b"\n\n===== CAPPLAN REVIEW BUNDLE: MIDDLE OF LOG OMITTED =====\n\n"
     return data[:half] + marker + data[-half:]
+
+
+def _json(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _latest_identity(root: Path) -> Path | None:
+    candidates = [p for p in root.glob("commands/pipeline_identity*.txt") if p.is_file()]
+    return max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
+
+
+def _required_paths(root: Path) -> list[tuple[Path, str | None]]:
+    req: list[tuple[Path, str | None]] = []
+    for split in SPLITS:
+        for city in CITIES:
+            req.append((root / f"hybrid_graph.{split}.{city}.json", EXPECTED_GRAPH_VERSION))
+            req.append((root / f"hybrid_pudo.{split}.{city}.json", EXPECTED_PUDO_VERSION))
+            req.append((root / f"hybrid_ready.{split}.{city}.json", EXPECTED_READY_VERSION))
+            req.append((root / f"build/{split}/hybrid_dataset_audit.{city}.json", EXPECTED_AUDIT_VERSION))
+        req.append((root / f"build/{split}/hybrid_dataset_audit.merged.json", EXPECTED_AUDIT_VERSION))
+        req.append((root / f"build/{split}/merged_dataset_manifest.hybrid.json", None))
+        req.append((root / f"build/{split}/merged_validation_report.hybrid.json", None))
+        req.append((root / f"commands/hybrid_build.{split}.log", None))
+    req.append((root / "hybrid_site_consistency.json", None))
+    return req
+
+
+def _log_rc(path: Path) -> int | None:
+    try:
+        tail = path.read_text(encoding="utf-8", errors="replace")[-20000:]
+    except Exception:
+        return None
+    matches = re.findall(r"END rc=(\d+)", tail)
+    return int(matches[-1]) if matches else None
+
+
+def _iso_from_ns(ns: int | None) -> str | None:
+    if ns is None:
+        return None
+    return dt.datetime.fromtimestamp(ns / 1e9, tz=dt.timezone.utc).isoformat()
+
+
+def _assess(root: Path) -> dict[str, Any]:
+    identity = _latest_identity(root)
+    run_start_ns = identity.stat().st_mtime_ns if identity else None
+    missing: list[str] = []
+    stale: list[str] = []
+    version_mismatch: list[dict[str, str]] = []
+    failed: list[dict[str, Any]] = []
+    fresh: list[str] = []
+
+    for path, expected_version in _required_paths(root):
+        rel = str(path.relative_to(root))
+        if not path.exists():
+            missing.append(rel)
+            continue
+        if run_start_ns is not None and path.stat().st_mtime_ns <= run_start_ns:
+            stale.append(rel)
+            continue
+        fresh.append(rel)
+        if path.suffix == ".json":
+            payload = _json(path)
+            if expected_version and str(payload.get("version") or "") != expected_version:
+                version_mismatch.append({"path": rel, "expected": expected_version, "actual": str(payload.get("version") or "missing")})
+            status = str(payload.get("status") or "").upper()
+            # PARTIAL is allowed for PUDO/readiness reports because a few scenes
+            # may be deliberately rejected for insufficient real geometry.  Final
+            # semantic audits, site consistency and validation must be PASS-like.
+            if "hybrid_dataset_audit" in rel and status != "PASS":
+                failed.append({"path": rel, "status": status or "missing"})
+            if rel == "hybrid_site_consistency.json" and status != "PASS":
+                failed.append({"path": rel, "status": status or "missing"})
+            if "merged_validation_report.hybrid.json" in rel:
+                valid = payload.get("valid")
+                if status == "FAIL" or valid is False:
+                    failed.append({"path": rel, "status": status or f"valid={valid}"})
+        elif rel.startswith("commands/hybrid_build."):
+            rc = _log_rc(path)
+            if rc is None:
+                failed.append({"path": rel, "status": "missing_END_rc"})
+            elif rc != 0:
+                failed.append({"path": rel, "status": f"rc={rc}"})
+
+    if failed or version_mismatch:
+        status = "FAIL"
+    elif missing or stale or identity is None:
+        status = "INCOMPLETE"
+    else:
+        status = "PASS"
+    return {
+        "status": status,
+        "identity_file": str(identity.relative_to(root)) if identity else None,
+        "run_start_mtime_ns": run_start_ns,
+        "run_start_utc": _iso_from_ns(run_start_ns),
+        "fresh_required": fresh,
+        "missing_required": missing,
+        "stale_required": stale,
+        "version_mismatches": version_mismatch,
+        "failed_required": failed,
+    }
 
 
 def main() -> None:
@@ -85,6 +204,7 @@ def main() -> None:
     p.add_argument("--reports_root", required=True)
     p.add_argument("--output_zip", required=True)
     p.add_argument("--max_command_log_bytes", type=int, default=2_000_000)
+    p.add_argument("--require_complete", action="store_true", help="Exit 2 unless assessed status is PASS; the ZIP is still written first.")
     args = p.parse_args()
 
     root = Path(args.reports_root).resolve()
@@ -93,29 +213,37 @@ def main() -> None:
     out = Path(args.output_zip).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    assessment = _assess(root)
     reports = _collect(root, REPORT_GLOBS)
     logs = _collect(root, COMMAND_GLOBS)
     selected = reports + [x for x in logs if x not in reports]
-    manifest = {
-        "status": "PASS",
+    manifest: dict[str, Any] = {
+        **assessment,
         "version": VERSION,
         "reports_root": str(root),
         "selected_file_count": len(selected),
         "max_command_log_bytes": int(args.max_command_log_bytes),
         "files": [],
+        "expected_versions": {
+            "hybrid_graph": EXPECTED_GRAPH_VERSION,
+            "hybrid_pudo": EXPECTED_PUDO_VERSION,
+            "hybrid_ready": EXPECTED_READY_VERSION,
+            "hybrid_dataset_audit": EXPECTED_AUDIT_VERSION,
+        },
         "interpretation": (
-            "Upload this ZIP together with the outer nohup/tee log if a run failed. "
-            "The bundle excludes the full dataset and graph/PUDO materializations."
+            "PASS means all required final hybrid artifacts are fresh relative to the latest pipeline identity, "
+            "have the expected semantic versions, and final semantic audits/build logs pass. INCOMPLETE means the "
+            "bundle is useful for diagnosis but the benchmark is not yet freeze-ready."
         ),
     }
 
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         readme = (
             "CapPlan hybrid benchmark review bundle\n"
-            f"version={VERSION}\n\n"
-            "Contains only small reports and selected command logs. It excludes nuPlan DBs, "
-            "materialized datasets, accessibility graph JSONLs and PUDO JSONLs.\n"
-            "If the build failed, also upload the outer nohup/tee console log so the first fatal traceback is preserved.\n"
+            f"version={VERSION}\nstatus={assessment['status']}\n\n"
+            "Contains only small reports and selected command logs. It excludes nuPlan DBs, materialized datasets, "
+            "accessibility graph JSONLs and PUDO JSONLs.\n"
+            "The bundle status is a real completeness gate, not merely a packaging-success flag.\n"
         )
         z.writestr("README.txt", readme)
         for path in selected:
@@ -139,14 +267,20 @@ def main() -> None:
     manifest["output_zip_bytes"] = out.stat().st_size
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({
-        "status": "PASS",
+        "status": assessment["status"],
         "version": VERSION,
         "selected_file_count": len(selected),
         "output_zip": str(out),
         "output_zip_bytes": out.stat().st_size,
         "manifest": str(manifest_path),
+        "missing_required_count": len(assessment["missing_required"]),
+        "stale_required_count": len(assessment["stale_required"]),
+        "version_mismatch_count": len(assessment["version_mismatches"]),
+        "failed_required_count": len(assessment["failed_required"]),
     }, ensure_ascii=False, indent=2, sort_keys=True))
-    print("HYBRID_REVIEW_BUNDLE=PASS")
+    print(f"HYBRID_REVIEW_BUNDLE={assessment['status']}")
+    if args.require_complete and assessment["status"] != "PASS":
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

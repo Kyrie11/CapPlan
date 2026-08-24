@@ -327,6 +327,7 @@ def main() -> None:
         raise RuntimeError(f"no *.edges.jsonl in {inp}")
     reports = Counter()
     field_kind_counts: Dict[str, Counter] = defaultdict(Counter)
+    field_source_counts: Dict[str, Counter] = defaultdict(Counter)
     group_classes = Counter()
     group_class_edge_counts = Counter()
     group_class_by_key: Dict[str, str] = {}
@@ -369,6 +370,7 @@ def main() -> None:
                 pv = fp.get(field) if isinstance(fp, Mapping) else None
                 if isinstance(pv, Mapping):
                     field_kind_counts[field][str(pv.get("kind") or "unknown")] += 1
+                    field_source_counts[field][str(pv.get("source") or pv.get("method") or "unknown")] += 1
                 if _is_blank(before.get(field)) and not _is_blank(row.get(field)):
                     reports[field] += 1
                     if isinstance(pv, Mapping) and str(pv.get("kind")) == "simulated":
@@ -412,6 +414,11 @@ def main() -> None:
         "edges_with_any_simulated_field": simulated_edges,
         "filled_missing_field_counts": dict(reports),
         "field_provenance_kind_counts": {k: dict(v) for k, v in sorted(field_kind_counts.items())},
+        "field_provenance_source_counts": {k: dict(v) for k, v in sorted(field_source_counts.items())},
+        "slope_high_resolution_dem_derived_edges": int(field_source_counts.get("slope", {}).get("high_resolution_dem_endpoint_elevation", 0)),
+        "slope_high_resolution_dem_derived_rate": (
+            float(field_source_counts.get("slope", {}).get("high_resolution_dem_endpoint_elevation", 0)) / max(1, edges_total)
+        ),
         "input_graph_dir": str(inp),
         "output_graph_dir": str(out),
         "interpretation": (

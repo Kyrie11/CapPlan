@@ -20,8 +20,9 @@ from typing import Any, Dict, Iterable, List, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl
+from capplan.data.capability_contracts import contract_episode_id
 
-VERSION = "abilitybench_hybrid_dataset_audit_v2_20260824"
+VERSION = "abilitybench_hybrid_dataset_audit_v3_20260824"
 
 
 def _rows(path: Path) -> Iterable[Dict[str, Any]]:
@@ -56,6 +57,7 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
     pairs = list(_rows(dataset_dir / "counterfactual_pairs.jsonl"))
     vehicles = list(_rows(dataset_dir / "vehicle_interfaces.jsonl"))
     edge_labels = list(_rows(dataset_dir / "passenger_edge_labels.jsonl"))
+    transitions = list(_rows(dataset_dir / "candidate_transitions.jsonl"))
     pudo = list(_rows(dataset_dir / "pudo_anchors.jsonl"))
 
     errors: List[str] = []
@@ -118,6 +120,59 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
         warnings.append(f"failure certificates cover only {len(cert_resource)} resource types")
     if certs and len(cert_phase) < 3:
         warnings.append(f"failure certificates cover only {len(cert_phase)} service phases")
+
+    # Paper-safe CASA requires a passenger-conditioned label for every
+    # (candidate transition, passenger contract) pair.  A fallback to z_e would
+    # silently erase capability conditioning, so make coverage a hard dataset gate.
+    contracts_by_ep: Dict[str, List[str]] = defaultdict(list)
+    for c in contracts:
+        md = c.get("metadata") if isinstance(c.get("metadata"), Mapping) else {}
+        eid = contract_episode_id(str(c.get("passenger_id") or ""), dict(md or {}))
+        contracts_by_ep[eid].append(str(c.get("passenger_id")))
+    transitions_by_ep: Dict[str, List[str]] = defaultdict(list)
+    transition_id_set = set()
+    for t in transitions:
+        eid = str(t.get("episode_id") or "")
+        tid = str(t.get("transition_id") or "")
+        transitions_by_ep[eid].append(tid); transition_id_set.add(tid)
+    edge_pair_counts = Counter((str(r.get("transition_id") or ""), str(r.get("passenger_id") or "")) for r in edge_labels)
+    duplicate_edge_pairs = [k for k, n in edge_pair_counts.items() if n != 1]
+    expected_edge_pairs = {(tid, pid) for eid in episode_ids for tid in transitions_by_ep.get(eid, []) for pid in contracts_by_ep.get(eid, [])}
+    actual_edge_pairs = set(edge_pair_counts)
+    missing_edge_pairs = expected_edge_pairs - actual_edge_pairs
+    extra_edge_pairs = actual_edge_pairs - expected_edge_pairs
+    if duplicate_edge_pairs:
+        errors.append(f"{len(duplicate_edge_pairs)} passenger transition pairs have duplicate labels")
+    if missing_edge_pairs:
+        errors.append(f"{len(missing_edge_pairs)} passenger transition pairs are missing y_e,p labels")
+    if extra_edge_pairs:
+        errors.append(f"{len(extra_edge_pairs)} passenger edge labels do not match a retained contract/transition pair")
+
+    # Successful witnesses must actually represent the complete service lifecycle.
+    canonical = ["access", "wait", "board", "ride", "alight", "egress", "destination"]
+    phase_index = {q: i for i, q in enumerate(canonical)}
+    bad_skeletons = []
+    for sk in skeletons:
+        phases = [str(st.get("phase") or "") for st in (sk.get("steps") or []) if isinstance(st, Mapping)]
+        monotone = all(phase_index.get(a, -1) <= phase_index.get(b, -1) for a, b in zip(phases, phases[1:]))
+        complete = all(q in phases for q in canonical) and bool(phases) and phases[-1] == "destination"
+        refs_ok = all(str(tid) in transition_id_set for tid in (sk.get("transitions") or []))
+        if not bool(sk.get("accepted")) or not monotone or not complete or not refs_ok:
+            bad_skeletons.append(str(sk.get("passenger_id")))
+    if bad_skeletons:
+        errors.append(f"{len(bad_skeletons)} success skeletons do not encode a valid complete canonical lifecycle")
+
+    bad_certificates = []
+    for c in certs:
+        try:
+            margin = float(c.get("signed_margin"))
+            conf = float(c.get("confidence"))
+        except Exception:
+            bad_certificates.append(str(c.get("passenger_id"))); continue
+        if margin > 1e-9 or not (0.0 <= conf <= 1.0) or not str(c.get("phase") or "") or not str(c.get("resource_type") or "") or not str(c.get("evidence_source") or ""):
+            bad_certificates.append(str(c.get("passenger_id")))
+    if bad_certificates:
+        errors.append(f"{len(bad_certificates)} failure certificates have invalid sign/confidence/diagnostic fields")
 
     y_pos = 0; y_total = 0
     for r in edge_labels:
@@ -225,6 +280,13 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
         "certificate_phase_counts": dict(cert_phase),
         "certificate_resource_counts": dict(cert_resource),
         "passenger_edge_positive_rate": edge_positive_rate,
+        "expected_passenger_edge_label_count": len(expected_edge_pairs),
+        "actual_unique_passenger_edge_label_count": len(actual_edge_pairs),
+        "missing_passenger_edge_label_count": len(missing_edge_pairs),
+        "extra_passenger_edge_label_count": len(extra_edge_pairs),
+        "duplicate_passenger_edge_label_pair_count": len(duplicate_edge_pairs),
+        "invalid_success_skeleton_count": len(bad_skeletons),
+        "invalid_failure_certificate_count": len(bad_certificates),
         "vehicle_assignment_counts": dict(assigned_vehicle_counts),
         "vehicle_type_row_counts": dict(vehicle_type_counts),
         "od_provenance_kind_counts": dict(od_kind_counts),

@@ -540,6 +540,7 @@ def main() -> None:
     p.add_argument("--city", required=True, choices=["boston", "pittsburgh", "vegas", "singapore"])
     p.add_argument("--split", required=True, choices=["train", "val", "test"])
     p.add_argument("--audit_worklist_csv", default=None, help="Optional source-prefilled site worklist from prepare_pudo_audit_worklist.py")
+    p.add_argument("--site_evidence_peer_jsonl", action="append", default=[], metavar="SPLIT=PATH", help="Additional base-PUDO split used only to construct cross-split canonical static site evidence; may be repeated.")
     p.add_argument("--seed", type=int, default=20260822)
     p.add_argument("--min_positive_per_episode", type=int, default=2)
     p.add_argument("--report_json", required=True)
@@ -604,7 +605,58 @@ def main() -> None:
             prepared.append((row, prov))
         prepared_by_episode[eid] = prepared
 
-    site_static_evidence, site_static_counts, site_static_conflicts = _canonical_site_static_evidence(prepared_by_episode, args.city)
+    # Canonical static site evidence must be global to the official split set.
+    # The previous implementation only saw the current split while claiming
+    # cross-split consistency; a site observed in train could therefore be
+    # independently simulated in val/test.  Peer inputs fix that without
+    # changing dynamic blockage, which intentionally remains episode-specific.
+    site_evidence_prepared: Dict[str, List[tuple[Dict[str, Any], Dict[str, Any]]]] = {
+        f"{args.split}:{eid}": rows for eid, rows in prepared_by_episode.items()
+    }
+    peer_rows_loaded = 0
+    for spec in args.site_evidence_peer_jsonl:
+        if "=" not in str(spec):
+            raise RuntimeError(f"--site_evidence_peer_jsonl expects SPLIT=PATH, got {spec!r}")
+        peer_split, peer_path = str(spec).split("=", 1)
+        peer_split = peer_split.strip(); peer_path = peer_path.strip()
+        if peer_split not in {"train", "val", "test"}:
+            raise RuntimeError(f"invalid peer split {peer_split!r}")
+        pp = Path(peer_path)
+        if pp.resolve() == Path(args.input_pudo_jsonl).resolve():
+            continue
+        if not pp.exists():
+            raise FileNotFoundError(pp)
+        peer_audit_map = _load_audit_map(args.audit_worklist_csv, peer_split)
+        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for raw in iter_jsonl(pp):
+            row = _normalize_base(dict(raw)); eid = str(row.get("episode_id") or "")
+            if eid:
+                grouped[eid].append(row); peer_rows_loaded += 1
+        for eid, rows in grouped.items():
+            prepared_peer: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
+            for row in sorted(rows, key=lambda r: str(r.get("anchor_id") or r.get("pudo_id"))):
+                aid = str(row.get("anchor_id") or row.get("pudo_id"))
+                prov: Dict[str, Any] = dict(row.get("field_provenance") or {}) if isinstance(row.get("field_provenance"), Mapping) else {}
+                for field in REQUIRED_FIELDS:
+                    if field not in prov:
+                        bp = _base_provenance(row, field)
+                        if bp is not None:
+                            prov[field] = bp
+                if "legal_stop" not in prov:
+                    row["legal_stop"] = None
+                    if str(row.get("legal_basis") or "").lower().startswith(("unknown", "no_", "bootstrap")):
+                        row["legal_basis"] = None
+                audit = peer_audit_map.get(aid)
+                if audit:
+                    _copy_observed_from_audit(row, audit, prov)
+                site_key = _site_key(row, args.city)
+                forced = _observed_site_class(row)
+                if forced is not None:
+                    observed_classes_by_site[site_key].append(forced)
+                prepared_peer.append((row, prov))
+            site_evidence_prepared[f"{peer_split}:{eid}"] = prepared_peer
+
+    site_static_evidence, site_static_counts, site_static_conflicts = _canonical_site_static_evidence(site_evidence_prepared, args.city)
     for prepared in prepared_by_episode.values():
         for row, prov in prepared:
             _apply_site_static_evidence(row, prov, _site_key(row, args.city), site_static_evidence, site_static_counts)
@@ -721,6 +773,7 @@ def main() -> None:
         "numeric_field_ranges": {k: {"min": v[0], "max": v[1]} for k, v in numeric_minmax.items()},
         "field_provenance_kind_counts": {k: dict(v) for k, v in sorted(field_kinds.items())},
         "same_site_static_evidence_counts": dict(site_static_counts),
+        "cross_split_site_evidence_peer_rows_loaded": peer_rows_loaded,
         "same_site_static_evidence_conflict_count": len(site_static_conflicts),
         "same_site_static_evidence_conflict_examples": site_static_conflicts[:50],
         "insufficient_episode_count": len(insufficient_eps),

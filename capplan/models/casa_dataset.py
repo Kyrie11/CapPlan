@@ -1,7 +1,7 @@
 """Dataset loader for CASA training."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -26,6 +26,7 @@ class CASASample:
     y_phase: int
     y_demand: List[float]
     demand_mask: List[float]
+    uncertainty_beta: List[float] = field(default_factory=list)
     y_availability: float = 1.0
 
 
@@ -60,7 +61,17 @@ class CASADataset:
         split_ids = self._read_split(split)
         transition_labels = {d["transition_id"]: d for d in read_jsonl(self.dataset_dir / "transition_labels.jsonl")}
         passenger_path = self.dataset_dir / "passenger_edge_labels.jsonl"
-        passenger_labels = {(d.get("transition_id"), d.get("passenger_id")): d for d in read_jsonl(passenger_path)} if passenger_path.exists() else {}
+        passenger_labels: Dict[Tuple[str, str], Dict] = {}
+        if passenger_path.exists():
+            for row in read_jsonl(passenger_path):
+                key = (str(row.get("transition_id") or ""), str(row.get("passenger_id") or ""))
+                if not all(key):
+                    raise RuntimeError(f"invalid passenger edge label row in {passenger_path}: transition_id and passenger_id are required")
+                if key in passenger_labels:
+                    raise RuntimeError(f"duplicate passenger edge label for {key} in {passenger_path}")
+                passenger_labels[key] = row
+        elif self.feature_policy == "paper_safe":
+            raise RuntimeError(f"paper_safe CASA loading requires passenger-specific labels: {passenger_path}")
         contracts_by_episode: Dict[str, List] = {}
         contracts_path = self.dataset_dir / "capability_contracts.jsonl"
         if contracts_path.exists():
@@ -83,6 +94,11 @@ class CASADataset:
                 continue
             contracts = contracts_by_episode.get(t.episode_id, [])
             if not contracts:
+                if self.feature_policy == "paper_safe":
+                    raise RuntimeError(
+                        f"paper_safe CASA loading found transition {t.transition_id} in episode {t.episode_id} "
+                        "without any passenger capability contract"
+                    )
                 # Backward-compatible fallback for legacy transition-only data.
                 lab = transition_labels.get(t.transition_id, {})
                 y_edge = 1.0 if lab.get("z_e", t.tests.z_e) else 0.0
@@ -97,7 +113,8 @@ class CASADataset:
                     y_value = explicit_value_targets[key]
                 y_phase = self.vocab.phases.index(t.to_phase) if t.to_phase in self.vocab.phases else 0
                 yd, ym = self._demand_target(t)
-                self.samples.append(CASASample(t.transition_id, t.episode_id, "__transition_only__", encode_transition_with_capability(t, [], self.vocab, feature_policy=self.feature_policy), y_edge, y_value, y_phase, yd, ym, max(0.0, min(1.0, float(t.availability)))))
+                ub = [1.0 for _ in self.vocab.resources]
+                self.samples.append(CASASample(t.transition_id, t.episode_id, "__transition_only__", encode_transition_with_capability(t, [], self.vocab, feature_policy=self.feature_policy), y_edge, y_value, y_phase, yd, ym, ub, max(0.0, min(1.0, float(t.availability)))))
                 continue
             for contract in contracts:
                 compiled = self.compiler.compile(contract, trip_context=contract.metadata.get("trip_modifiers", {}))
@@ -105,6 +122,11 @@ class CASADataset:
                 if plab is not None:
                     y_edge = 1.0 if plab.get("y_e_p") else 0.0
                 else:
+                    if self.feature_policy == "paper_safe":
+                        raise RuntimeError(
+                            "paper_safe CASA loading requires a passenger-conditioned edge label for every "
+                            f"(transition, passenger) pair; missing {(t.transition_id, contract.passenger_id)}"
+                        )
                     lab = transition_labels.get(t.transition_id, {})
                     y_edge = 1.0 if lab.get("z_e", t.tests.z_e) else 0.0
                 in_skeleton = t.transition_id in skeleton_edges.get((t.episode_id, contract.passenger_id), set())
@@ -127,7 +149,8 @@ class CASADataset:
                     y_value = explicit_value_targets[key]
                 y_phase = self.vocab.phases.index(t.to_phase) if t.to_phase in self.vocab.phases else 0
                 yd, ym = self._demand_target(t)
-                self.samples.append(CASASample(t.transition_id, t.episode_id, contract.passenger_id, encode_transition_with_capability(t, compiled.tokens, self.vocab, feature_policy=self.feature_policy), y_edge, y_value, y_phase, yd, ym, max(0.0, min(1.0, float(t.availability)))))
+                ub = self._uncertainty_beta(compiled.tokens)
+                self.samples.append(CASASample(t.transition_id, t.episode_id, contract.passenger_id, encode_transition_with_capability(t, compiled.tokens, self.vocab, feature_policy=self.feature_policy), y_edge, y_value, y_phase, yd, ym, ub, max(0.0, min(1.0, float(t.availability)))))
 
     def _read_split(self, split: str) -> set[str]:
         p = self.dataset_dir / "splits" / f"{split}_episodes.txt"
@@ -158,6 +181,25 @@ class CASADataset:
                 raise RuntimeError(f"invalid completion-value target {value} for {(tid, pid)}; expected [0,1]")
             out[(tid, pid)] = value
         return out
+
+
+    def _uncertainty_beta(self, tokens) -> List[float]:
+        """Return per-resource conservative uncertainty multipliers from Psi_p.
+
+        The paper calibration term is resource-wise: beta_tau * sigma_e^tau must
+        cover the residual of the corresponding typed demand.  Multiple active
+        clauses for one resource are combined conservatively with max(beta_tau).
+        """
+        beta = [1.0 for _ in self.vocab.resources]
+        for tok in tokens or []:
+            try:
+                rid = int(tok.get("resource_id", -1))
+                b = max(0.0, float(tok.get("beta_tau", 1.0)))
+            except Exception:
+                continue
+            if 0 <= rid < len(beta):
+                beta[rid] = max(beta[rid], b)
+        return beta
 
 
     def _demand_target(self, t) -> Tuple[List[float], List[float]]:
@@ -192,3 +234,9 @@ class CASADataset:
         x, y_edge, y_value, y_phase, y_demand, demand_mask = self.arrays_full()
         y_availability = np.array([s.y_availability for s in self.samples], dtype=np.float32)
         return x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability
+
+    def arrays_for_training(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return all CASA targets, including per-resource beta_tau calibration scales."""
+        x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability = self.arrays_with_availability()
+        uncertainty_beta = np.array([s.uncertainty_beta or [1.0 for _ in self.vocab.resources] for s in self.samples], dtype=np.float32)
+        return x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, uncertainty_beta

@@ -18,10 +18,29 @@ def mse(pred, target) -> float:
     return float(np.mean((p - y) ** 2))
 
 
-def calibration_interval_loss(error, sigma) -> float:
+def calibration_interval_loss(error, sigma, beta=None, mask=None, sigma_regularizer: float = 0.001) -> float:
+    """Conservative residual-coverage loss.
+
+    Paper-facing CASA calibration is resource-wise: |x - x_hat| should be
+    upper-bounded by beta_tau * sigma_tau for every observable typed resource.
+    ``mask`` excludes missing/non-numeric resource targets.  A very small sigma
+    regularizer avoids the trivial solution of unbounded uncertainty.
+    """
     e = np.abs(np.asarray(error, dtype=float))
     s = np.maximum(np.asarray(sigma, dtype=float), EPS)
-    return float(np.mean(np.maximum(0.0, e - s) + 0.01 * s))
+    b = np.ones_like(s, dtype=float) if beta is None else np.asarray(beta, dtype=float)
+    if b.shape != s.shape:
+        b = np.broadcast_to(b, s.shape)
+    coverage = np.maximum(0.0, e - np.maximum(b, 0.0) * s)
+    if mask is None:
+        return float(np.mean(coverage) + sigma_regularizer * np.mean(s))
+    m = np.asarray(mask, dtype=float)
+    if m.shape != coverage.shape:
+        m = np.broadcast_to(m, coverage.shape)
+    denom = float(np.sum(m))
+    if denom <= 0.0:
+        return 0.0
+    return float(np.sum(coverage * m) / denom + sigma_regularizer * np.sum(s * m) / denom)
 
 
 def phase_cross_entropy(phase_prob, phase_target) -> float:
@@ -43,10 +62,36 @@ def masked_mse(pred, target, mask) -> float:
     return float(np.sum(((p - y) ** 2) * m) / denom)
 
 
-def casa_loss(edge_pred, edge_target, value_pred, value_target, uncertainty=None, phase_pred=None, phase_target=None, demand_pred=None, demand_target=None, demand_mask=None) -> dict:
+def casa_loss(
+    edge_pred,
+    edge_target,
+    value_pred,
+    value_target,
+    uncertainty=None,
+    phase_pred=None,
+    phase_target=None,
+    demand_pred=None,
+    demand_target=None,
+    demand_mask=None,
+    uncertainty_beta=None,
+) -> dict:
     le = binary_cross_entropy(edge_pred, edge_target)
     lv = mse(value_pred, value_target)
-    lu = calibration_interval_loss(np.asarray(edge_pred) - np.asarray(edge_target), uncertainty if uncertainty is not None else np.ones_like(np.asarray(edge_pred)) * 0.1)
     lp = phase_cross_entropy(phase_pred, phase_target) if phase_pred is not None and phase_target is not None else 0.0
     ld = masked_mse(demand_pred, demand_target, demand_mask) if demand_pred is not None and demand_target is not None and demand_mask is not None else 0.0
+
+    # The paper defines calibration on typed demand residuals, not on the binary
+    # edge-classification residual.  Keep a legacy fallback only for callers that
+    # do not provide typed demand targets.
+    if uncertainty is not None and demand_pred is not None and demand_target is not None and demand_mask is not None:
+        u = np.asarray(uncertainty, dtype=float)
+        dp = np.asarray(demand_pred, dtype=float)
+        dt = np.asarray(demand_target, dtype=float)
+        if u.shape == dp.shape == dt.shape:
+            lu = calibration_interval_loss(dp - dt, u, beta=uncertainty_beta, mask=demand_mask)
+        else:
+            lu = calibration_interval_loss(np.asarray(edge_pred) - np.asarray(edge_target), uncertainty)
+    else:
+        default_u = np.ones_like(np.asarray(edge_pred), dtype=float) * 0.1
+        lu = calibration_interval_loss(np.asarray(edge_pred) - np.asarray(edge_target), default_u)
     return {"L_phase": lp, "L_edge": le, "L_demand": ld, "L_cal": lu, "L_value": lv, "L_CASA": lp + le + ld + lu + lv}

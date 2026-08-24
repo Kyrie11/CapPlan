@@ -6,7 +6,7 @@ DATA_ROOT="${DATA_ROOT:-/data0/senzeyu2/dataset/CapPlan/data}"
 CONFIG="${CONFIG:-$CAP_HOME/configs/abilitybench_nuplan_real_data0.yaml}"
 EXT="$DATA_ROOT/external"
 REPORTS="$EXT/reports"
-PIPELINE_VERSION="abilitybench_data0_realism_v4_20260824"
+PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix1_20260824"
 
 mkdir -p "$REPORTS/commands" "$REPORTS/build" "$REPORTS/model" "$REPORTS/eval"
 cd "$CAP_HOME"
@@ -22,8 +22,13 @@ pipeline_version() {
     sha256sum "$0" | awk '{print "CAPPLAN_SCRIPT_SHA256=" $1}'
   fi
   grep -q 'hybrid-realism-rebuild)' "$0" && echo "CAPPLAN_REALISM_STAGE_DISPATCH=present" || echo "CAPPLAN_REALISM_STAGE_DISPATCH=MISSING"
+  grep -q 'hybrid-realism-resume-post-base)' "$0" && echo "CAPPLAN_REALISM_RESUME_DISPATCH=present" || echo "CAPPLAN_REALISM_RESUME_DISPATCH=MISSING"
   grep -q 'abilitybench_hybrid_accessibility_v2_20260823' "$CAP_HOME/scripts/build_hybrid_accessibility_overlay.py" 2>/dev/null \
     && echo "CAPPLAN_HYBRID_GRAPH_V2=present" || echo "CAPPLAN_HYBRID_GRAPH_V2=MISSING"
+  grep -q 'abilitybench_hybrid_pudo_v4_20260824' "$CAP_HOME/scripts/build_hybrid_pudo_evidence.py" 2>/dev/null \
+    && echo "CAPPLAN_HYBRID_PUDO_V4=present" || echo "CAPPLAN_HYBRID_PUDO_V4=MISSING"
+  grep -q 'abilitybench_hybrid_dataset_audit_v3_20260824' "$CAP_HOME/scripts/audit_hybrid_benchmark.py" 2>/dev/null \
+    && echo "CAPPLAN_HYBRID_AUDIT_V3=present" || echo "CAPPLAN_HYBRID_AUDIT_V3=MISSING"
 }
 
 runlog() {
@@ -510,9 +515,13 @@ audit_review_bundle() {
 }
 
 hybrid_review_bundle() {
+  # The review bundle is also the final freeze-readiness gate.  Even on an
+  # incomplete/failed run the Python packager writes a diagnostic ZIP first,
+  # then exits non-zero so stale historical artifacts cannot masquerade as PASS.
   runlog hybrid_review_bundle python scripts/build_hybrid_review_bundle.py \
     --reports_root "$REPORTS" \
-    --output_zip "$REPORTS/capplan_hybrid_review_bundle.zip"
+    --output_zip "$REPORTS/capplan_hybrid_review_bundle.zip" \
+    --require_complete
 }
 
 review_source_complete_audits() {
@@ -604,6 +613,9 @@ PYIDS
         --input_pudo_jsonl "$base_pudo" --output_pudo_jsonl "$hybrid_city" \
         --city "$city" --split "$split" \
         --audit_worklist_csv "$audit_csv" \
+        --site_evidence_peer_jsonl "train=$DATA_ROOT/outputs/prepared/train/pudo/${city}.jsonl" \
+        --site_evidence_peer_jsonl "val=$DATA_ROOT/outputs/prepared/val/pudo/${city}.jsonl" \
+        --site_evidence_peer_jsonl "test=$DATA_ROOT/outputs/prepared/test/pudo/${city}.jsonl" \
         --seed "${CAP_HYBRID_SEED:-20260822}" \
         --min_positive_per_episode "${CAP_HYBRID_MIN_PUDOS:-2}" \
         --report_json "$REPORTS/hybrid_pudo.${split}.${city}.json"
@@ -616,6 +628,11 @@ PYIDS
         "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid/singapore.jsonl" \
       --output "$DATA_ROOT/outputs/prepared/$split/pudo_hybrid_evidence.jsonl"
   done
+  runlog "hybrid_site_consistency" python scripts/audit_hybrid_site_consistency.py \
+    --input "train=$DATA_ROOT/outputs/prepared/train/pudo_hybrid_evidence.jsonl" \
+    --input "val=$DATA_ROOT/outputs/prepared/val/pudo_hybrid_evidence.jsonl" \
+    --input "test=$DATA_ROOT/outputs/prepared/test/pudo_hybrid_evidence.jsonl" \
+    --output "$REPORTS/hybrid_site_consistency.json" --fail_on_error
 }
 
 hybrid_graph_evidence_only() {
@@ -704,6 +721,19 @@ hybrid_reality_refresh() {
   # service requests, labels, city datasets and merged train/val/test outputs.
   hybrid_graph_evidence_only
   hybrid_build
+}
+
+hybrid_realism_resume_post_base() {
+  # Resume after corrected realism-v4 base graph/PUDO materialization has already
+  # completed.  This is the right recovery path for the 2026-08-24 run whose
+  # reports reached site catalog / evidence recovery but never produced fresh
+  # hybrid v2/v4 overlays or final semantic audits.
+  pipeline_version | tee "$REPORTS/commands/pipeline_identity.realism_v4_resume.txt"
+  build_site_catalogs
+  recover_audit_evidence
+  site_disjoint_eval
+  hybrid_evidence
+  hybrid_dataset_build_only
 }
 
 hybrid_realism_rebuild() {
@@ -930,7 +960,8 @@ Stages:
   hybrid-from-existing                 # recommended continuation: source refresh -> recovery -> overlays -> build
   hybrid-full-build                    # complete from-zero four-city train/val/test hybrid benchmark pipeline
   hybrid-reality-refresh               # Rebuild hybrid priors/service/labels only when base graph semantics are already current
-  hybrid-realism-rebuild               # RECOMMENDED realism-v4: rebuild base graph/PUDO + downstream hybrid; reuse scene extraction/downloads
+  hybrid-realism-rebuild               # full realism-v4: rebuild base graph/PUDO + downstream hybrid; reuse scene extraction/downloads
+  hybrid-realism-resume-post-base      # RECOMMENDED for current uploaded state: reuse fresh v5 base graph/PUDO and rebuild audit/hybrid/dataset
   render-audit-packets                # visual rows, or evidence-gap diagnostic packets when visual bucket is empty
   audit-review-bundle                 # small PUDO audit ZIP under reports/ (no NPZ/full dataset)
   hybrid-review-bundle                # compact hybrid rebuild/dataset reports ZIP for remote review
@@ -989,6 +1020,7 @@ case "${1:-}" in
   hybrid-full-build) hybrid_full_build ;;
   hybrid-reality-refresh) hybrid_reality_refresh ;;
   hybrid-realism-rebuild) hybrid_realism_rebuild ;;
+  hybrid-realism-resume-post-base) hybrid_realism_resume_post_base ;;
   render-audit-packets) render_audit_packets ;;
   audit-review-bundle) audit_review_bundle ;;
   hybrid-review-bundle) hybrid_review_bundle ;;
