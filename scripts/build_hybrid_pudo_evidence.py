@@ -27,8 +27,9 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl, write_jsonl
 
-VERSION = "abilitybench_hybrid_pudo_v3_20260823"
+VERSION = "abilitybench_hybrid_pudo_v4_20260824"
 PHYSICAL_FIELDS = ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp")
+STATIC_TRANSFER_FIELDS = (*PHYSICAL_FIELDS, "side")
 REQUIRED_FIELDS = (*PHYSICAL_FIELDS, "legal_stop", "legal_basis", "side", "adjacent_ped_node_id")
 
 
@@ -268,6 +269,95 @@ def _resolve_site_class(observed: Iterable[str], rng: random.Random) -> str:
         if cls in forced:
             return cls
     return _static_site_class(rng)
+
+
+def _canonical_site_static_evidence(
+    prepared_by_episode: Mapping[str, List[tuple[Dict[str, Any], Dict[str, Any]]]],
+    city: str,
+) -> tuple[Dict[str, Dict[str, tuple[Any, Dict[str, Any]]]], Counter, List[Dict[str, Any]]]:
+    """Collect stable observed/derived site facts and make them reusable.
+
+    Repeated nuPlan snapshots often revisit the same physical curb.  If one
+    snapshot has an observed/derived static interface fact and another snapshot
+    is missing it, independently simulating the latter throws away real
+    evidence and can make one curb change width/height across time.  We transfer
+    only evidence-backed *static* fields and never dynamic blockage.  Conflicting
+    evidence is reported and left untouched rather than silently averaged.
+    """
+    vals: Dict[str, Dict[str, List[tuple[Any, Dict[str, Any]]]]] = defaultdict(lambda: defaultdict(list))
+    for prepared in prepared_by_episode.values():
+        for row, prov in prepared:
+            key = _site_key(row, city)
+            for field in STATIC_TRANSFER_FIELDS:
+                pv = prov.get(field) if isinstance(prov.get(field), Mapping) else None
+                if not isinstance(pv, Mapping) or str(pv.get("kind") or "").lower() not in {"observed", "derived", "observed_or_derived"}:
+                    continue
+                value: Any
+                if field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m"}:
+                    value = _as_float(row.get(field))
+                elif field == "curb_ramp":
+                    value = _as_bool(row.get(field))
+                else:
+                    value = None if _blank(row.get(field)) or str(row.get(field)).lower() == "unknown" else str(row.get(field)).lower()
+                if value is not None:
+                    vals[key][field].append((value, dict(pv)))
+
+    canonical: Dict[str, Dict[str, tuple[Any, Dict[str, Any]]]] = defaultdict(dict)
+    counts = Counter()
+    conflicts: List[Dict[str, Any]] = []
+    tolerances = {"curb_height_m": 0.03, "sidewalk_width_m": 0.25, "deployment_clearance_m": 0.25}
+    for key, fields in vals.items():
+        for field, observations in fields.items():
+            raw_values = [x[0] for x in observations]
+            if field in tolerances:
+                xs = sorted(float(x) for x in raw_values)
+                spread = xs[-1] - xs[0]
+                if spread > tolerances[field]:
+                    conflicts.append({"physical_site_key": key, "field": field, "values": xs[:20], "spread": spread})
+                    counts[f"conflict:{field}"] += 1
+                    continue
+                value = xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs)//2 - 1] + xs[len(xs)//2]) / 2.0
+                value = round(value, 4)
+            else:
+                unique = {str(x) for x in raw_values}
+                if len(unique) != 1:
+                    conflicts.append({"physical_site_key": key, "field": field, "values": sorted(unique)[:20]})
+                    counts[f"conflict:{field}"] += 1
+                    continue
+                value = raw_values[0]
+            sources = sorted({str(pv.get("source") or "unknown") for _v, pv in observations})
+            kinds = sorted({str(pv.get("kind") or "unknown") for _v, pv in observations})
+            canonical[key][field] = (value, {
+                "kind": "derived",
+                "source": ";".join(sources[:8]),
+                "method": "same_physical_site_static_evidence_transfer",
+                "physical_site_key": key,
+                "upstream_evidence_kinds": kinds,
+                "supporting_observation_count": len(observations),
+                "claim_scope": "static_site_evidence_reused_across_nuplan_snapshots",
+            })
+            counts[f"canonical:{field}"] += 1
+    return canonical, counts, conflicts
+
+
+def _apply_site_static_evidence(
+    row: MutableMapping[str, Any],
+    prov: MutableMapping[str, Any],
+    site_key: str,
+    canonical: Mapping[str, Mapping[str, tuple[Any, Dict[str, Any]]]],
+    counts: Counter,
+) -> None:
+    facts = canonical.get(site_key) or {}
+    for field, (value, pv) in facts.items():
+        current_missing = (
+            _as_float(row.get(field)) is None if field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m"}
+            else _as_bool(row.get(field)) is None if field == "curb_ramp"
+            else _blank(row.get(field)) or str(row.get(field)).lower() == "unknown"
+        )
+        if current_missing:
+            row[field] = value
+            prov[field] = dict(pv)
+            counts[f"transferred:{field}"] += 1
 
 
 def _scenario_from_row(row: Mapping[str, Any]) -> str:
@@ -514,6 +604,11 @@ def main() -> None:
             prepared.append((row, prov))
         prepared_by_episode[eid] = prepared
 
+    site_static_evidence, site_static_counts, site_static_conflicts = _canonical_site_static_evidence(prepared_by_episode, args.city)
+    for prepared in prepared_by_episode.values():
+        for row, prov in prepared:
+            _apply_site_static_evidence(row, prov, _site_key(row, args.city), site_static_evidence, site_static_counts)
+
     site_class_by_key: Dict[str, str] = {}
     for prepared in prepared_by_episode.values():
         for row, _prov in prepared:
@@ -577,7 +672,7 @@ def main() -> None:
             legal = bool(_as_bool(row.get("legal_stop")))
             eligible = complete and legal and float(row.get("blockage_risk") or 0.0) < 0.85 and float(row.get("deployment_clearance_m") or 0.0) > 0
             row.update({
-                "truth_mode": "hybrid_geometry_anchored_site_correlated_simulated_interface_v2",
+                "truth_mode": "hybrid_geometry_anchored_site_correlated_simulated_interface_v3",
                 "evidence_kind": "mixed" if simulated and any(isinstance(v, Mapping) and str(v.get("kind")) in {"observed", "derived"} for v in prov.values()) else ("simulated" if simulated else "observed_or_derived"),
                 "field_provenance": prov,
                 "hybrid_evidence_complete": complete,
@@ -625,11 +720,14 @@ def main() -> None:
         "curb_side_counts": dict(curb_sides),
         "numeric_field_ranges": {k: {"min": v[0], "max": v[1]} for k, v in numeric_minmax.items()},
         "field_provenance_kind_counts": {k: dict(v) for k, v in sorted(field_kinds.items())},
+        "same_site_static_evidence_counts": dict(site_static_counts),
+        "same_site_static_evidence_conflict_count": len(site_static_conflicts),
+        "same_site_static_evidence_conflict_examples": site_static_conflicts[:50],
         "insufficient_episode_count": len(insufficient_eps),
         "insufficient_episode_examples": insufficient_eps[:50],
         "standard_profile": profile,
         "paper_claim_allowed_for_simulated_rows": False,
-        "interpretation": "Benchmark-ready hybrid truth may contain simulated typed-resource values. Static simulated curb/interface facts are physical-site correlated across official splits; dynamic blockage remains episode/time-specific. Simulated fields are scenario truth only and must not be reported as measured city ground truth.",
+        "interpretation": "Benchmark-ready hybrid truth may contain simulated typed-resource values. Observed/derived static site facts are reused across repeated nuPlan snapshots when consistent; remaining static simulated curb/interface facts are physical-site correlated, while dynamic blockage remains episode/time-specific. Conflicting site evidence is reported rather than overwritten. Simulated fields are scenario truth only and must not be reported as measured city ground truth.",
         "output_pudo_jsonl": str(out),
     }
     rp = Path(args.report_json); rp.parent.mkdir(parents=True, exist_ok=True)

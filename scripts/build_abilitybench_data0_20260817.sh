@@ -6,9 +6,25 @@ DATA_ROOT="${DATA_ROOT:-/data0/senzeyu2/dataset/CapPlan/data}"
 CONFIG="${CONFIG:-$CAP_HOME/configs/abilitybench_nuplan_real_data0.yaml}"
 EXT="$DATA_ROOT/external"
 REPORTS="$EXT/reports"
+PIPELINE_VERSION="abilitybench_data0_realism_v4_20260824"
 
 mkdir -p "$REPORTS/commands" "$REPORTS/build" "$REPORTS/model" "$REPORTS/eval"
 cd "$CAP_HOME"
+
+pipeline_version() {
+  local script_path
+  script_path=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+  echo "CAPPLAN_PIPELINE_VERSION=$PIPELINE_VERSION"
+  echo "CAPPLAN_SCRIPT_PATH=$script_path"
+  echo "CAPPLAN_CAP_HOME=$CAP_HOME"
+  echo "CAPPLAN_CONFIG=$CONFIG"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$0" | awk '{print "CAPPLAN_SCRIPT_SHA256=" $1}'
+  fi
+  grep -q 'hybrid-realism-rebuild)' "$0" && echo "CAPPLAN_REALISM_STAGE_DISPATCH=present" || echo "CAPPLAN_REALISM_STAGE_DISPATCH=MISSING"
+  grep -q 'abilitybench_hybrid_accessibility_v2_20260823' "$CAP_HOME/scripts/build_hybrid_accessibility_overlay.py" 2>/dev/null \
+    && echo "CAPPLAN_HYBRID_GRAPH_V2=present" || echo "CAPPLAN_HYBRID_GRAPH_V2=MISSING"
+}
 
 runlog() {
   local name="$1"; shift
@@ -493,6 +509,12 @@ audit_review_bundle() {
     --output_zip "$REPORTS/capplan_audit_review_bundle.zip"
 }
 
+hybrid_review_bundle() {
+  runlog hybrid_review_bundle python scripts/build_hybrid_review_bundle.py \
+    --reports_root "$REPORTS" \
+    --output_zip "$REPORTS/capplan_hybrid_review_bundle.zip"
+}
+
 review_source_complete_audits() {
   : "${REVIEWER_ID:?Set REVIEWER_ID only after a reviewer has inspected source_complete_review_candidates.csv}"
   : "${CONFIRM_SOURCE_REVIEW:?Set CONFIRM_SOURCE_REVIEW=YES only after actual human review}"
@@ -604,6 +626,12 @@ hybrid_graph_evidence_only() {
   for split in train val test; do
     base_graph="$DATA_ROOT/outputs/prepared/$split/accessibility_graphs"
     hybrid_graph="$DATA_ROOT/outputs/prepared/$split/accessibility_graphs_hybrid"
+    # The current hybrid overlay is a complete materialization of the current
+    # capped episode inventory.  Remove stale episode files from older overlay
+    # versions/selections before repopulating all four cities.  Otherwise a
+    # previous scene can remain discoverable by build_service_layer.py even
+    # though it is no longer in the current inventory.
+    rm -rf "$hybrid_graph"
     mkdir -p "$hybrid_graph"
     for city in boston pittsburgh vegas singapore; do
       allowlist="$REPORTS/hybrid_episode_ids.${split}.${city}.txt"
@@ -679,7 +707,7 @@ hybrid_reality_refresh() {
 }
 
 hybrid_realism_rebuild() {
-  # Recommended rebuild for the 2026-08-23 realism-v3 fix.  Scene extraction,
+  # Recommended rebuild for the corrected realism-v4 pipeline.  Scene extraction,
   # full nuPlan identity indexes and downloaded external sources are reused.
   # Base accessibility graphs must be regenerated because DEM samples are now
   # evidence (<=5 m endpoint elevation -> derived grade) instead of accidental
@@ -688,13 +716,16 @@ hybrid_realism_rebuild() {
   local graph_jobs="${CAP_GRAPH_CITY_JOBS:-2}"
   local pudo_jobs="${CAP_PUDO_CITY_JOBS:-4}"
   local split
+  # Record the exact checkout/script identity at the start of the expensive run.
+  # This makes wrong-checkout failures visible in the reports bundle.
+  pipeline_version | tee "$REPORTS/commands/pipeline_identity.realism_v4.txt"
   for split in train val test; do
-    runlog "realism_v3_preflight.${split}" python scripts/prepare_abilitybench_external.py \
+    runlog "realism_v4_preflight.${split}" python scripts/prepare_abilitybench_external.py \
       --config "$CONFIG" --split "$split" --source_policy bootstrap \
       --cities boston+pittsburgh+vegas+singapore --stages preflight
-    run_city_stage_parallel "$split" bootstrap graphs "$graph_jobs" realism_v3_base config
-    run_city_stage_parallel "$split" bootstrap pudo "$pudo_jobs" realism_v3_base config
-    concat_split_pudo "$split" realism_v3_base
+    run_city_stage_parallel "$split" bootstrap graphs "$graph_jobs" realism_v4_base config
+    run_city_stage_parallel "$split" bootstrap pudo "$pudo_jobs" realism_v4_base config
+    concat_split_pudo "$split" realism_v4_base
   done
   build_site_catalogs
   recover_audit_evidence
@@ -868,6 +899,7 @@ usage() {
   cat <<USAGE
 Usage: $0 <stage>
 Stages:
+  version                              # print exact pipeline/check-out identity before long runs
   migrate
   inspect-nuplan
   prepare-osm
@@ -898,9 +930,10 @@ Stages:
   hybrid-from-existing                 # recommended continuation: source refresh -> recovery -> overlays -> build
   hybrid-full-build                    # complete from-zero four-city train/val/test hybrid benchmark pipeline
   hybrid-reality-refresh               # Rebuild hybrid priors/service/labels only when base graph semantics are already current
-  hybrid-realism-rebuild               # RECOMMENDED for realism-v3: rebuild base graph/PUDO + downstream hybrid; reuse scene extraction/downloads
+  hybrid-realism-rebuild               # RECOMMENDED realism-v4: rebuild base graph/PUDO + downstream hybrid; reuse scene extraction/downloads
   render-audit-packets                # visual rows, or evidence-gap diagnostic packets when visual bucket is empty
-  audit-review-bundle                 # small uploadable ZIP under reports/ (no NPZ/full dataset)
+  audit-review-bundle                 # small PUDO audit ZIP under reports/ (no NPZ/full dataset)
+  hybrid-review-bundle                # compact hybrid rebuild/dataset reports ZIP for remote review
   review-source-complete-audits
   import-source-complete-audits
   import-completed-manual-audits
@@ -924,6 +957,7 @@ USAGE
 }
 
 case "${1:-}" in
+  version|pipeline-version) pipeline_version ;;
   migrate) migrate ;;
   inspect-nuplan) inspect_nuplan ;;
   prepare-osm) prepare_osm ;;
@@ -957,6 +991,7 @@ case "${1:-}" in
   hybrid-realism-rebuild) hybrid_realism_rebuild ;;
   render-audit-packets) render_audit_packets ;;
   audit-review-bundle) audit_review_bundle ;;
+  hybrid-review-bundle) hybrid_review_bundle ;;
   review-source-complete-audits) review_source_complete_audits ;;
   import-source-complete-audits) import_source_complete_audits ;;
   import-completed-manual-audits) import_completed_manual_audits ;;

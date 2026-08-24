@@ -328,6 +328,7 @@ def main() -> None:
     reports = Counter()
     field_kind_counts: Dict[str, Counter] = defaultdict(Counter)
     group_classes = Counter()
+    group_class_edge_counts = Counter()
     group_class_by_key: Dict[str, str] = {}
     simulation_groups: set[str] = set()
     numeric_minmax: Dict[str, list[float | None]] = {k: [None, None] for k in ("width_m", "slope", "cross_slope")}
@@ -351,6 +352,7 @@ def main() -> None:
             prev_class = group_class_by_key.setdefault(group_key, gclass)
             if prev_class != gclass:
                 raise RuntimeError(f"simulation group {group_key} changed class within one overlay: {prev_class} != {gclass}")
+            group_class_edge_counts[gclass] += 1
             for field, bounds in numeric_minmax.items():
                 try:
                     val = float(row.get(field))
@@ -404,7 +406,7 @@ def main() -> None:
         "edges": edges_total,
         "simulation_group_count": len(simulation_groups),
         "simulation_group_class_counts": dict(group_classes),
-        "simulation_group_class_edge_counts": dict(group_classes),  # backward-compatible alias; counts unique groups in v2
+        "simulation_group_class_edge_counts": dict(group_class_edge_counts),
         "numeric_field_ranges": {k: {"min": v[0], "max": v[1]} for k, v in numeric_minmax.items()},
         "categorical_field_counts": {k: dict(v) for k, v in categorical_counts.items()},
         "edges_with_any_simulated_field": simulated_edges,

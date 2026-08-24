@@ -21,7 +21,7 @@ from typing import Any, Dict, Iterable, List, Mapping
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl
 
-VERSION = "abilitybench_hybrid_dataset_audit_v1_20260823"
+VERSION = "abilitybench_hybrid_dataset_audit_v2_20260824"
 
 
 def _rows(path: Path) -> Iterable[Dict[str, Any]]:
@@ -116,12 +116,16 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
     cert_resource = Counter(str(c.get("resource_type") or "unknown") for c in certs)
     if certs and len(cert_resource) < 3:
         warnings.append(f"failure certificates cover only {len(cert_resource)} resource types")
+    if certs and len(cert_phase) < 3:
+        warnings.append(f"failure certificates cover only {len(cert_phase)} service phases")
 
     y_pos = 0; y_total = 0
     for r in edge_labels:
         y_total += 1
         y_pos += int(bool(r.get("y_e_p")))
     edge_positive_rate = y_pos / max(1, y_total)
+    if y_total and (edge_positive_rate < 0.05 or edge_positive_rate > 0.95):
+        warnings.append(f"passenger-edge labels are highly imbalanced: positive_rate={edge_positive_rate:.4f}")
 
     vehicle_ids_by_ep: Dict[str, set[str]] = defaultdict(set)
     vehicle_type_counts = Counter()
@@ -158,13 +162,36 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
     frontage_rate = frontage_count / max(1, len(requests))
     if frontage_rate > 0.90:
         warnings.append(f"{frontage_rate:.1%} of requests use simulated frontage access points; consider reporting this explicitly")
+    scene_time_count = int(time_sources.get("nuplan_scene_timestamp", 0))
+    if requests and scene_time_count < len(requests):
+        warnings.append(f"{len(requests) - scene_time_count} service requests do not use the nuPlan scene timestamp")
 
     pudo_by_ep = Counter(str(p.get("episode_id")) for p in pudo)
+    hybrid_eligible_by_ep = Counter(str(p.get("episode_id")) for p in pudo if bool(p.get("hybrid_eligible")) and bool(p.get("legal_stop")))
     bad_pudo_eps = sorted(eid for eid in episode_ids if pudo_by_ep[eid] < 2)
+    bad_eligible_pudo_eps = sorted(eid for eid in episode_ids if hybrid_eligible_by_ep[eid] < 2)
     if bad_pudo_eps:
         errors.append(f"{len(bad_pudo_eps)} retained episodes contain fewer than two PUDO anchors")
+    if bad_eligible_pudo_eps:
+        errors.append(f"{len(bad_eligible_pudo_eps)} retained episodes contain fewer than two legal hybrid-eligible PUDO anchors")
     curb_sides = Counter(str(p.get("side") or "unknown") for p in pudo)
     pudo_truth_modes = Counter(str(p.get("truth_mode") or (p.get("metadata") or {}).get("truth_mode") or "unknown") for p in pudo)
+    pudo_scenario_classes = Counter(str(p.get("hybrid_scenario_class") or "unknown") for p in pudo)
+    pudo_site_classes = Counter(str(p.get("hybrid_site_prior_class") or "unknown") for p in pudo)
+    pudo_site_keys = {str(p.get("hybrid_physical_site_key")) for p in pudo if p.get("hybrid_physical_site_key")}
+    core_pudo_fields = ["curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp", "legal_stop", "side", "blockage_risk"]
+    pudo_provenance: Dict[str, Counter] = {field: Counter() for field in core_pudo_fields}
+    missing_core_provenance = 0
+    for p in pudo:
+        fp = p.get("field_provenance") if isinstance(p.get("field_provenance"), Mapping) else {}
+        for field in core_pudo_fields:
+            pv = fp.get(field) if isinstance(fp, Mapping) else None
+            if isinstance(pv, Mapping):
+                pudo_provenance[field][str(pv.get("kind") or "unknown")] += 1
+            elif field != "blockage_risk":
+                missing_core_provenance += 1
+    if missing_core_provenance:
+        warnings.append(f"{missing_core_provenance} retained PUDO core-field values lack explicit provenance")
 
     # For explicit monotonic pairs, a stricter contract must never succeed when
     # the base contract fails under identical scene/OD/vehicle evidence.
@@ -209,6 +236,12 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
         "request_local_hour": _quantiles(local_hours),
         "pudo_curb_side_counts": dict(curb_sides),
         "pudo_truth_mode_counts": dict(pudo_truth_modes),
+        "pudo_hybrid_eligible_count_per_episode_distribution": {str(k): v for k, v in sorted(Counter(hybrid_eligible_by_ep.get(eid, 0) for eid in episode_ids).items())},
+        "pudo_scenario_class_counts": dict(pudo_scenario_classes),
+        "pudo_site_prior_class_counts": dict(pudo_site_classes),
+        "pudo_physical_site_key_count": len(pudo_site_keys),
+        "pudo_core_field_provenance_kind_counts": {k: dict(v) for k, v in pudo_provenance.items()},
+        "pudo_missing_core_provenance_count": missing_core_provenance,
         "errors": errors[:200],
         "warnings": warnings[:200],
         "interpretation": (

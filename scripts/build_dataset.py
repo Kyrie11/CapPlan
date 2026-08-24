@@ -339,7 +339,9 @@ def _apply_pudo_evidence_overrides(anchors: List[PUDOAnchor], evidence: Dict[tup
         "paper_evidence_complete", "paper_eligible", "evidence_status", "evidence_notes",
         "legal_basis", "curb_ramp", "truth_mode", "evidence_kind", "field_provenance",
         "hybrid_evidence_complete", "hybrid_eligible", "deployment_clearance_semantics",
-        "hybrid_scenario_class", "hybrid_seed", "paper_claim_allowed",
+        "hybrid_scenario_class", "hybrid_site_prior_class", "hybrid_seed",
+        "hybrid_dynamic_seed", "hybrid_physical_site_key", "hybrid_standard_profile",
+        "hybrid_missing_fields", "paper_claim_allowed",
     }
     updated: List[PUDOAnchor] = []
     for a in anchors:
@@ -451,7 +453,12 @@ def _pudo_anchors_from_evidence_rows(evidence: Dict[tuple[str | None, str], Dict
             hybrid_eligible=_as_bool_field(row.get("hybrid_eligible"), default=False),
             deployment_clearance_semantics=str(row.get("deployment_clearance_semantics") or "available_environment_clear_space"),
             hybrid_scenario_class=row.get("hybrid_scenario_class"),
+            hybrid_site_prior_class=row.get("hybrid_site_prior_class"),
             hybrid_seed=int(row["hybrid_seed"]) if row.get("hybrid_seed") not in (None, "") else None,
+            hybrid_dynamic_seed=int(row["hybrid_dynamic_seed"]) if row.get("hybrid_dynamic_seed") not in (None, "") else None,
+            hybrid_physical_site_key=row.get("hybrid_physical_site_key"),
+            hybrid_standard_profile=row.get("hybrid_standard_profile"),
+            hybrid_missing_fields=list(row.get("hybrid_missing_fields") or []),
             paper_claim_allowed=_as_bool_field(row.get("paper_claim_allowed"), default=True),
         ))
     return anchors
@@ -948,7 +955,7 @@ def main() -> None:
         "nuplan": {"data_root": args.nuplan_data_root or args.nuplan_root, "map_root": args.nuplan_map_root, "sensor_root": args.nuplan_sensor_root, "db_files_requested": resolved_db_files, "db_files_expanded": adapter.db_files if args.scene_source == "nuplan" else [], "map_version": args.nuplan_map_version},
         "accessibility_source": args.accessibility_source, "accessibility_graph_dir": args.accessibility_graph_dir, "pudo_source": args.pudo_source, "pudo_evidence_jsonl": args.pudo_evidence_jsonl,
         "paper_mode": bool(args.paper_mode), "source_policy": args.source_policy,
-        "truth_mode": "hybrid_geometry_anchored_site_feature_correlated_simulated_resource_truth_v2" if args.source_policy == "hybrid" else ("audited_city_evidence" if args.source_policy == "paper" else "bootstrap_unknowns_fail_closed"),
+        "truth_mode": "hybrid_geometry_anchored_site_feature_correlated_simulated_resource_truth_v3" if args.source_policy == "hybrid" else ("audited_city_evidence" if args.source_policy == "paper" else "bootstrap_unknowns_fail_closed"),
         "benchmark_ready": bool(args.source_policy in {"hybrid", "paper"}),
         "publication_ready": bool(args.paper_mode and args.source_policy == "paper" and (preflight or {}).get("publication_ready", False)),
         "simulated_values_are_real_city_ground_truth": False if args.source_policy == "hybrid" else None,

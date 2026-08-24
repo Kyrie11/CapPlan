@@ -137,3 +137,65 @@ def test_coarse_dem_is_not_promoted_to_sidewalk_scale_slope():
     assert len(graph.nodes) == 2
     assert all(e.slope is None for e in graph.edges)
     assert graph.metadata["coarse_elevation_samples_ignored_for_local_grade"] == 2
+
+
+def test_same_site_observed_static_evidence_is_reused_for_missing_snapshot():
+    mod = _load_script("hybrid_pudo_site_transfer_20260824", "scripts/build_hybrid_pudo_evidence.py")
+    observed = {
+        "anchor_id": "a1", "episode_id": "ep1", "x": 10.0, "y": 20.0,
+        "side": "right", "adjacent_ped_node_id": "ped:1", "lane_id": "lane:1",
+        "curb_height_m": 0.03, "sidewalk_width_m": 1.75,
+        "deployment_clearance_m": 1.62, "curb_ramp": True,
+    }
+    missing = {**observed, "anchor_id": "a2", "episode_id": "ep2",
+               "curb_height_m": None, "sidewalk_width_m": None,
+               "deployment_clearance_m": None, "curb_ramp": None}
+    prepared = {
+        "ep1": [(observed, {
+            "curb_height_m": {"kind": "observed", "source": "site_survey"},
+            "sidewalk_width_m": {"kind": "observed", "source": "site_survey"},
+            "deployment_clearance_m": {"kind": "observed", "source": "site_survey"},
+            "curb_ramp": {"kind": "observed", "source": "site_survey"},
+            "side": {"kind": "derived", "source": "map_geometry"},
+        })],
+        "ep2": [(missing, {"side": {"kind": "derived", "source": "map_geometry"}})],
+    }
+    canonical, counts, conflicts = mod._canonical_site_static_evidence(prepared, "boston")
+    assert conflicts == []
+    prov2 = prepared["ep2"][0][1]
+    key = mod._site_key(missing, "boston")
+    mod._apply_site_static_evidence(missing, prov2, key, canonical, counts)
+    assert missing["curb_height_m"] == 0.03
+    assert missing["sidewalk_width_m"] == 1.75
+    assert missing["deployment_clearance_m"] == 1.62
+    assert missing["curb_ramp"] is True
+    assert prov2["sidewalk_width_m"]["kind"] == "derived"
+    assert prov2["sidewalk_width_m"]["method"] == "same_physical_site_static_evidence_transfer"
+
+
+def test_dataset_materialization_preserves_hybrid_physical_site_identity():
+    mod = _load_script("build_dataset_hybrid_site_identity_20260824", "scripts/build_dataset.py")
+    row = {
+        "episode_id": "ep", "anchor_id": "a", "kind": "pickup_dropoff",
+        "x": 1.0, "y": 2.0, "side": "right", "legal_stop": True,
+        "legal_stop_source": "sim", "adjacent_ped_node_id": "ped:1",
+        "curb_height_m": 0.03, "sidewalk_width_m": 1.6,
+        "deployment_clearance_m": 1.7, "curb_ramp": True,
+        "blockage_risk": 0.05, "map_confidence": 0.85, "dynamic_confidence": 0.95,
+        "hybrid_evidence_complete": True, "hybrid_eligible": True,
+        "hybrid_scenario_class": "accessible_loading",
+        "hybrid_site_prior_class": "accessible_loading",
+        "hybrid_seed": 11, "hybrid_dynamic_seed": 12,
+        "hybrid_physical_site_key": "boston|ped:1|lane:1|0:0",
+        "hybrid_standard_profile": "US_prior",
+        "hybrid_missing_fields": [],
+        "paper_claim_allowed": False,
+        "field_provenance": {"curb_height_m": {"kind": "simulated"}},
+    }
+    anchors = mod._pudo_anchors_from_evidence_rows({("ep", "a"): row}, "ep")
+    assert len(anchors) == 1
+    a = anchors[0]
+    assert a.hybrid_physical_site_key == row["hybrid_physical_site_key"]
+    assert a.hybrid_site_prior_class == "accessible_loading"
+    assert a.hybrid_dynamic_seed == 12
+    assert a.hybrid_standard_profile == "US_prior"

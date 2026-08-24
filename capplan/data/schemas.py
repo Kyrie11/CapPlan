@@ -240,7 +240,12 @@ class PUDOAnchor:
     hybrid_eligible: bool = False
     deployment_clearance_semantics: str = "legacy_effective_clearance"
     hybrid_scenario_class: str | None = None
+    hybrid_site_prior_class: str | None = None
     hybrid_seed: int | None = None
+    hybrid_dynamic_seed: int | None = None
+    hybrid_physical_site_key: str | None = None
+    hybrid_standard_profile: str | None = None
+    hybrid_missing_fields: List[str] = field(default_factory=list)
     paper_claim_allowed: bool = True
 
     @property

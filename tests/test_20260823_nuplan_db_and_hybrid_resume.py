@@ -136,3 +136,27 @@ def test_hybrid_ready_allowlist_rejects_without_synthesizing_geometry(tmp_path: 
     assert rep["allowed_episode_count"] == 1
     assert rep["rejected_episode_count"] == 2
     assert rep["rejection_reason_counts"]["insufficient_geometry_anchored_candidates"] == 1
+
+
+def test_prepare_internal_artifact_gate_accepts_text_allowlist_and_is_lightweight(tmp_path: Path):
+    mod = _load_script("prepare_internal_artifact_gate_20260824", "scripts/prepare_abilitybench_external.py")
+    allow = tmp_path / "ready.txt"
+    allow.write_text("# hybrid-ready episodes\nep_a\nep_b\n", encoding="utf-8")
+    # The internal gate must not call the external source inspector.  In
+    # particular, plain-text allowlists are valid pipeline artifacts.
+    mod.inspect_source = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("inspect_source must not be called"))
+    mod._require_artifact(allow, "hybrid-ready allowlist", False)
+
+    graph_dir = tmp_path / "graphs"
+    graph_dir.mkdir()
+    (graph_dir / "ep.edges.jsonl").write_text('{"edge_id":"e"}\n', encoding="utf-8")
+    mod._require_artifact(graph_dir, "accessibility graphs", False)
+
+
+def test_prepare_internal_artifact_gate_rejects_empty_text_allowlist(tmp_path: Path):
+    import pytest
+    mod = _load_script("prepare_internal_artifact_gate_empty_20260824", "scripts/prepare_abilitybench_external.py")
+    allow = tmp_path / "empty.txt"
+    allow.write_text("# comments only\n\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="no usable entries"):
+        mod._require_artifact(allow, "hybrid-ready allowlist", False)
