@@ -29,7 +29,8 @@ from capplan.utils.serialization import iter_jsonl, write_jsonl
 
 VERSION = "abilitybench_hybrid_pudo_v4_20260824"
 PHYSICAL_FIELDS = ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp")
-STATIC_TRANSFER_FIELDS = (*PHYSICAL_FIELDS, "side")
+STATIC_TRANSFER_FIELDS = PHYSICAL_FIELDS
+SIDE_SEMANTICS = "episode_route_relative_service_approach_relation"
 REQUIRED_FIELDS = (*PHYSICAL_FIELDS, "legal_stop", "legal_basis", "side", "adjacent_ped_node_id")
 
 
@@ -207,7 +208,8 @@ def _site_key(row: Mapping[str, Any], city: str, radius_m: float = 5.0) -> str:
 
     Static simulated curb/interface facts must not flip just because the same
     curb is observed in another nuPlan snapshot.  Prefer the stable adjacent
-    pedestrian node and include a 5 m geometry cell as a guard.
+    pedestrian node and include a 5 m geometry cell as a guard.  The route-
+    relative ``side`` relation is deliberately NOT part of this identity.
     """
     x, y = _xy(row)
     q = "unknown"
@@ -281,8 +283,9 @@ def _canonical_site_static_evidence(
     snapshot has an observed/derived static interface fact and another snapshot
     is missing it, independently simulating the latter throws away real
     evidence and can make one curb change width/height across time.  We transfer
-    only evidence-backed *static* fields and never dynamic blockage.  Conflicting
-    evidence is reported and left untouched rather than silently averaged.
+    only evidence-backed *immutable physical* fields and never dynamic blockage
+    or the episode-route-relative left/right service relation.  Conflicting
+    physical evidence is reported and left untouched rather than silently averaged.
     """
     vals: Dict[str, Dict[str, List[tuple[Any, Dict[str, Any]]]]] = defaultdict(lambda: defaultdict(list))
     for prepared in prepared_by_episode.values():
@@ -780,7 +783,7 @@ def main() -> None:
         "insufficient_episode_examples": insufficient_eps[:50],
         "standard_profile": profile,
         "paper_claim_allowed_for_simulated_rows": False,
-        "interpretation": "Benchmark-ready hybrid truth may contain simulated typed-resource values. Observed/derived static site facts are reused across repeated nuPlan snapshots when consistent; remaining static simulated curb/interface facts are physical-site correlated, while dynamic blockage remains episode/time-specific. Conflicting site evidence is reported rather than overwritten. Simulated fields are scenario truth only and must not be reported as measured city ground truth.",
+        "interpretation": "Benchmark-ready hybrid truth may contain simulated typed-resource values. Observed/derived immutable physical site facts are reused across repeated nuPlan snapshots when consistent; remaining static simulated curb/interface facts are physical-site correlated, while dynamic blockage remains episode/time-specific. PUDO side is route-relative to the current episode approach and is therefore not canonicalized across physical-site snapshots. Conflicting immutable site evidence is reported rather than overwritten. Simulated fields are scenario truth only and must not be reported as measured city ground truth.",
         "output_pudo_jsonl": str(out),
     }
     rp = Path(args.report_json); rp.parent.mkdir(parents=True, exist_ok=True)

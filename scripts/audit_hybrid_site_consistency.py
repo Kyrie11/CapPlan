@@ -19,13 +19,14 @@ from typing import Any, Mapping
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl
 
-VERSION = "abilitybench_hybrid_site_consistency_v1_20260824"
+VERSION = "abilitybench_hybrid_site_consistency_v2_20260825"
 NUMERIC_TOL = {
     "curb_height_m": 0.03,
     "sidewalk_width_m": 0.25,
     "deployment_clearance_m": 0.25,
 }
-CATEGORICAL = ("curb_ramp", "side", "lighting", "shelter")
+SITE_STATIC_CATEGORICAL = ("curb_ramp", "lighting", "shelter")
+RELATIONAL_FIELDS = ("side",)
 
 
 def _blank(v: Any) -> bool:
@@ -64,6 +65,7 @@ def main() -> None:
     repeated_sites = 0
     cross_split_sites = 0
     legal_variation_sites = 0
+    relational_variation_sites = {field: 0 for field in RELATIONAL_FIELDS}
     for key, items in by_site.items():
         if len(items) > 1:
             repeated_sites += 1
@@ -83,11 +85,21 @@ def main() -> None:
                 xs = [v for _, v in vals]
                 if max(xs) - min(xs) > tol + 1e-12:
                     conflicts.append({"physical_site_key": key, "field": field, "values": vals[:30], "spread": max(xs)-min(xs), "tolerance": tol})
-        for field in CATEGORICAL:
+        for field in SITE_STATIC_CATEGORICAL:
             vals = [(split, str(row.get(field)).lower()) for split, row in items if not _blank(row.get(field)) and str(row.get(field)).lower() != "unknown"]
             uniq = {v for _, v in vals}
             if len(uniq) > 1:
                 conflicts.append({"physical_site_key": key, "field": field, "values": vals[:30]})
+        # ``side`` is intentionally *not* a physical-site invariant.  Base PUDO
+        # construction derives it from the candidate point relative to the
+        # direction of the current episode route.  The same curb can therefore
+        # be left for one service approach and right for the reverse approach.
+        # It remains an important per-transition interface relation, but must not
+        # be transferred or audited as immutable curb geometry.
+        for field in RELATIONAL_FIELDS:
+            vals = {str(row.get(field)).lower() for _, row in items if not _blank(row.get(field)) and str(row.get(field)).lower() != "unknown"}
+            if len(vals) > 1:
+                relational_variation_sites[field] += 1
         legal = {bool(row.get("legal_stop")) for _, row in items if row.get("legal_stop") is not None}
         if len(legal) > 1:
             legal_variation_sites += 1
@@ -108,10 +120,12 @@ def main() -> None:
         "static_conflict_count": len(conflicts),
         "static_conflict_examples": conflicts[:100],
         "legal_stop_variation_site_count": legal_variation_sites,
+        "relational_variation_site_counts": relational_variation_sites,
         "missing_physical_site_key_count": missing_site_key,
         "dynamic_fields_excluded": ["blockage_risk", "dynamic_confidence", "hybrid_dynamic_seed"],
+        "relational_fields_excluded_from_static_consistency": list(RELATIONAL_FIELDS),
         "errors": errors,
-        "interpretation": "Static curb/interface facts are checked across official splits; dynamic blockage is intentionally allowed to vary by episode/time. legal_stop variation is reported but not a static-geometry failure because real restrictions can be time-dependent.",
+        "interpretation": "Immutable curb/interface facts are checked across official splits. Dynamic blockage is episode/time dependent. PUDO side is an episode-route-relative service-approach relation, so left/right variation at one physical curb is valid and is reported informationally rather than treated as a static-site conflict. legal_stop variation is also reported but not treated as static geometry because restrictions can be time-dependent.",
     }
     out = Path(args.output); out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")

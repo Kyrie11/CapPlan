@@ -95,16 +95,16 @@ def test_cross_split_peer_static_evidence_transfers_observed_width(tmp_path):
     assert json.loads(report.read_text())["cross_split_site_evidence_peer_rows_loaded"] == 1
 
 
-def test_site_consistency_audit_excludes_dynamic_blockage(tmp_path):
+def test_site_consistency_audit_excludes_dynamic_and_route_relative_side(tmp_path):
     inputs = []
-    for split, blockage in [("train", 0.02), ("val", 0.93), ("test", 0.07)]:
+    for split, blockage, side in [("train", 0.02, "right"), ("val", 0.93, "left"), ("test", 0.07, "right")]:
         p = tmp_path / f"{split}.jsonl"
         p.write_text(json.dumps({
             "episode_id": f"{split}:ep", "anchor_id": "a",
             "hybrid_physical_site_key": "boston|ped:1|lane:1|2:4",
             "curb_height_m": 0.03, "sidewalk_width_m": 1.6,
             "deployment_clearance_m": 1.7, "curb_ramp": True,
-            "side": "right", "lighting": "lit", "shelter": False,
+            "side": side, "lighting": "lit", "shelter": False,
             "legal_stop": True, "blockage_risk": blockage,
         }) + "\n")
         inputs.extend(["--input", f"{split}={p}"])
@@ -115,5 +115,85 @@ def test_site_consistency_audit_excludes_dynamic_blockage(tmp_path):
     ], cwd=ROOT)
     d = json.loads(report.read_text())
     assert d["status"] == "PASS"
+    assert d["version"] == "abilitybench_hybrid_site_consistency_v2_20260825"
     assert d["cross_split_physical_site_count"] == 1
     assert d["static_conflict_count"] == 0
+    assert d["relational_variation_site_counts"]["side"] == 1
+    assert "side" in d["relational_fields_excluded_from_static_consistency"]
+
+
+def test_site_consistency_still_fails_true_static_geometry_conflict(tmp_path):
+    inputs = []
+    for split, width in [("train", 1.60), ("val", 2.20)]:
+        p = tmp_path / f"{split}.jsonl"
+        p.write_text(json.dumps({
+            "episode_id": f"{split}:ep", "anchor_id": "a",
+            "hybrid_physical_site_key": "boston|ped:1|lane:1|2:4",
+            "curb_height_m": 0.03, "sidewalk_width_m": width,
+            "deployment_clearance_m": 1.7, "curb_ramp": True,
+            "side": "right", "lighting": "lit", "shelter": False,
+            "legal_stop": True, "blockage_risk": 0.05,
+        }) + "\n")
+        inputs.extend(["--input", f"{split}={p}"])
+    report = tmp_path / "site.json"
+    proc = subprocess.run([
+        sys.executable, "scripts/audit_hybrid_site_consistency.py",
+        *inputs, "--output", str(report), "--fail_on_error",
+    ], cwd=ROOT, check=False)
+    assert proc.returncode == 2
+    d = json.loads(report.read_text())
+    assert d["status"] == "FAIL"
+    assert d["static_conflict_count"] == 1
+    assert d["static_conflict_examples"][0]["field"] == "sidewalk_width_m"
+
+
+def test_route_relative_side_is_not_canonicalized_as_static_site_evidence():
+    mod = _load_script("hybrid_pudo_route_side_reviewfix2", "scripts/build_hybrid_pudo_evidence.py")
+    a = {
+        "anchor_id": "a1", "episode_id": "ep1", "x": 10.0, "y": 20.0,
+        "side": "right", "adjacent_ped_node_id": "ped:1", "lane_id": "lane:1",
+        "curb_height_m": 0.03, "sidewalk_width_m": 1.75,
+        "deployment_clearance_m": 1.62, "curb_ramp": True,
+    }
+    b = {**a, "anchor_id": "a2", "episode_id": "ep2", "side": "left"}
+    prov = {
+        "curb_height_m": {"kind": "observed", "source": "survey"},
+        "sidewalk_width_m": {"kind": "observed", "source": "survey"},
+        "deployment_clearance_m": {"kind": "observed", "source": "survey"},
+        "curb_ramp": {"kind": "observed", "source": "survey"},
+        "side": {"kind": "derived", "source": "episode_route_geometry"},
+    }
+    prepared = {"ep1": [(a, dict(prov))], "ep2": [(b, dict(prov))]}
+    canonical, counts, conflicts = mod._canonical_site_static_evidence(prepared, "boston")
+    assert conflicts == []
+    assert "side" not in canonical[mod._site_key(a, "boston")]
+    assert counts.get("conflict:side", 0) == 0
+
+
+def test_reviewfix2_pipeline_exposes_post_pudo_resume_stage():
+    script = (ROOT / "scripts/build_abilitybench_data0_20260817.sh").read_text()
+    assert 'PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix2_20260825"' in script
+    assert "hybrid-realism-resume-post-pudo) hybrid_realism_resume_post_pudo" in script
+    assert "CAPPLAN_SITE_AUDIT_V2=present" in script
+
+def test_reviewfix2_pipeline_exposes_recommended_resume_stage():
+    script = (ROOT / "scripts/build_abilitybench_data0_20260817.sh").read_text()
+    assert "hybrid-realism-resume-reviewfix2) hybrid_realism_resume_reviewfix2" in script
+    assert "CAPPLAN_REVIEWFIX2_RESUME_DISPATCH=present" in script
+
+
+def test_review_bundle_rejects_fresh_hybrid_pudo_report_with_static_conflicts(tmp_path):
+    mod = _load_script("hybrid_review_bundle_reviewfix2", "scripts/build_hybrid_review_bundle.py")
+    root = tmp_path / "reports"; (root / "commands").mkdir(parents=True)
+    identity = root / "commands/pipeline_identity.realism_v4_resume.txt"
+    identity.write_text("CAPPLAN_PIPELINE_VERSION=test\n")
+    pudo = root / "hybrid_pudo.train.boston.json"
+    pudo.write_text(json.dumps({
+        "status": "PASS", "version": "abilitybench_hybrid_pudo_v4_20260824",
+        "same_site_static_evidence_conflict_count": 3,
+    }))
+    now = identity.stat().st_mtime_ns
+    os.utime(pudo, ns=(now + 10_000_000, now + 10_000_000))
+    report = mod._assess(root)
+    assert report["status"] == "FAIL"
+    assert any(x["path"] == "hybrid_pudo.train.boston.json" for x in report["failed_required"])

@@ -19,11 +19,12 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "capplan_hybrid_review_bundle_v2_20260824"
+VERSION = "capplan_hybrid_review_bundle_v3_20260825"
 EXPECTED_GRAPH_VERSION = "abilitybench_hybrid_accessibility_v2_20260823"
 EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v4_20260824"
 EXPECTED_READY_VERSION = "abilitybench_hybrid_ready_allowlist_v1_20260823"
 EXPECTED_AUDIT_VERSION = "abilitybench_hybrid_dataset_audit_v3_20260824"
+EXPECTED_SITE_AUDIT_VERSION = "abilitybench_hybrid_site_consistency_v2_20260825"
 SPLITS = ("train", "val", "test")
 CITIES = ("boston", "pittsburgh", "vegas", "singapore")
 
@@ -51,6 +52,7 @@ REPORT_GLOBS = (
 
 COMMAND_GLOBS = (
     "commands/pipeline_identity*.txt",
+    "commands/manual_pipeline_identity*.txt",
     "commands/hybrid_realism*.log",
     "commands/realism_v4_*.log",
     "commands/paper_site_catalog.*.log",
@@ -120,7 +122,7 @@ def _required_paths(root: Path) -> list[tuple[Path, str | None]]:
         req.append((root / f"build/{split}/merged_dataset_manifest.hybrid.json", None))
         req.append((root / f"build/{split}/merged_validation_report.hybrid.json", None))
         req.append((root / f"commands/hybrid_build.{split}.log", None))
-    req.append((root / "hybrid_site_consistency.json", None))
+    req.append((root / "hybrid_site_consistency.json", EXPECTED_SITE_AUDIT_VERSION))
     return req
 
 
@@ -165,6 +167,10 @@ def _assess(root: Path) -> dict[str, Any]:
             # PARTIAL is allowed for PUDO/readiness reports because a few scenes
             # may be deliberately rejected for insufficient real geometry.  Final
             # semantic audits, site consistency and validation must be PASS-like.
+            if rel.startswith("hybrid_pudo."):
+                site_conflicts = int(payload.get("same_site_static_evidence_conflict_count") or 0)
+                if site_conflicts > 0:
+                    failed.append({"path": rel, "status": f"static_site_evidence_conflicts={site_conflicts}"})
             if "hybrid_dataset_audit" in rel and status != "PASS":
                 failed.append({"path": rel, "status": status or "missing"})
             if rel == "hybrid_site_consistency.json" and status != "PASS":
@@ -229,6 +235,7 @@ def main() -> None:
             "hybrid_pudo": EXPECTED_PUDO_VERSION,
             "hybrid_ready": EXPECTED_READY_VERSION,
             "hybrid_dataset_audit": EXPECTED_AUDIT_VERSION,
+            "hybrid_site_consistency": EXPECTED_SITE_AUDIT_VERSION,
         },
         "interpretation": (
             "PASS means all required final hybrid artifacts are fresh relative to the latest pipeline identity, "
