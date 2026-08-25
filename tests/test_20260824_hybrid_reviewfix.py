@@ -148,7 +148,7 @@ def test_site_consistency_still_fails_true_static_geometry_conflict(tmp_path):
 
 
 def test_route_relative_side_is_not_canonicalized_as_static_site_evidence():
-    mod = _load_script("hybrid_pudo_route_side_reviewfix2", "scripts/build_hybrid_pudo_evidence.py")
+    mod = _load_script("hybrid_pudo_route_side_reviewfix3", "scripts/build_hybrid_pudo_evidence.py")
     a = {
         "anchor_id": "a1", "episode_id": "ep1", "x": 10.0, "y": 20.0,
         "side": "right", "adjacent_ped_node_id": "ped:1", "lane_id": "lane:1",
@@ -170,26 +170,30 @@ def test_route_relative_side_is_not_canonicalized_as_static_site_evidence():
     assert counts.get("conflict:side", 0) == 0
 
 
-def test_reviewfix2_pipeline_exposes_post_pudo_resume_stage():
+def test_reviewfix3_pipeline_exposes_post_pudo_resume_stage():
     script = (ROOT / "scripts/build_abilitybench_data0_20260817.sh").read_text()
-    assert 'PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix2_20260825"' in script
+    assert 'PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix3_20260825"' in script
     assert "hybrid-realism-resume-post-pudo) hybrid_realism_resume_post_pudo" in script
     assert "CAPPLAN_SITE_AUDIT_V2=present" in script
 
-def test_reviewfix2_pipeline_exposes_recommended_resume_stage():
+def test_reviewfix3_pipeline_exposes_recommended_resume_stage():
     script = (ROOT / "scripts/build_abilitybench_data0_20260817.sh").read_text()
-    assert "hybrid-realism-resume-reviewfix2) hybrid_realism_resume_reviewfix2" in script
-    assert "CAPPLAN_REVIEWFIX2_RESUME_DISPATCH=present" in script
+    assert "hybrid-realism-resume-reviewfix3) hybrid_realism_resume_reviewfix3" in script
+    assert "CAPPLAN_REVIEWFIX3_RESUME_DISPATCH=present" in script
+    assert "reviewfix3_runtime_guard" in script
+    assert "reviewfix3-preflight) reviewfix3_preflight" in script
 
 
 def test_review_bundle_rejects_fresh_hybrid_pudo_report_with_static_conflicts(tmp_path):
-    mod = _load_script("hybrid_review_bundle_reviewfix2", "scripts/build_hybrid_review_bundle.py")
+    mod = _load_script("hybrid_review_bundle_reviewfix3", "scripts/build_hybrid_review_bundle.py")
     root = tmp_path / "reports"; (root / "commands").mkdir(parents=True)
     identity = root / "commands/pipeline_identity.realism_v4_resume.txt"
     identity.write_text("CAPPLAN_PIPELINE_VERSION=test\n")
     pudo = root / "hybrid_pudo.train.boston.json"
     pudo.write_text(json.dumps({
-        "status": "PASS", "version": "abilitybench_hybrid_pudo_v4_20260824",
+        "status": "PASS", "version": "abilitybench_hybrid_pudo_v5_20260825",
+        "side_semantics": "episode_route_relative_service_approach_relation",
+        "static_transfer_fields": ["curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp"],
         "same_site_static_evidence_conflict_count": 3,
     }))
     now = identity.stat().st_mtime_ns

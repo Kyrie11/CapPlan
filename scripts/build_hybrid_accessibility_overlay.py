@@ -26,8 +26,10 @@ from typing import Any, Dict, Mapping, MutableMapping
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl, write_jsonl
 
-VERSION = "abilitybench_hybrid_accessibility_v2_20260823"
+VERSION = "abilitybench_hybrid_accessibility_v3_20260825"
 FIELDS = ("width_m", "slope", "cross_slope", "surface", "curb_ramp", "step_free", "lighting", "shelter")
+MAX_DEM_GRADE = 1.0
+MAX_STEP_FREE_DEM_GRADE = 0.35
 
 
 def _seed(base: int, *parts: str) -> int:
@@ -153,6 +155,62 @@ def _existing_prov(row: Mapping[str, Any], field: str) -> Dict[str, Any]:
     }
 
 
+
+
+def _looks_like_steps(row: Mapping[str, Any]) -> bool:
+    text = " ".join([str(row.get("source") or ""), str(row.get("edge_id") or ""), str(row.get("crossing_type") or "")]).lower()
+    return "step" in text or row.get("step_free") is False
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        x = float(value)
+    except Exception:
+        return None
+    return x if math.isfinite(x) else None
+
+
+def _sanitize_preexisting_fields(row: MutableMapping[str, Any], fp: MutableMapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Reject physically invalid/high-risk numeric evidence before hybrid completion.
+
+    We never silently clamp and keep the value as derived truth.  Rejected values
+    are retained in metadata for audit, then the field is treated as missing and
+    completed by the deterministic hybrid prior.  This is especially important
+    for endpoint-DEM grade on short/noisy segments, where independent nearest
+    samples can create >100% apparent pedestrian grades.
+    """
+    rejected: Dict[str, Dict[str, Any]] = {}
+
+    def reject(field: str, reason: str) -> None:
+        if _is_blank(row.get(field)):
+            return
+        pv = dict(fp.get(field)) if isinstance(fp.get(field), Mapping) else _existing_prov(row, field)
+        rejected[field] = {"value": row.get(field), "reason": reason, "provenance": pv}
+        row[field] = None
+        fp.pop(field, None)
+
+    width = _finite_float(row.get("width_m"))
+    if not _is_blank(row.get("width_m")) and (width is None or width <= 0.0):
+        reject("width_m", "nonpositive_or_nonfinite_path_width")
+
+    cross = _finite_float(row.get("cross_slope"))
+    if not _is_blank(row.get("cross_slope")) and (cross is None or cross < 0.0 or cross > 1.0):
+        reject("cross_slope", "invalid_cross_slope_ratio")
+
+    if not _is_blank(row.get("slope")):
+        slope = _finite_float(row.get("slope"))
+        pv = dict(fp.get("slope")) if isinstance(fp.get("slope"), Mapping) else _existing_prov(row, "slope")
+        source = str(pv.get("source") or "").lower()
+        method = str(pv.get("method") or "").lower()
+        dem_endpoint = "high_resolution_dem_endpoint_elevation" in source or "absolute_endpoint_grade" in method
+        if slope is None or slope < 0.0:
+            reject("slope", "negative_or_nonfinite_slope")
+        elif dem_endpoint:
+            threshold = MAX_DEM_GRADE if _looks_like_steps(row) else MAX_STEP_FREE_DEM_GRADE
+            if slope > threshold:
+                reject("slope", f"dem_endpoint_grade_above_plausibility_threshold:{threshold}")
+    return rejected
+
 def _group_class(rng: random.Random, row: Mapping[str, Any]) -> str:
     """Draw one stable physical class for the whole underlying map feature."""
     if "steps" in str(row.get("source") or "").lower() or "step" in str(row.get("edge_id") or "").lower():
@@ -169,7 +227,7 @@ def _group_class(rng: random.Random, row: Mapping[str, Any]) -> str:
     return "rough_or_non_step_free"
 
 
-def _fill(row: MutableMapping[str, Any], *, city: str, split: str, episode_id: str, base_seed: int) -> tuple[Counter, str]:
+def _fill(row: MutableMapping[str, Any], *, city: str, split: str, episode_id: str, base_seed: int) -> tuple[Counter, str, Dict[str, Dict[str, Any]]]:
     edge_id = str(row.get("edge_id") or "unknown")
     group_key = _edge_group_key(row)
     # Intentionally exclude split/episode from static seed.  The same physical
@@ -185,6 +243,11 @@ def _fill(row: MutableMapping[str, Any], *, city: str, split: str, episode_id: s
 
     meta = dict(row.get("metadata") or {}) if isinstance(row.get("metadata"), Mapping) else {}
     fp = dict(meta.get("field_provenance") or {}) if isinstance(meta.get("field_provenance"), Mapping) else {}
+    rejected = _sanitize_preexisting_fields(row, fp)
+    if rejected:
+        prior_rejected = dict(meta.get("rejected_field_evidence") or {}) if isinstance(meta.get("rejected_field_evidence"), Mapping) else {}
+        prior_rejected.update(rejected)
+        meta["rejected_field_evidence"] = prior_rejected
     kinds = Counter()
 
     for field in FIELDS:
@@ -219,19 +282,26 @@ def _fill(row: MutableMapping[str, Any], *, city: str, split: str, episode_id: s
         # A building/public-realm connector is short and typically not wider
         # than the adjoining walkway, while still remaining plausible.
         width = min(width, edge_rng.uniform(1.20 if city != "singapore" else 1.50, 2.20))
-    put("width_m", round(width, 3), "city_conditioned_feature_correlated_path_width_prior")
+    put("width_m", round(width, 3), "rejected_invalid_width_then_city_conditioned_feature_correlated_path_width_prior" if "width_m" in rejected else "city_conditioned_feature_correlated_path_width_prior")
 
-    if group_class == "steep":
+    if _looks_like_steps(row) and _is_blank(row.get("slope")):
+        slope = edge_rng.uniform(0.15, 0.45)
+        slope_method = "non_step_free_or_steps_running_slope_prior"
+    elif group_class == "steep":
         slope = edge_rng.uniform(*steep_slope)
+        slope_method = "feature_correlated_running_slope_prior"
     else:
         slope = edge_rng.uniform(*normal_slope)
-    put("slope", round(slope, 4), "feature_correlated_running_slope_prior")
+        slope_method = "feature_correlated_running_slope_prior"
+    if "slope" in rejected:
+        slope_method = "rejected_dem_or_invalid_slope_then_" + slope_method
+    put("slope", round(slope, 4), slope_method)
 
     if group_class == "high_cross_slope":
         cross = edge_rng.uniform(*steep_cross)
     else:
         cross = edge_rng.uniform(*normal_cross)
-    put("cross_slope", round(cross, 4), "feature_correlated_cross_slope_prior")
+    put("cross_slope", round(cross, 4), "rejected_invalid_cross_slope_then_feature_correlated_cross_slope_prior" if "cross_slope" in rejected else "feature_correlated_cross_slope_prior")
 
     # Urban pedestrian networks are overwhelmingly hard-surfaced; use a stable
     # weighted prior instead of the previous equal-probability per-edge draw.
@@ -279,7 +349,7 @@ def _fill(row: MutableMapping[str, Any], *, city: str, split: str, episode_id: s
 
     meta.update({
         "field_provenance": fp,
-        "truth_mode": "hybrid_geometry_anchored_feature_correlated_simulated_accessibility_v2",
+        "truth_mode": "hybrid_geometry_anchored_feature_correlated_simulated_accessibility_v3",
         "hybrid_simulation_group_id": group_key,
         "hybrid_simulation_group_class": group_class,
         "paper_claim_allowed": not any(str(v.get("kind")) == "simulated" for v in fp.values() if isinstance(v, Mapping)),
@@ -289,7 +359,7 @@ def _fill(row: MutableMapping[str, Any], *, city: str, split: str, episode_id: s
         src = str(row.get("source") or "prepared_accessibility_graph")
         if VERSION not in src:
             row["source"] = src + "+" + VERSION
-    return kinds, group_key
+    return kinds, group_key, rejected
 
 
 def _copy_file(src: Path, dst: Path) -> None:
@@ -337,6 +407,9 @@ def main() -> None:
     episodes = 0
     edges_total = 0
     simulated_edges = 0
+    rejected_field_counts = Counter()
+    rejected_reason_counts = Counter()
+    rejected_numeric_max: Dict[str, float] = {}
     for ef in edge_files:
         eid = ef.name[:-len(".edges.jsonl")]
         if allow is not None and eid not in allow:
@@ -346,7 +419,16 @@ def main() -> None:
         for raw in iter_jsonl(ef):
             row = dict(raw)
             before = {k: row.get(k) for k in FIELDS}
-            _, group_key = _fill(row, city=args.city, split=args.split, episode_id=eid, base_seed=args.seed)
+            _, group_key, rejected = _fill(row, city=args.city, split=args.split, episode_id=eid, base_seed=args.seed)
+            for field, rec in rejected.items():
+                rejected_field_counts[field] += 1
+                rejected_reason_counts[str(rec.get("reason") or "unknown")] += 1
+                try:
+                    val = abs(float(rec.get("value")))
+                    if math.isfinite(val):
+                        rejected_numeric_max[field] = max(rejected_numeric_max.get(field, 0.0), val)
+                except Exception:
+                    pass
             simulation_groups.add(group_key)
             meta = row.get("metadata") or {}
             gclass = str(meta.get("hybrid_simulation_group_class") or "unknown")
@@ -388,7 +470,7 @@ def main() -> None:
                 payload = json.loads(mf.read_text())
                 md = dict(payload.get("metadata") or {})
                 md.update({
-                    "truth_mode": "hybrid_geometry_anchored_feature_correlated_simulated_accessibility_v2",
+                    "truth_mode": "hybrid_geometry_anchored_feature_correlated_simulated_accessibility_v3",
                     "hybrid_overlay_version": VERSION,
                     "paper_claim_allowed": not episode_sim,
                 })
@@ -413,6 +495,10 @@ def main() -> None:
         "categorical_field_counts": {k: dict(v) for k, v in categorical_counts.items()},
         "edges_with_any_simulated_field": simulated_edges,
         "filled_missing_field_counts": dict(reports),
+        "rejected_preexisting_field_counts": dict(rejected_field_counts),
+        "rejected_preexisting_reason_counts": dict(rejected_reason_counts),
+        "max_abs_rejected_numeric_value": dict(rejected_numeric_max),
+        "dem_grade_plausibility_thresholds": {"step_free_or_non_steps": MAX_STEP_FREE_DEM_GRADE, "steps_or_non_step_free": MAX_DEM_GRADE},
         "field_provenance_kind_counts": {k: dict(v) for k, v in sorted(field_kind_counts.items())},
         "field_provenance_source_counts": {k: dict(v) for k, v in sorted(field_source_counts.items())},
         "slope_high_resolution_dem_derived_edges": int(field_source_counts.get("slope", {}).get("high_resolution_dem_endpoint_elevation", 0)),
@@ -422,7 +508,8 @@ def main() -> None:
         "input_graph_dir": str(inp),
         "output_graph_dir": str(out),
         "interpretation": (
-            "Real topology/geometry and every pre-existing observed/derived field are preserved. "
+            "Real topology/geometry and physically plausible pre-existing observed/derived fields are preserved. "
+            "Non-positive widths and implausible high-resolution DEM endpoint grades are retained as rejected evidence, not trusted as typed-resource truth; the field is then completed with a deterministic provenance-tagged prior. "
             "Missing static attributes are deterministic and correlated by mapped feature/connector across snapshots; "
             "they are benchmark scenario truth only, never measured city truth."
         ),

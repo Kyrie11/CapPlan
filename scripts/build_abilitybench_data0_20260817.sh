@@ -6,7 +6,7 @@ DATA_ROOT="${DATA_ROOT:-/data0/senzeyu2/dataset/CapPlan/data}"
 CONFIG="${CONFIG:-$CAP_HOME/configs/abilitybench_nuplan_real_data0.yaml}"
 EXT="$DATA_ROOT/external"
 REPORTS="$EXT/reports"
-PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix2_20260825"
+PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix3_20260825"
 
 mkdir -p "$REPORTS/commands" "$REPORTS/build" "$REPORTS/model" "$REPORTS/eval"
 cd "$CAP_HOME"
@@ -24,15 +24,95 @@ pipeline_version() {
   grep -q 'hybrid-realism-rebuild)' "$0" && echo "CAPPLAN_REALISM_STAGE_DISPATCH=present" || echo "CAPPLAN_REALISM_STAGE_DISPATCH=MISSING"
   grep -q 'hybrid-realism-resume-post-base)' "$0" && echo "CAPPLAN_REALISM_RESUME_DISPATCH=present" || echo "CAPPLAN_REALISM_RESUME_DISPATCH=MISSING"
   grep -q 'hybrid-realism-resume-post-pudo)' "$0" && echo "CAPPLAN_REALISM_POST_PUDO_RESUME_DISPATCH=present" || echo "CAPPLAN_REALISM_POST_PUDO_RESUME_DISPATCH=MISSING"
-  grep -q 'hybrid-realism-resume-reviewfix2)' "$0" && echo "CAPPLAN_REVIEWFIX2_RESUME_DISPATCH=present" || echo "CAPPLAN_REVIEWFIX2_RESUME_DISPATCH=MISSING"
+  grep -q 'hybrid-realism-resume-reviewfix3)' "$0" && echo "CAPPLAN_REVIEWFIX3_RESUME_DISPATCH=present" || echo "CAPPLAN_REVIEWFIX3_RESUME_DISPATCH=MISSING"
   grep -q 'abilitybench_hybrid_site_consistency_v2_20260825' "$CAP_HOME/scripts/audit_hybrid_site_consistency.py" 2>/dev/null \
     && echo "CAPPLAN_SITE_AUDIT_V2=present" || echo "CAPPLAN_SITE_AUDIT_V2=MISSING"
-  grep -q 'abilitybench_hybrid_accessibility_v2_20260823' "$CAP_HOME/scripts/build_hybrid_accessibility_overlay.py" 2>/dev/null \
-    && echo "CAPPLAN_HYBRID_GRAPH_V2=present" || echo "CAPPLAN_HYBRID_GRAPH_V2=MISSING"
-  grep -q 'abilitybench_hybrid_pudo_v4_20260824' "$CAP_HOME/scripts/build_hybrid_pudo_evidence.py" 2>/dev/null \
-    && echo "CAPPLAN_HYBRID_PUDO_V4=present" || echo "CAPPLAN_HYBRID_PUDO_V4=MISSING"
-  grep -q 'abilitybench_hybrid_dataset_audit_v3_20260824' "$CAP_HOME/scripts/audit_hybrid_benchmark.py" 2>/dev/null \
-    && echo "CAPPLAN_HYBRID_AUDIT_V3=present" || echo "CAPPLAN_HYBRID_AUDIT_V3=MISSING"
+  grep -q 'abilitybench_hybrid_accessibility_v3_20260825' "$CAP_HOME/scripts/build_hybrid_accessibility_overlay.py" 2>/dev/null \
+    && echo "CAPPLAN_HYBRID_GRAPH_V3=present" || echo "CAPPLAN_HYBRID_GRAPH_V3=MISSING"
+  grep -q 'abilitybench_hybrid_pudo_v5_20260825' "$CAP_HOME/scripts/build_hybrid_pudo_evidence.py" 2>/dev/null \
+    && echo "CAPPLAN_HYBRID_PUDO_V5=present" || echo "CAPPLAN_HYBRID_PUDO_V5=MISSING"
+  grep -q 'abilitybench_hybrid_dataset_audit_v4_20260825' "$CAP_HOME/scripts/audit_hybrid_benchmark.py" 2>/dev/null \
+    && echo "CAPPLAN_HYBRID_AUDIT_V4=present" || echo "CAPPLAN_HYBRID_AUDIT_V4=MISSING"
+  grep -q 'capplan_hybrid_review_bundle_v4_20260825' "$CAP_HOME/scripts/build_hybrid_review_bundle.py" 2>/dev/null \
+    && echo "CAPPLAN_REVIEW_BUNDLE_V4=present" || echo "CAPPLAN_REVIEW_BUNDLE_V4=MISSING"
+}
+
+reviewfix3_runtime_guard() {
+  # Fail before touching data if the server checkout is not the code version the
+  # resume command was designed for.  This prevents another expensive run from
+  # silently using an older audit/overlay script from a different checkout.
+  python - "$CAP_HOME" <<'PYGUARD'
+from pathlib import Path
+import hashlib, re, sys
+root = Path(sys.argv[1]).resolve()
+checks = {
+    "scripts/build_hybrid_pudo_evidence.py": [
+        'VERSION = "abilitybench_hybrid_pudo_v5_20260825"',
+        'STATIC_TRANSFER_FIELDS = PHYSICAL_FIELDS',
+        'SIDE_SEMANTICS = "episode_route_relative_service_approach_relation"',
+    ],
+    "scripts/audit_hybrid_site_consistency.py": [
+        'VERSION = "abilitybench_hybrid_site_consistency_v2_20260825"',
+        'RELATIONAL_FIELDS = ("side",)',
+    ],
+    "scripts/build_hybrid_accessibility_overlay.py": [
+        'VERSION = "abilitybench_hybrid_accessibility_v3_20260825"',
+        'MAX_DEM_GRADE = 1.0',
+    ],
+    "scripts/audit_hybrid_benchmark.py": [
+        'VERSION = "abilitybench_hybrid_dataset_audit_v4_20260825"',
+    ],
+    "scripts/build_hybrid_review_bundle.py": [
+        'VERSION = "capplan_hybrid_review_bundle_v4_20260825"',
+    ],
+}
+errors=[]
+for rel, markers in checks.items():
+    p=root/rel
+    if not p.exists():
+        errors.append(f"missing:{rel}"); continue
+    text=p.read_text(encoding="utf-8", errors="replace")
+    for marker in markers:
+        if marker not in text:
+            errors.append(f"marker_missing:{rel}:{marker}")
+    print(f"CAPPLAN_RUNTIME_FILE_SHA256[{rel}]={hashlib.sha256(p.read_bytes()).hexdigest()}")
+if errors:
+    print("CAPPLAN_REVIEWFIX3_RUNTIME_GUARD=FAIL", file=sys.stderr)
+    for e in errors: print(e, file=sys.stderr)
+    raise SystemExit(2)
+print("CAPPLAN_REVIEWFIX3_RUNTIME_GUARD=PASS")
+PYGUARD
+}
+
+write_reviewfix3_run_context() {
+  local out="$REPORTS/commands/hybrid_run_context.reviewfix3.json"
+  python - "$CAP_HOME" "$CONFIG" "$PIPELINE_VERSION" "$out" <<'PYCTX'
+from pathlib import Path
+import datetime as dt, hashlib, json, os, sys, time
+root=Path(sys.argv[1]).resolve(); config=Path(sys.argv[2]).resolve(); version=sys.argv[3]; out=Path(sys.argv[4])
+critical=[
+  "scripts/build_abilitybench_data0_20260817.sh",
+  "scripts/build_hybrid_pudo_evidence.py",
+  "scripts/audit_hybrid_site_consistency.py",
+  "scripts/build_hybrid_accessibility_overlay.py",
+  "scripts/audit_hybrid_benchmark.py",
+  "scripts/build_hybrid_review_bundle.py",
+]
+sha={}
+for rel in critical:
+    p=root/rel
+    sha[rel]=hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+now_ns=time.time_ns()
+run_id=f"reviewfix3_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{sha[critical[0]][:12]}"
+payload={
+  "run_id":run_id, "pipeline_version":version, "cap_home":str(root), "config":str(config),
+  "start_time_ns":now_ns, "start_time_utc":dt.datetime.fromtimestamp(now_ns/1e9, tz=dt.timezone.utc).isoformat(),
+  "critical_file_sha256":sha, "hybrid_seed":os.environ.get("CAP_HYBRID_SEED"),
+}
+out.parent.mkdir(parents=True, exist_ok=True); out.write_text(json.dumps(payload, indent=2, sort_keys=True)+"\n")
+print(f"CAPPLAN_HYBRID_RUN_ID={run_id}")
+print(f"CAPPLAN_HYBRID_RUN_CONTEXT={out}")
+PYCTX
 }
 
 runlog() {
@@ -519,6 +599,7 @@ audit_review_bundle() {
 }
 
 hybrid_review_bundle() {
+  reviewfix3_runtime_guard
   # The review bundle is also the final freeze-readiness gate.  Even on an
   # incomplete/failed run the Python packager writes a diagnostic ZIP first,
   # then exits non-zero so stale historical artifacts cannot masquerade as PASS.
@@ -751,6 +832,25 @@ hybrid_realism_resume_reviewfix2() {
   hybrid_dataset_build_only
 }
 
+reviewfix3_preflight() {
+  reviewfix3_runtime_guard
+  pipeline_version
+}
+
+hybrid_realism_resume_reviewfix3() {
+  # Correct continuation after the reviewfix2 deployment mismatch.  The stage
+  # first proves that the running checkout contains the intended semantics, then
+  # creates a fresh pipeline identity/run context.  It refreshes cheap PUDO v5,
+  # regenerates hybrid graph v3 (including DEM-outlier sanitation), and rebuilds
+  # final labels/datasets/audits.  Base graph/PUDO and external downloads are reused.
+  reviewfix3_runtime_guard
+  pipeline_version | tee "$REPORTS/commands/pipeline_identity.reviewfix3_resume.txt"
+  write_reviewfix3_run_context | tee "$REPORTS/commands/hybrid_run_context.reviewfix3.log"
+  hybrid_pudo_evidence_only
+  hybrid_graph_evidence_only
+  hybrid_dataset_build_only
+}
+
 hybrid_realism_resume_post_pudo() {
   # Recovery path for the reviewfix1 run that successfully materialized all
   # v4 hybrid PUDO files and then stopped only because route-relative ``side``
@@ -970,6 +1070,7 @@ usage() {
 Usage: $0 <stage>
 Stages:
   version                              # print exact pipeline/check-out identity before long runs
+  reviewfix3-preflight                 # hard-check critical script semantic versions/hashes before data writes
   migrate
   inspect-nuplan
   prepare-osm
@@ -1003,7 +1104,8 @@ Stages:
   hybrid-realism-rebuild               # full realism-v4: rebuild base graph/PUDO + downstream hybrid; reuse scene extraction/downloads
   hybrid-realism-resume-post-base      # reuse fresh v5 base graph/PUDO and rebuild audit/hybrid/dataset
   hybrid-realism-resume-post-pudo      # ultra-minimal: reuse existing v4 hybrid PUDO, rerun corrected site audit, then graph/dataset
-  hybrid-realism-resume-reviewfix2     # RECOMMENDED: refresh cheap PUDO reports under corrected side semantics, then graph/dataset
+  hybrid-realism-resume-reviewfix2     # legacy reviewfix2 resume
+  hybrid-realism-resume-reviewfix3     # RECOMMENDED: runtime-guarded PUDO v5 + graph v3 + final dataset/audits
   render-audit-packets                # visual rows, or evidence-gap diagnostic packets when visual bucket is empty
   audit-review-bundle                 # small PUDO audit ZIP under reports/ (no NPZ/full dataset)
   hybrid-review-bundle                # compact hybrid rebuild/dataset reports ZIP for remote review
@@ -1031,6 +1133,7 @@ USAGE
 
 case "${1:-}" in
   version|pipeline-version) pipeline_version ;;
+  reviewfix3-preflight) reviewfix3_preflight ;;
   migrate) migrate ;;
   inspect-nuplan) inspect_nuplan ;;
   prepare-osm) prepare_osm ;;
@@ -1065,6 +1168,7 @@ case "${1:-}" in
   hybrid-realism-resume-post-base) hybrid_realism_resume_post_base ;;
   hybrid-realism-resume-post-pudo) hybrid_realism_resume_post_pudo ;;
   hybrid-realism-resume-reviewfix2) hybrid_realism_resume_reviewfix2 ;;
+  hybrid-realism-resume-reviewfix3) hybrid_realism_resume_reviewfix3 ;;
   render-audit-packets) render_audit_packets ;;
   audit-review-bundle) audit_review_bundle ;;
   hybrid-review-bundle) hybrid_review_bundle ;;

@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl, write_jsonl
 
-VERSION = "abilitybench_hybrid_pudo_v4_20260824"
+VERSION = "abilitybench_hybrid_pudo_v5_20260825"
 PHYSICAL_FIELDS = ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp")
 STATIC_TRANSFER_FIELDS = PHYSICAL_FIELDS
 SIDE_SEMANTICS = "episode_route_relative_service_approach_relation"
@@ -419,6 +419,19 @@ def _fill_missing(
             pv.update({"physical_site_key": site_key, "correlation_scope": "episode_time_at_physical_site"})
             prov[field] = pv
 
+    def put_relational(field: str, value: Any, method: str) -> None:
+        """Fill an episode/route-relative service relation without making it a site fact."""
+        if row.get(field) is None or _blank(row.get(field)) or str(row.get(field)).lower() == "unknown":
+            row[field] = value
+            pv = _sim_prov(city, split, eid, aid, field, dynamic_seed, profile_name, method)
+            pv.update({
+                "physical_site_key": site_key,
+                "semantic_scope": "episode_route_relative_service_relation",
+                "correlation_scope": "episode_route_approach",
+                "fallback_reason": "route_geometry_side_unknown",
+            })
+            prov[field] = pv
+
     if site_class == "narrow_clearance":
         sw_lo, sw_hi = profile["narrow_sidewalk"]
         cl_lo, cl_hi = profile["narrow_clearance"]
@@ -459,7 +472,7 @@ def _fill_missing(
     put_static("curb_ramp", ramp, "site_correlated_curb_ramp_prior")
     put_static("curb_height_m", curb_h, "site_correlated_curb_height_prior")
     if str(row.get("side") or "unknown").lower() == "unknown":
-        put_static("side", _default_curb_side(city), "city_traffic_side_prior_when_geometry_unknown")
+        put_relational("side", _default_curb_side(city), "city_driving_side_prior_when_route_geometry_unknown")
 
     if _as_bool(row.get("legal_stop")) is None:
         legal = site_class != "simulated_loading_prohibited"
@@ -727,7 +740,7 @@ def main() -> None:
             legal = bool(_as_bool(row.get("legal_stop")))
             eligible = complete and legal and float(row.get("blockage_risk") or 0.0) < 0.85 and float(row.get("deployment_clearance_m") or 0.0) > 0
             row.update({
-                "truth_mode": "hybrid_geometry_anchored_site_correlated_simulated_interface_v3",
+                "truth_mode": "hybrid_geometry_anchored_site_correlated_simulated_interface_v4",
                 "evidence_kind": "mixed" if simulated and any(isinstance(v, Mapping) and str(v.get("kind")) in {"observed", "derived"} for v in prov.values()) else ("simulated" if simulated else "observed_or_derived"),
                 "field_provenance": prov,
                 "hybrid_evidence_complete": complete,
@@ -773,6 +786,8 @@ def main() -> None:
         "physical_site_prior_class_counts": dict(site_prior_classes),
         "physical_site_key_count": len(physical_site_keys),
         "curb_side_counts": dict(curb_sides),
+        "side_semantics": SIDE_SEMANTICS,
+        "static_transfer_fields": list(STATIC_TRANSFER_FIELDS),
         "numeric_field_ranges": {k: {"min": v[0], "max": v[1]} for k, v in numeric_minmax.items()},
         "field_provenance_kind_counts": {k: dict(v) for k, v in sorted(field_kinds.items())},
         "same_site_static_evidence_counts": dict(site_static_counts),

@@ -19,12 +19,13 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "capplan_hybrid_review_bundle_v3_20260825"
-EXPECTED_GRAPH_VERSION = "abilitybench_hybrid_accessibility_v2_20260823"
-EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v4_20260824"
+VERSION = "capplan_hybrid_review_bundle_v4_20260825"
+EXPECTED_GRAPH_VERSION = "abilitybench_hybrid_accessibility_v3_20260825"
+EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v5_20260825"
 EXPECTED_READY_VERSION = "abilitybench_hybrid_ready_allowlist_v1_20260823"
-EXPECTED_AUDIT_VERSION = "abilitybench_hybrid_dataset_audit_v3_20260824"
+EXPECTED_AUDIT_VERSION = "abilitybench_hybrid_dataset_audit_v4_20260825"
 EXPECTED_SITE_AUDIT_VERSION = "abilitybench_hybrid_site_consistency_v2_20260825"
+EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix3_20260825"
 SPLITS = ("train", "val", "test")
 CITIES = ("boston", "pittsburgh", "vegas", "singapore")
 
@@ -53,6 +54,8 @@ REPORT_GLOBS = (
 COMMAND_GLOBS = (
     "commands/pipeline_identity*.txt",
     "commands/manual_pipeline_identity*.txt",
+    "commands/hybrid_run_context*.json",
+    "commands/hybrid_run_context*.log",
     "commands/hybrid_realism*.log",
     "commands/realism_v4_*.log",
     "commands/paper_site_catalog.*.log",
@@ -110,6 +113,22 @@ def _latest_identity(root: Path) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
 
 
+def _identity_pipeline_version(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    m = re.search(r"^CAPPLAN_PIPELINE_VERSION=(.+)$", text, flags=re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def _latest_run_context(root: Path) -> Path | None:
+    candidates = [p for p in root.glob("commands/hybrid_run_context*.json") if p.is_file()]
+    return max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
+
+
 def _required_paths(root: Path) -> list[tuple[Path, str | None]]:
     req: list[tuple[Path, str | None]] = []
     for split in SPLITS:
@@ -123,6 +142,7 @@ def _required_paths(root: Path) -> list[tuple[Path, str | None]]:
         req.append((root / f"build/{split}/merged_validation_report.hybrid.json", None))
         req.append((root / f"commands/hybrid_build.{split}.log", None))
     req.append((root / "hybrid_site_consistency.json", EXPECTED_SITE_AUDIT_VERSION))
+    req.append((root / "commands/hybrid_run_context.reviewfix3.json", None))
     return req
 
 
@@ -143,12 +163,31 @@ def _iso_from_ns(ns: int | None) -> str | None:
 
 def _assess(root: Path) -> dict[str, Any]:
     identity = _latest_identity(root)
+    identity_version = _identity_pipeline_version(identity)
+    run_context = _latest_run_context(root)
+    run_context_payload = _json(run_context) if run_context else {}
     run_start_ns = identity.stat().st_mtime_ns if identity else None
     missing: list[str] = []
     stale: list[str] = []
     version_mismatch: list[dict[str, str]] = []
     failed: list[dict[str, Any]] = []
     fresh: list[str] = []
+
+    if identity is None:
+        version_mismatch.append({"path": "commands/pipeline_identity*.txt", "expected": EXPECTED_PIPELINE_VERSION, "actual": "missing"})
+    elif identity_version != EXPECTED_PIPELINE_VERSION:
+        version_mismatch.append({"path": str(identity.relative_to(root)), "expected": EXPECTED_PIPELINE_VERSION, "actual": str(identity_version or "missing")})
+    if run_context is None:
+        version_mismatch.append({"path": "commands/hybrid_run_context.reviewfix3.json", "expected": EXPECTED_PIPELINE_VERSION, "actual": "missing"})
+    elif str(run_context_payload.get("pipeline_version") or "") != EXPECTED_PIPELINE_VERSION:
+        version_mismatch.append({"path": str(run_context.relative_to(root)), "expected": EXPECTED_PIPELINE_VERSION, "actual": str(run_context_payload.get("pipeline_version") or "missing")})
+    elif isinstance(run_context_payload.get("critical_file_sha256"), dict):
+        cap_home = Path(str(run_context_payload.get("cap_home") or ""))
+        for rel, expected_sha in sorted(run_context_payload["critical_file_sha256"].items()):
+            current = cap_home / rel
+            actual_sha = _sha256(current) if current.is_file() else "missing"
+            if str(expected_sha or "") != actual_sha:
+                version_mismatch.append({"path": f"runtime_sha256:{rel}", "expected": str(expected_sha or "missing"), "actual": actual_sha})
 
     for path, expected_version in _required_paths(root):
         rel = str(path.relative_to(root))
@@ -171,6 +210,19 @@ def _assess(root: Path) -> dict[str, Any]:
                 site_conflicts = int(payload.get("same_site_static_evidence_conflict_count") or 0)
                 if site_conflicts > 0:
                     failed.append({"path": rel, "status": f"static_site_evidence_conflicts={site_conflicts}"})
+                if str(payload.get("side_semantics") or "") != "episode_route_relative_service_approach_relation":
+                    failed.append({"path": rel, "status": "missing_or_wrong_route_relative_side_semantics"})
+                static_fields = set(payload.get("static_transfer_fields") or [])
+                if "side" in static_fields:
+                    failed.append({"path": rel, "status": "side_must_not_be_static_transfer_field"})
+            if rel.startswith("hybrid_graph."):
+                slope_range = payload.get("numeric_field_ranges", {}).get("slope", {}) if isinstance(payload.get("numeric_field_ranges"), dict) else {}
+                try:
+                    slope_max = float(slope_range.get("max")) if slope_range.get("max") is not None else None
+                except Exception:
+                    slope_max = None
+                if slope_max is not None and slope_max > 1.0 + 1e-9:
+                    failed.append({"path": rel, "status": f"implausible_slope_max={slope_max:.6g}"})
             if "hybrid_dataset_audit" in rel and status != "PASS":
                 failed.append({"path": rel, "status": status or "missing"})
             if rel == "hybrid_site_consistency.json" and status != "PASS":
@@ -195,6 +247,10 @@ def _assess(root: Path) -> dict[str, Any]:
     return {
         "status": status,
         "identity_file": str(identity.relative_to(root)) if identity else None,
+        "identity_pipeline_version": identity_version,
+        "expected_pipeline_version": EXPECTED_PIPELINE_VERSION,
+        "run_context_file": str(run_context.relative_to(root)) if run_context else None,
+        "run_id": run_context_payload.get("run_id") if run_context_payload else None,
         "run_start_mtime_ns": run_start_ns,
         "run_start_utc": _iso_from_ns(run_start_ns),
         "fresh_required": fresh,
@@ -236,10 +292,11 @@ def main() -> None:
             "hybrid_ready": EXPECTED_READY_VERSION,
             "hybrid_dataset_audit": EXPECTED_AUDIT_VERSION,
             "hybrid_site_consistency": EXPECTED_SITE_AUDIT_VERSION,
+            "pipeline": EXPECTED_PIPELINE_VERSION,
         },
         "interpretation": (
             "PASS means all required final hybrid artifacts are fresh relative to the latest pipeline identity, "
-            "have the expected semantic versions, and final semantic audits/build logs pass. INCOMPLETE means the "
+            "have the expected semantic versions, the pipeline identity matches this code revision, and final semantic audits/build logs pass. INCOMPLETE means the "
             "bundle is useful for diagnosis but the benchmark is not yet freeze-ready."
         ),
     }
@@ -284,6 +341,8 @@ def main() -> None:
         "stale_required_count": len(assessment["stale_required"]),
         "version_mismatch_count": len(assessment["version_mismatches"]),
         "failed_required_count": len(assessment["failed_required"]),
+        "identity_pipeline_version": assessment.get("identity_pipeline_version"),
+        "run_id": assessment.get("run_id"),
     }, ensure_ascii=False, indent=2, sort_keys=True))
     print(f"HYBRID_REVIEW_BUNDLE={assessment['status']}")
     if args.require_complete and assessment["status"] != "PASS":

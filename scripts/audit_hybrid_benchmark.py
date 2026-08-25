@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl
 from capplan.data.capability_contracts import contract_episode_id
 
-VERSION = "abilitybench_hybrid_dataset_audit_v3_20260824"
+VERSION = "abilitybench_hybrid_dataset_audit_v4_20260825"
 
 
 def _rows(path: Path) -> Iterable[Dict[str, Any]]:
@@ -237,16 +237,33 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
     core_pudo_fields = ["curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp", "legal_stop", "side", "blockage_risk"]
     pudo_provenance: Dict[str, Counter] = {field: Counter() for field in core_pudo_fields}
     missing_core_provenance = 0
+    invalid_side_values = 0
+    invalid_side_semantics = 0
     for p in pudo:
         fp = p.get("field_provenance") if isinstance(p.get("field_provenance"), Mapping) else {}
+        side = str(p.get("side") or "unknown").lower()
+        if side not in {"left", "right"}:
+            invalid_side_values += 1
         for field in core_pudo_fields:
             pv = fp.get(field) if isinstance(fp, Mapping) else None
             if isinstance(pv, Mapping):
                 pudo_provenance[field][str(pv.get("kind") or "unknown")] += 1
-            elif field != "blockage_risk":
+                if field == "side":
+                    kind = str(pv.get("kind") or "unknown").lower()
+                    method = str(pv.get("method") or "").lower()
+                    scope = str(pv.get("semantic_scope") or pv.get("correlation_scope") or "").lower()
+                    geometry_ok = kind in {"derived", "observed", "observed_or_derived"}
+                    fallback_ok = kind == "simulated" and "city_driving_side_prior" in method and "episode_route" in scope
+                    if not (geometry_ok or fallback_ok):
+                        invalid_side_semantics += 1
+            else:
                 missing_core_provenance += 1
     if missing_core_provenance:
-        warnings.append(f"{missing_core_provenance} retained PUDO core-field values lack explicit provenance")
+        errors.append(f"{missing_core_provenance} retained PUDO core-field values lack explicit provenance")
+    if invalid_side_values:
+        errors.append(f"{invalid_side_values} retained PUDO anchors do not have left/right route-relative side")
+    if invalid_side_semantics:
+        errors.append(f"{invalid_side_semantics} retained PUDO side values lack route-relative/explicit-fallback provenance semantics")
 
     # For explicit monotonic pairs, a stricter contract must never succeed when
     # the base contract fails under identical scene/OD/vehicle evidence.
@@ -304,6 +321,8 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
         "pudo_physical_site_key_count": len(pudo_site_keys),
         "pudo_core_field_provenance_kind_counts": {k: dict(v) for k, v in pudo_provenance.items()},
         "pudo_missing_core_provenance_count": missing_core_provenance,
+        "pudo_invalid_side_value_count": invalid_side_values,
+        "pudo_invalid_side_semantics_count": invalid_side_semantics,
         "errors": errors[:200],
         "warnings": warnings[:200],
         "interpretation": (
