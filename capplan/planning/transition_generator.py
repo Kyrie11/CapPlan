@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
-from capplan.data.accessibility_layer import NoAccessiblePathError, shortest_accessible_path_stats
+from capplan.data.accessibility_layer import NoAccessiblePathError, _adjacency, shortest_accessible_path_stats
 from capplan.data.schemas import AccessibilityGraph, CandidateTransition, PUDOAnchor, ResourceEvidence, TransitionTests, VehicleInterface
 
 
@@ -40,8 +40,16 @@ class TransitionGenerator:
             dropoffs = pudo_anchors[: self.config.max_pudo]
         out: List[CandidateTransition] = []
 
+        # A real-city graph can contain tens of thousands of pedestrian edges.
+        # The old implementation rebuilt the full undirected adjacency map for
+        # every access/egress candidate.  Build it once per episode and cache
+        # repeated OD-to-PUDO path summaries instead.
+        adjacency = _adjacency(graph)
+        graph_node_ids = {n.node_id for n in graph.nodes}
+        path_cache: Dict[Tuple[str, str], Dict[str, Any] | NoAccessiblePathError] = {}
+
         for pu in pickups:
-            out.append(self._access_transition(episode_id, graph, origin_anchor, pu, scene_context))
+            out.append(self._access_transition(episode_id, graph, origin_anchor, pu, scene_context, adjacency, graph_node_ids, path_cache))
             out.append(self._wait_transition(episode_id, pu, vehicle, scene_context))
             out.append(self._board_transition(episode_id, pu, vehicle))
 
@@ -51,20 +59,33 @@ class TransitionGenerator:
                     continue
                 out.append(self._ride_transition(episode_id, pu, do, vehicle, scene_context))
                 out.append(self._alight_transition(episode_id, pu, do, vehicle))
-                out.append(self._egress_transition(episode_id, graph, do, destination_anchor, pu.anchor_id, scene_context))
+                out.append(self._egress_transition(episode_id, graph, do, destination_anchor, pu.anchor_id, scene_context, adjacency, graph_node_ids, path_cache))
                 out.append(self._destination_transition(episode_id, do, pu.anchor_id, destination_anchor))
 
         if self.config.include_replan:
             out.extend(self._replan_transitions(episode_id, pickups, dropoffs))
         return out
 
-    def _access_transition(self, episode_id: str, graph: AccessibilityGraph, origin_anchor: str, pu: PUDOAnchor, scene_context: Dict[str, Any]) -> CandidateTransition:
+    def _access_transition(
+        self, episode_id: str, graph: AccessibilityGraph, origin_anchor: str,
+        pu: PUDOAnchor, scene_context: Dict[str, Any], adjacency, graph_node_ids,
+        path_cache: Dict[Tuple[str, str], Dict[str, Any] | NoAccessiblePathError],
+    ) -> CandidateTransition:
         start = origin_anchor
         end = pu.adjacent_ped_node_id or pu.anchor_id
         try:
-            path = shortest_accessible_path_stats(graph, start, end)
+            cached = path_cache.get((start, end))
+            if isinstance(cached, NoAccessiblePathError):
+                raise cached
+            if cached is None:
+                cached = shortest_accessible_path_stats(
+                    graph, start, end, adjacency=adjacency, node_ids=graph_node_ids
+                )
+                path_cache[(start, end)] = cached
+            path = cached
             tests = TransitionTests(True, True, True, True, True, not path.get("obstacle", False), ["obstacle_on_path"] if path.get("obstacle") else [])
         except NoAccessiblePathError as e:
+            path_cache[(start, end)] = e
             path = {"distance": None, "width": None, "slope": None, "cross_slope": None, "curb_ramp": None, "step_free": None, "surface": None, "obstacle": False, "blockage_risk": 1.0, "confidence": 0.0, "missing_fields": ["path"], "lighting": None, "shelter": None, "path_edge_ids": []}
             tests = TransitionTests(True, False, False, False, True, False, [str(e)])
         evidence = self._path_evidence("access", path, scene_context)
@@ -177,13 +198,27 @@ class TransitionGenerator:
             completion_value=0.82,
         )
 
-    def _egress_transition(self, episode_id: str, graph: AccessibilityGraph, do: PUDOAnchor, destination_anchor: str, pickup_id: str, scene_context: Dict[str, Any]) -> CandidateTransition:
+    def _egress_transition(
+        self, episode_id: str, graph: AccessibilityGraph, do: PUDOAnchor,
+        destination_anchor: str, pickup_id: str, scene_context: Dict[str, Any],
+        adjacency, graph_node_ids,
+        path_cache: Dict[Tuple[str, str], Dict[str, Any] | NoAccessiblePathError],
+    ) -> CandidateTransition:
         start = do.adjacent_ped_node_id or do.anchor_id
         end = destination_anchor
         try:
-            path = shortest_accessible_path_stats(graph, start, end)
+            cached = path_cache.get((start, end))
+            if isinstance(cached, NoAccessiblePathError):
+                raise cached
+            if cached is None:
+                cached = shortest_accessible_path_stats(
+                    graph, start, end, adjacency=adjacency, node_ids=graph_node_ids
+                )
+                path_cache[(start, end)] = cached
+            path = cached
             tests = TransitionTests(True, True, True, True, True, not path.get("obstacle", False), ["obstacle_on_path"] if path.get("obstacle") else [])
         except NoAccessiblePathError as e:
+            path_cache[(start, end)] = e
             path = {"distance": None, "width": None, "slope": None, "cross_slope": None, "curb_ramp": None, "step_free": None, "surface": None, "obstacle": False, "blockage_risk": 1.0, "confidence": 0.0, "missing_fields": ["path"], "lighting": None, "shelter": None, "path_edge_ids": []}
             tests = TransitionTests(True, False, False, False, True, False, [str(e)])
         evidence = self._path_evidence("egress", path, scene_context)

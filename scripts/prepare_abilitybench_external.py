@@ -879,6 +879,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                     "--service_requests_jsonl", str(service_requests),
                     "--pudo_evidence_jsonl", str(combined_pudo),
                     "--output", str(reports_root / f"dataset_diagnostics.{city}.json"),
+                    *( ["--fast_graph_scan"] if source_policy == "hybrid" else [] ),
                 ], dry_run)
                 if source_policy == "hybrid":
                     _run([

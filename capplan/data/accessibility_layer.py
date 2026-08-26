@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 from capplan.data.schemas import AccessibilityEdge, AccessibilityGraph, AccessibilityNode, PUDOAnchor, Pose2D, graph_from_records, to_dict
-from capplan.utils.serialization import read_jsonl, write_jsonl
+from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 
 
 class NoAccessiblePathError(RuntimeError):
@@ -307,11 +307,19 @@ def _adjacency(graph: AccessibilityGraph) -> Dict[str, List[Tuple[str, Accessibi
     return adj
 
 
-def shortest_path_edges(graph: AccessibilityGraph, start_node: str, end_node: str, risk_penalty: float = 0.0) -> Tuple[List[str], List[AccessibilityEdge], float]:
-    nodes = {n.node_id for n in graph.nodes}
+def shortest_path_edges(
+    graph: AccessibilityGraph,
+    start_node: str,
+    end_node: str,
+    risk_penalty: float = 0.0,
+    *,
+    adjacency: Dict[str, List[Tuple[str, AccessibilityEdge]]] | None = None,
+    node_ids: set[str] | None = None,
+) -> Tuple[List[str], List[AccessibilityEdge], float]:
+    nodes = node_ids if node_ids is not None else {n.node_id for n in graph.nodes}
     if start_node not in nodes or end_node not in nodes:
         raise NoAccessiblePathError(f"unknown node in path {start_node}->{end_node}")
-    adj = _adjacency(graph)
+    adj = adjacency if adjacency is not None else _adjacency(graph)
     q: List[Tuple[float, str]] = [(0.0, start_node)]
     dist = {start_node: 0.0}
     prev: Dict[str, Tuple[str, AccessibilityEdge]] = {}
@@ -358,8 +366,20 @@ def _agg_optional(values: List[Any], op: str, missing_default: Any = None) -> An
     return vals[0]
 
 
-def shortest_accessible_path_stats(graph: AccessibilityGraph, start_node: str, end_node: str, contract: Any | None = None) -> Dict[str, Any]:
-    node_ids, edges, distance = shortest_path_edges(graph, start_node, end_node, risk_penalty=50.0 if contract is not None else 0.0)
+def shortest_accessible_path_stats(
+    graph: AccessibilityGraph,
+    start_node: str,
+    end_node: str,
+    contract: Any | None = None,
+    *,
+    adjacency: Dict[str, List[Tuple[str, AccessibilityEdge]]] | None = None,
+    node_ids: set[str] | None = None,
+) -> Dict[str, Any]:
+    node_path_ids, edges, distance = shortest_path_edges(
+        graph, start_node, end_node,
+        risk_penalty=50.0 if contract is not None else 0.0,
+        adjacency=adjacency, node_ids=node_ids,
+    )
     missing_fields = []
     def missing_check(name: str, vals: List[Any]) -> None:
         if any(v is None for v in vals):
@@ -393,7 +413,7 @@ def shortest_accessible_path_stats(graph: AccessibilityGraph, start_node: str, e
         risk *= (1.0 - er)
     blockage_risk = 1.0 - risk
     return {
-        "path_node_ids": node_ids,
+        "path_node_ids": node_path_ids,
         "path_edge_ids": [e.edge_id for e in edges],
         "distance": distance,
         "width": _agg_optional(width_vals, "min"),
@@ -413,14 +433,49 @@ def shortest_accessible_path_stats(graph: AccessibilityGraph, start_node: str, e
     }
 
 
-def write_accessibility_graph(dataset_dir: str | Path, graph: AccessibilityGraph) -> None:
+def write_accessibility_graph(
+    dataset_dir: str | Path,
+    graph: AccessibilityGraph,
+    *,
+    write_legacy_combined: bool = True,
+) -> None:
+    """Persist the canonical accessibility graph plus a lightweight audit sidecar.
+
+    Large nuPlan/hybrid episodes can contain tens of thousands of edges.  The old
+    writer serialized every graph three times: nodes, edges, and one huge legacy
+    combined record.  The canonical node/edge files are the representation used
+    by evaluation, so callers building the large benchmark may disable the legacy
+    duplicate without changing graph semantics.
+
+    ``*.audit.json`` stores exact O(1)-to-read counts/source summaries generated
+    while the graph is already in memory.  Dataset QA can therefore avoid reparsing
+    millions of graph JSON records solely to count them.
+    """
+    from collections import Counter
+
     root = Path(dataset_dir) / "accessibility_graphs"
     root.mkdir(parents=True, exist_ok=True)
-    write_jsonl(root / f"{graph.episode_id}.nodes.jsonl", [to_dict(n) for n in graph.nodes])
-    write_jsonl(root / f"{graph.episode_id}.edges.jsonl", [to_dict(e) for e in graph.edges])
-    # Backward-compatible combined graph record for older users; evaluation uses
-    # the canonical node/edge files.
-    write_jsonl(root / f"{graph.episode_id}.jsonl", [to_dict(graph)])
+    write_jsonl(root / f"{graph.episode_id}.nodes.jsonl", (to_dict(n) for n in graph.nodes))
+    edge_sources = Counter(str(e.source) for e in graph.edges)
+    write_jsonl(root / f"{graph.episode_id}.edges.jsonl", (to_dict(e) for e in graph.edges))
+    dump_json(
+        root / f"{graph.episode_id}.audit.json",
+        {
+            "episode_id": graph.episode_id,
+            "node_count": len(graph.nodes),
+            "edge_count": len(graph.edges),
+            "edge_source_counts": dict(edge_sources),
+            "metadata_source": graph.metadata.get("source"),
+            "graph_metadata": {
+                k: graph.metadata.get(k)
+                for k in ("source", "version", "semantic_version", "city", "split")
+                if k in graph.metadata
+            },
+        },
+    )
+    if write_legacy_combined:
+        # Compatibility path for small/legacy consumers only.
+        write_jsonl(root / f"{graph.episode_id}.jsonl", [to_dict(graph)])
 
 
 def load_accessibility_graph(dataset_dir: str | Path, episode_id: str) -> AccessibilityGraph:

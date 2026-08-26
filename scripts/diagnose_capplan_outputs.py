@@ -53,6 +53,7 @@ def _graph_topology(nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]]) ->
             dangling += 1
             continue
         adj.setdefault(u, set()).add(v)
+        adj.setdefault(v, set()).add(u)
         try:
             total_len += float(e.get('length_m') or 0.0)
         except Exception:
@@ -76,10 +77,6 @@ def _graph_topology(nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]]) ->
             for y in adj.get(x, set()):
                 if y not in seen:
                     seen.add(y); stack.append(y)
-            # weak connectivity: add reverse traversal without building a second graph
-            for z, outs in adj.items():
-                if x in outs and z not in seen:
-                    seen.add(z); stack.append(z)
         comps.append(c)
     node_kinds = Counter(str(n.get('kind')) for n in nodes)
     edge_types = Counter(str(e.get('crossing_type') or e.get('edge_type') or 'path') for e in edges)
@@ -106,7 +103,7 @@ def _read_external_jsonl(path: str | _Path | None) -> List[Dict[str, Any]]:
     p = _Path(path)
     return read_jsonl(p) if p.exists() else []
 
-def diagnose_dataset(dataset_dir: str | _Path, eval_dir: str | _Path | None = None, audit_json: str | _Path | None = None, accessibility_graph_dir: str | _Path | None = None, service_requests_jsonl: str | _Path | None = None, pudo_evidence_jsonl: str | _Path | None = None) -> Dict[str, Any]:
+def diagnose_dataset(dataset_dir: str | _Path, eval_dir: str | _Path | None = None, audit_json: str | _Path | None = None, accessibility_graph_dir: str | _Path | None = None, service_requests_jsonl: str | _Path | None = None, pudo_evidence_jsonl: str | _Path | None = None, fast_graph_scan: bool = False) -> Dict[str, Any]:
     root = _Path(dataset_dir)
     episodes = _safe_read(root / 'episodes.jsonl')
     transitions = _safe_read(root / 'candidate_transitions.jsonl')
@@ -132,8 +129,18 @@ def diagnose_dataset(dataset_dir: str | _Path, eval_dir: str | _Path | None = No
     graph_sources: Counter[str] = Counter()
     graph_topologies: Dict[str, Any] = {}
     graph_dir = _Path(accessibility_graph_dir) if accessibility_graph_dir else root / 'accessibility_graphs'
+    local_graph_dir = root / 'accessibility_graphs'
+    graph_sidecar_hits = 0
     for ep in episodes:
         eid = ep.get('episode_id')
+        sidecar = local_graph_dir / f'{eid}.audit.json'
+        if fast_graph_scan and sidecar.exists():
+            row = _safe_json(sidecar)
+            graph_node_counts.append(int(row.get('node_count', 0)))
+            graph_edge_counts.append(int(row.get('edge_count', 0)))
+            graph_sources.update({str(k): int(v) for k, v in (row.get('edge_source_counts') or {}).items()})
+            graph_sidecar_hits += 1
+            continue
         nodes = _safe_read(graph_dir / f'{eid}.nodes.jsonl')
         edges = _safe_read(graph_dir / f'{eid}.edges.jsonl')
         graph_node_counts.append(len(nodes))
@@ -335,7 +342,7 @@ def main() -> None:
     p.add_argument('--pudo_evidence_jsonl', default=None, help='Optional external PUDO evidence JSONL to check legal-stop/source/missingness before final build.')
     p.add_argument('--output', default=None)
     args = p.parse_args()
-    report = diagnose_dataset(args.dataset_dir, args.eval_dir, args.audit_json, args.accessibility_graph_dir, args.service_requests_jsonl, args.pudo_evidence_jsonl)
+    report = diagnose_dataset(args.dataset_dir, args.eval_dir, args.audit_json, args.accessibility_graph_dir, args.service_requests_jsonl, args.pudo_evidence_jsonl, args.fast_graph_scan)
     print(json.dumps(report, indent=2, sort_keys=True))
     if args.output:
         dump_json(args.output, report)

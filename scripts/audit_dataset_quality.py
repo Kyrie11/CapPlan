@@ -76,8 +76,26 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
     graph_edge_sources: Counter[str] = Counter()
     graph_metadata_sources: Counter[str] = Counter()
     graph_dir = root / "accessibility_graphs"
+    graph_audit_sidecar_hits = 0
     for ep in episodes:
         eid = ep.get("episode_id")
+        audit_path = graph_dir / f"{eid}.audit.json"
+        if audit_path.exists():
+            # Fast path: exact counts/source summaries were emitted by the writer
+            # while the in-memory graph was already available.  This avoids
+            # reparsing every graph edge during QA (hours at four-city scale).
+            audit_row = json.loads(audit_path.read_text())
+            graph_node_counts.append(int(audit_row.get("node_count", 0)))
+            graph_edge_counts.append(int(audit_row.get("edge_count", 0)))
+            graph_edge_sources.update({
+                str(k): int(v) for k, v in (audit_row.get("edge_source_counts") or {}).items()
+            })
+            if audit_row.get("metadata_source") is not None:
+                graph_metadata_sources[str(audit_row.get("metadata_source"))] += 1
+            graph_audit_sidecar_hits += 1
+            continue
+
+        # Compatibility fallback for datasets produced before the audit sidecar.
         nodes = _safe_read(graph_dir / f"{eid}.nodes.jsonl")
         edges = _safe_read(graph_dir / f"{eid}.edges.jsonl")
         graph_node_counts.append(len(nodes))
@@ -304,6 +322,8 @@ def audit_dataset(dataset_dir: str | _Path, paper_mode: bool = False, min_graph_
             "entrance_sources": _counter(entrances, "source"),
             "pudo_sources": _counter(pudos, "source"),
             "graph_edge_sources": dict(graph_edge_sources),
+            "graph_audit_sidecar_hits": graph_audit_sidecar_hits,
+            "graph_audit_sidecar_coverage": _rate(graph_audit_sidecar_hits, len(episodes)),
             "graph_metadata_sources": dict(graph_metadata_sources),
         },
         "geometry": {

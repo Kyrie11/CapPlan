@@ -69,7 +69,27 @@ class IndependentLabelOracle:
         clauses = compiled.clauses
         groups = compiled.groups
         ledger0 = init_ledger({c.resource_name for c in clauses}, self.registry)
-        q = deque([("origin", "origin", ledger0, [], [], 0.0)])
+        # The service-layer transition generator uses the *actual* request-bound
+        # entrance anchor id for origin-phase access edges.  Real nuPlan/hybrid
+        # episodes therefore do not necessarily have an anchor literally named
+        # ``origin``.  Starting from that synthetic-only literal makes every real
+        # episode fail before the first access transition and produces the
+        # pathological all-origin failure-certificate distribution.
+        #
+        # Infer the unique origin state(s) from the transition graph itself.  The
+        # legacy literal remains only as a fail-closed compatibility fallback for
+        # old synthetic fixtures that contain no origin transition at all.
+        origin_states = sorted({
+            (e.from_anchor, e.from_phase)
+            for e in transitions
+            if e.from_phase == "origin" and e.action == "access"
+        })
+        if not origin_states:
+            origin_states = [("origin", "origin")]
+        q = deque(
+            (anchor, phase, dict(ledger0), [], [], 0.0)
+            for anchor, phase in origin_states
+        )
         visited = set()
         violations: List[ViolationRecord] = []
         outgoing: Dict[Tuple[str, str], List[CandidateTransition]] = {}

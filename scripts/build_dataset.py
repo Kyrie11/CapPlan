@@ -869,7 +869,10 @@ def main() -> None:
         graph, pudo = attach_pudo_nodes_to_graph(graph, pudo)
         _enforce_paper_episode_quality(args, eid, graph, origin, destination, pudo)
         _enforce_hybrid_episode_quality(args, eid, graph, pudo)
-        write_accessibility_graph(out, graph)
+        # Canonical node/edge graph files are sufficient for training/evaluation.
+        # Avoid duplicating the full graph into a legacy combined JSONL record;
+        # this materially reduces hybrid build serialization and disk I/O.
+        write_accessibility_graph(out, graph, write_legacy_combined=False)
         pudo_records.extend(to_dict(x) for x in pudo)
 
         trip_context = {
