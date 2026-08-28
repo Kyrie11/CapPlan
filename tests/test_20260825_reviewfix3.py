@@ -32,7 +32,7 @@ def test_pudo_fallback_side_is_relational_not_static():
     assert prov["side"]["semantic_scope"] == "episode_route_relative_service_relation"
     assert prov["side"]["correlation_scope"] == "episode_route_approach"
     assert "side" not in mod.STATIC_TRANSFER_FIELDS
-    assert mod.VERSION == "abilitybench_hybrid_pudo_v5_20260825"
+    assert mod.VERSION == "abilitybench_hybrid_pudo_v6_20260828"
 
 
 def test_hybrid_graph_rejects_extreme_dem_grade_and_nonpositive_width():

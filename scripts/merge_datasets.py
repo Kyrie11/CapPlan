@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -50,6 +51,16 @@ def _episode_ids(dataset_dir: Path) -> List[str]:
     return [str(r["episode_id"]) for r in read_jsonl(dataset_dir / "episodes.jsonl") if r.get("episode_id")]
 
 
+def _link_or_copy(src: Path, dst: Path) -> str:
+    """Reuse immutable graph files without duplicating tens of GB of JSONL."""
+    try:
+        os.link(src, dst)
+        return "hardlink"
+    except OSError:
+        shutil.copy2(src, dst)
+        return "copy"
+
+
 def merge_datasets(input_dirs: List[Path], output_dir: Path, strict: bool = False, clean_output: bool = False) -> Dict[str, Any]:
     if not input_dirs:
         raise RuntimeError("at least one input dataset is required")
@@ -68,6 +79,7 @@ def merge_datasets(input_dirs: List[Path], output_dir: Path, strict: bool = Fals
             rows.extend(read_jsonl(d / name))
         write_jsonl(output_dir / name, _dedupe(rows))
 
+    graph_storage = {"hardlink": 0, "copy": 0}
     for d in input_dirs:
         graph_dir = d / "accessibility_graphs"
         if not graph_dir.exists():
@@ -76,7 +88,7 @@ def merge_datasets(input_dirs: List[Path], output_dir: Path, strict: bool = Fals
             if f.is_file():
                 dst = output_dir / "accessibility_graphs" / f.name
                 if not dst.exists():
-                    shutil.copy2(f, dst)
+                    graph_storage[_link_or_copy(f, dst)] += 1
 
     split_dir = output_dir / "splits"
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -126,6 +138,7 @@ def merge_datasets(input_dirs: List[Path], output_dir: Path, strict: bool = Fals
         "num_episodes": len(read_jsonl(output_dir / "episodes.jsonl")),
         "num_contracts": len(read_jsonl(output_dir / "capability_contracts.jsonl")),
         "num_transitions": len(read_jsonl(output_dir / "candidate_transitions.jsonl")),
+        "graph_storage": graph_storage,
     }
     dump_json(output_dir / "dataset_manifest.json", manifest)
     validation = validate_dataset(output_dir, strict=strict)

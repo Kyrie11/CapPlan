@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import random
+import shutil
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -307,6 +309,68 @@ def _adjacency(graph: AccessibilityGraph) -> Dict[str, List[Tuple[str, Accessibi
     return adj
 
 
+def shortest_path_tree(
+    graph: AccessibilityGraph,
+    start_node: str,
+    risk_penalty: float = 0.0,
+    *,
+    adjacency: Dict[str, List[Tuple[str, AccessibilityEdge]]] | None = None,
+    node_ids: set[str] | None = None,
+) -> tuple[Dict[str, float], Dict[str, Tuple[str, AccessibilityEdge]]]:
+    """Run one exact single-source Dijkstra and retain predecessors.
+
+    Transition generation queries several PUDO anchors against the same entrance.
+    Running a separate Dijkstra for every anchor is exact but needlessly expensive
+    on the 20k--40k-edge hybrid graphs.  A shortest-path tree gives identical
+    distance/path semantics while amortizing the graph traversal across every
+    pickup or drop-off candidate in the episode.
+    """
+    nodes = node_ids if node_ids is not None else {n.node_id for n in graph.nodes}
+    if start_node not in nodes:
+        raise NoAccessiblePathError(f"unknown node in path tree root {start_node}")
+    adj = adjacency if adjacency is not None else _adjacency(graph)
+    q: List[Tuple[float, str]] = [(0.0, start_node)]
+    dist: Dict[str, float] = {start_node: 0.0}
+    prev: Dict[str, Tuple[str, AccessibilityEdge]] = {}
+    while q:
+        d, u = heapq.heappop(q)
+        if d > dist.get(u, float("inf")) + 1e-9:
+            continue
+        for v, e in adj.get(u, []):
+            penalty = risk_penalty * (1.0 if e.obstacle else 0.0)
+            nd = d + float(e.length_m) + penalty
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                prev[v] = (u, e)
+                heapq.heappush(q, (nd, v))
+    return dist, prev
+
+
+def path_edges_from_tree(
+    start_node: str,
+    end_node: str,
+    dist: Dict[str, float],
+    prev: Dict[str, Tuple[str, AccessibilityEdge]],
+) -> Tuple[List[str], List[AccessibilityEdge], float]:
+    if end_node not in dist:
+        raise NoAccessiblePathError(f"no path {start_node}->{end_node}")
+    if start_node == end_node:
+        return [start_node], [], 0.0
+    edge_path: List[AccessibilityEdge] = []
+    node_path = [end_node]
+    cur = end_node
+    while cur != start_node:
+        if cur not in prev:
+            raise NoAccessiblePathError(f"no predecessor chain {start_node}->{end_node}")
+        pu, pe = prev[cur]
+        edge_path.append(pe)
+        cur = pu
+        node_path.append(cur)
+    edge_path.reverse()
+    node_path.reverse()
+    return node_path, edge_path, dist[end_node]
+
+
 def shortest_path_edges(
     graph: AccessibilityGraph,
     start_node: str,
@@ -321,7 +385,7 @@ def shortest_path_edges(
         raise NoAccessiblePathError(f"unknown node in path {start_node}->{end_node}")
     adj = adjacency if adjacency is not None else _adjacency(graph)
     q: List[Tuple[float, str]] = [(0.0, start_node)]
-    dist = {start_node: 0.0}
+    dist: Dict[str, float] = {start_node: 0.0}
     prev: Dict[str, Tuple[str, AccessibilityEdge]] = {}
     while q:
         d, u = heapq.heappop(q)
@@ -336,19 +400,7 @@ def shortest_path_edges(
                 dist[v] = nd
                 prev[v] = (u, e)
                 heapq.heappush(q, (nd, v))
-    if end_node not in dist:
-        raise NoAccessiblePathError(f"no path {start_node}->{end_node}")
-    edge_path: List[AccessibilityEdge] = []
-    node_path = [end_node]
-    cur = end_node
-    while cur != start_node:
-        pu, pe = prev[cur]
-        edge_path.append(pe)
-        cur = pu
-        node_path.append(cur)
-    edge_path.reverse()
-    node_path.reverse()
-    return node_path, edge_path, dist[end_node]
+    return path_edges_from_tree(start_node, end_node, dist, prev)
 
 
 def _agg_optional(values: List[Any], op: str, missing_default: Any = None) -> Any:
@@ -366,20 +418,14 @@ def _agg_optional(values: List[Any], op: str, missing_default: Any = None) -> An
     return vals[0]
 
 
-def shortest_accessible_path_stats(
+def _path_stats_from_edges(
     graph: AccessibilityGraph,
-    start_node: str,
-    end_node: str,
-    contract: Any | None = None,
+    node_path_ids: List[str],
+    edges: List[AccessibilityEdge],
+    distance: float,
     *,
-    adjacency: Dict[str, List[Tuple[str, AccessibilityEdge]]] | None = None,
-    node_ids: set[str] | None = None,
+    node_kinds: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
-    node_path_ids, edges, distance = shortest_path_edges(
-        graph, start_node, end_node,
-        risk_penalty=50.0 if contract is not None else 0.0,
-        adjacency=adjacency, node_ids=node_ids,
-    )
     missing_fields = []
     def missing_check(name: str, vals: List[Any]) -> None:
         if any(v is None for v in vals):
@@ -388,7 +434,7 @@ def shortest_accessible_path_stats(
     width_vals = [e.width_m for e in edges]; missing_check("path_width_m", width_vals)
     slope_vals = [e.slope for e in edges]; missing_check("slope", slope_vals)
     cross_vals = [e.cross_slope for e in edges]; missing_check("cross_slope", cross_vals)
-    node_kinds = {n.node_id: n.kind for n in graph.nodes}
+    node_kinds = node_kinds if node_kinds is not None else {n.node_id: n.kind for n in graph.nodes}
     def touches_curb_context(e: AccessibilityEdge) -> bool:
         return (
             e.crossing_type == "curb"
@@ -433,6 +479,52 @@ def shortest_accessible_path_stats(
     }
 
 
+def shortest_accessible_path_stats(
+    graph: AccessibilityGraph,
+    start_node: str,
+    end_node: str,
+    contract: Any | None = None,
+    *,
+    adjacency: Dict[str, List[Tuple[str, AccessibilityEdge]]] | None = None,
+    node_ids: set[str] | None = None,
+    node_kinds: Dict[str, str] | None = None,
+) -> Dict[str, Any]:
+    node_path_ids, edges, distance = shortest_path_edges(
+        graph, start_node, end_node,
+        risk_penalty=50.0 if contract is not None else 0.0,
+        adjacency=adjacency, node_ids=node_ids,
+    )
+    return _path_stats_from_edges(
+        graph, node_path_ids, edges, distance, node_kinds=node_kinds
+    )
+
+
+def shortest_accessible_path_stats_from_tree(
+    graph: AccessibilityGraph,
+    start_node: str,
+    end_node: str,
+    dist: Dict[str, float],
+    prev: Dict[str, Tuple[str, AccessibilityEdge]],
+    *,
+    node_kinds: Dict[str, str] | None = None,
+    reverse_output: bool = False,
+) -> Dict[str, Any]:
+    """Aggregate the same path evidence from a precomputed shortest-path tree.
+
+    ``reverse_output`` is used for an egress tree rooted at the destination.  The
+    pedestrian graph is undirected, so the edge set and resource aggregates are
+    identical; only the reported node/edge sequence is reversed to preserve the
+    dropoff->destination orientation expected by downstream records.
+    """
+    node_path_ids, edges, distance = path_edges_from_tree(start_node, end_node, dist, prev)
+    if reverse_output:
+        node_path_ids = list(reversed(node_path_ids))
+        edges = list(reversed(edges))
+    return _path_stats_from_edges(
+        graph, node_path_ids, edges, distance, node_kinds=node_kinds
+    )
+
+
 def write_accessibility_graph(
     dataset_dir: str | Path,
     graph: AccessibilityGraph,
@@ -451,13 +543,30 @@ def write_accessibility_graph(
     while the graph is already in memory.  Dataset QA can therefore avoid reparsing
     millions of graph JSON records solely to count them.
     """
+    root = Path(dataset_dir) / "accessibility_graphs"
+    root.mkdir(parents=True, exist_ok=True)
+    write_jsonl(root / f"{graph.episode_id}.nodes.jsonl", (to_dict(n) for n in graph.nodes))
+    write_jsonl(root / f"{graph.episode_id}.edges.jsonl", (to_dict(e) for e in graph.edges))
+    write_accessibility_graph_audit(dataset_dir, graph, storage_mode="serialized")
+    if write_legacy_combined:
+        # Compatibility path for small/legacy consumers only.
+        write_jsonl(root / f"{graph.episode_id}.jsonl", [to_dict(graph)])
+
+
+def write_accessibility_graph_audit(
+    dataset_dir: str | Path,
+    graph: AccessibilityGraph,
+    *,
+    storage_mode: str = "serialized",
+    source_nodes_path: str | Path | None = None,
+    source_edges_path: str | Path | None = None,
+) -> None:
+    """Write the lightweight exact QA sidecar without serializing the graph."""
     from collections import Counter
 
     root = Path(dataset_dir) / "accessibility_graphs"
     root.mkdir(parents=True, exist_ok=True)
-    write_jsonl(root / f"{graph.episode_id}.nodes.jsonl", (to_dict(n) for n in graph.nodes))
     edge_sources = Counter(str(e.source) for e in graph.edges)
-    write_jsonl(root / f"{graph.episode_id}.edges.jsonl", (to_dict(e) for e in graph.edges))
     dump_json(
         root / f"{graph.episode_id}.audit.json",
         {
@@ -466,6 +575,9 @@ def write_accessibility_graph(
             "edge_count": len(graph.edges),
             "edge_source_counts": dict(edge_sources),
             "metadata_source": graph.metadata.get("source"),
+            "storage_mode": storage_mode,
+            "source_nodes_path": str(source_nodes_path) if source_nodes_path is not None else None,
+            "source_edges_path": str(source_edges_path) if source_edges_path is not None else None,
             "graph_metadata": {
                 k: graph.metadata.get(k)
                 for k in ("source", "version", "semantic_version", "city", "split")
@@ -473,9 +585,47 @@ def write_accessibility_graph(
             },
         },
     )
-    if write_legacy_combined:
-        # Compatibility path for small/legacy consumers only.
-        write_jsonl(root / f"{graph.episode_id}.jsonl", [to_dict(graph)])
+
+
+def materialize_prepared_accessibility_graph(
+    dataset_dir: str | Path,
+    graph: AccessibilityGraph,
+    nodes_path: str | Path,
+    edges_path: str | Path,
+) -> str:
+    """Reuse immutable prepared graph JSONLs by hardlink, with copy fallback.
+
+    Dataset construction already loads the prepared graph into memory for
+    service routing.  If attaching PUDOs did not alter node/edge topology, JSON
+    serializing tens of millions of unchanged records a second time is pure I/O.
+    Hardlinks preserve byte-identical canonical files and consume no additional
+    data blocks; ``copy2`` is used transparently when source/destination live on
+    different filesystems or hardlinks are unavailable.
+    """
+    root = Path(dataset_dir) / "accessibility_graphs"
+    root.mkdir(parents=True, exist_ok=True)
+    src_nodes = Path(nodes_path)
+    src_edges = Path(edges_path)
+    mode = "hardlink_to_prepared"
+    for src, dst in (
+        (src_nodes, root / f"{graph.episode_id}.nodes.jsonl"),
+        (src_edges, root / f"{graph.episode_id}.edges.jsonl"),
+    ):
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+            mode = "copy_from_prepared"
+    write_accessibility_graph_audit(
+        dataset_dir,
+        graph,
+        storage_mode=mode,
+        source_nodes_path=src_nodes,
+        source_edges_path=src_edges,
+    )
+    return mode
 
 
 def load_accessibility_graph(dataset_dir: str | Path, episode_id: str) -> AccessibilityGraph:

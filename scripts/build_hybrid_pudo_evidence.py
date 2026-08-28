@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl, write_jsonl
 
-VERSION = "abilitybench_hybrid_pudo_v5_20260825"
+VERSION = "abilitybench_hybrid_pudo_v6_20260828"
 PHYSICAL_FIELDS = ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp")
 STATIC_TRANSFER_FIELDS = PHYSICAL_FIELDS
 SIDE_SEMANTICS = "episode_route_relative_service_approach_relation"
@@ -498,6 +498,37 @@ def _fill_missing(
         row["blockage_risk"] = round(dyn_rng.uniform(0.88, 0.98) if blocked else dyn_rng.uniform(0.01, 0.10), 3)
         pv = _sim_prov(city, split, eid, aid, "blockage_risk", dynamic_seed, profile_name, "episode_time_dynamic_blockage_prior")
         pv.update({"physical_site_key": site_key, "correlation_scope": "episode_time_at_physical_site"})
+        prov["blockage_risk"] = pv
+    elif "blockage_risk" not in prov:
+        # Base nuPlan PUDO candidates compute blockage risk from the nearest
+        # dynamic agent in scene history.  Earlier hybrid versions preserved
+        # that score but forgot its field-level provenance, causing the final
+        # semantic audit to flag exactly one missing core provenance item per
+        # retained PUDO.  Preserve the value and describe its evidence rather
+        # than silently re-simulating it.
+        base_source = str(row.get("source") or "").lower()
+        if base_source.startswith("nuplan_route"):
+            pv = {
+                "kind": "derived",
+                "source": "nuplan_agent_history",
+                "method": "nearest_agent_distance_dynamic_blockage_risk",
+                "episode_id": eid,
+                "anchor_id": aid,
+                "city_context": city,
+                "split": split,
+                "physical_site_key": site_key,
+                "correlation_scope": "episode_time_at_physical_site",
+                "claim_scope": "scene_derived_dynamic_benchmark_evidence",
+            }
+        else:
+            pv = _sim_prov(
+                city, split, eid, aid, "blockage_risk", dynamic_seed,
+                profile_name, "preserved_preexisting_dynamic_score_without_audited_source",
+            )
+            pv.update({
+                "physical_site_key": site_key,
+                "correlation_scope": "episode_time_at_physical_site",
+            })
         prov["blockage_risk"] = pv
 
     # Lighting/shelter are site amenities, not IID edge noise.  Time-of-day is

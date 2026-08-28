@@ -340,6 +340,11 @@ def main() -> None:
     p.add_argument('--accessibility_graph_dir', default=None, help='Optional external graph dir to diagnose before/alongside a built dataset.')
     p.add_argument('--service_requests_jsonl', default=None, help='Optional external service requests JSONL to check profile/episode coverage.')
     p.add_argument('--pudo_evidence_jsonl', default=None, help='Optional external PUDO evidence JSONL to check legal-stop/source/missingness before final build.')
+    p.add_argument(
+        '--fast_graph_scan',
+        action='store_true',
+        help='Use per-episode accessibility_graphs/*.audit.json sidecars when available instead of reparsing full graph JSONL files.',
+    )
     p.add_argument('--output', default=None)
     args = p.parse_args()
     report = diagnose_dataset(args.dataset_dir, args.eval_dir, args.audit_json, args.accessibility_graph_dir, args.service_requests_jsonl, args.pudo_evidence_jsonl, args.fast_graph_scan)

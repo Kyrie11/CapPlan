@@ -19,13 +19,13 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "capplan_hybrid_review_bundle_v4_20260825"
+VERSION = "capplan_hybrid_review_bundle_v5_20260828"
 EXPECTED_GRAPH_VERSION = "abilitybench_hybrid_accessibility_v3_20260825"
-EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v5_20260825"
+EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v6_20260828"
 EXPECTED_READY_VERSION = "abilitybench_hybrid_ready_allowlist_v1_20260823"
 EXPECTED_AUDIT_VERSION = "abilitybench_hybrid_dataset_audit_v4_20260825"
 EXPECTED_SITE_AUDIT_VERSION = "abilitybench_hybrid_site_consistency_v2_20260825"
-EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix3_20260825"
+EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_20260828"
 SPLITS = ("train", "val", "test")
 CITIES = ("boston", "pittsburgh", "vegas", "singapore")
 
@@ -56,6 +56,7 @@ COMMAND_GLOBS = (
     "commands/manual_pipeline_identity*.txt",
     "commands/hybrid_run_context*.json",
     "commands/hybrid_run_context*.log",
+    "commands/reviewfix5_dataset_fix.sha256",
     "commands/hybrid_realism*.log",
     "commands/realism_v4_*.log",
     "commands/paper_site_catalog.*.log",
@@ -125,8 +126,16 @@ def _identity_pipeline_version(path: Path | None) -> str | None:
 
 
 def _latest_run_context(root: Path) -> Path | None:
-    candidates = [p for p in root.glob("commands/hybrid_run_context*.json") if p.is_file()]
-    return max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
+    # Dataset-only resumptions intentionally reuse expensive reviewfix3 graph/PUDO
+    # artifacts.  Their old run context is upstream lineage, not the freshness
+    # anchor for newly generated labels/audits.  Require the explicit dataset
+    # context so an old reviewfix3 audit cannot masquerade as a current result.
+    p = root / "commands/hybrid_run_context.reviewfix5_dataset.json"
+    return p if p.is_file() else None
+
+
+def _is_reused_upstream(rel: str) -> bool:
+    return rel.startswith("hybrid_graph.")
 
 
 def _required_paths(root: Path) -> list[tuple[Path, str | None]]:
@@ -136,13 +145,14 @@ def _required_paths(root: Path) -> list[tuple[Path, str | None]]:
             req.append((root / f"hybrid_graph.{split}.{city}.json", EXPECTED_GRAPH_VERSION))
             req.append((root / f"hybrid_pudo.{split}.{city}.json", EXPECTED_PUDO_VERSION))
             req.append((root / f"hybrid_ready.{split}.{city}.json", EXPECTED_READY_VERSION))
+            req.append((root / f"build/{split}/dataset_quality.{city}.json", None))
             req.append((root / f"build/{split}/hybrid_dataset_audit.{city}.json", EXPECTED_AUDIT_VERSION))
         req.append((root / f"build/{split}/hybrid_dataset_audit.merged.json", EXPECTED_AUDIT_VERSION))
         req.append((root / f"build/{split}/merged_dataset_manifest.hybrid.json", None))
         req.append((root / f"build/{split}/merged_validation_report.hybrid.json", None))
         req.append((root / f"commands/hybrid_build.{split}.log", None))
     req.append((root / "hybrid_site_consistency.json", EXPECTED_SITE_AUDIT_VERSION))
-    req.append((root / "commands/hybrid_run_context.reviewfix3.json", None))
+    req.append((root / "commands/hybrid_run_context.reviewfix5_dataset.json", None))
     return req
 
 
@@ -166,7 +176,10 @@ def _assess(root: Path) -> dict[str, Any]:
     identity_version = _identity_pipeline_version(identity)
     run_context = _latest_run_context(root)
     run_context_payload = _json(run_context) if run_context else {}
-    run_start_ns = identity.stat().st_mtime_ns if identity else None
+    try:
+        run_start_ns = int(run_context_payload.get("start_time_ns")) if run_context_payload.get("start_time_ns") else (identity.stat().st_mtime_ns if identity else None)
+    except Exception:
+        run_start_ns = identity.stat().st_mtime_ns if identity else None
     missing: list[str] = []
     stale: list[str] = []
     version_mismatch: list[dict[str, str]] = []
@@ -178,7 +191,7 @@ def _assess(root: Path) -> dict[str, Any]:
     elif identity_version != EXPECTED_PIPELINE_VERSION:
         version_mismatch.append({"path": str(identity.relative_to(root)), "expected": EXPECTED_PIPELINE_VERSION, "actual": str(identity_version or "missing")})
     if run_context is None:
-        version_mismatch.append({"path": "commands/hybrid_run_context.reviewfix3.json", "expected": EXPECTED_PIPELINE_VERSION, "actual": "missing"})
+        version_mismatch.append({"path": "commands/hybrid_run_context.reviewfix5_dataset.json", "expected": EXPECTED_PIPELINE_VERSION, "actual": "missing"})
     elif str(run_context_payload.get("pipeline_version") or "") != EXPECTED_PIPELINE_VERSION:
         version_mismatch.append({"path": str(run_context.relative_to(root)), "expected": EXPECTED_PIPELINE_VERSION, "actual": str(run_context_payload.get("pipeline_version") or "missing")})
     elif isinstance(run_context_payload.get("critical_file_sha256"), dict):
@@ -194,7 +207,7 @@ def _assess(root: Path) -> dict[str, Any]:
         if not path.exists():
             missing.append(rel)
             continue
-        if run_start_ns is not None and path.stat().st_mtime_ns <= run_start_ns:
+        if run_start_ns is not None and path.stat().st_mtime_ns <= run_start_ns and not _is_reused_upstream(rel):
             stale.append(rel)
             continue
         fresh.append(rel)
@@ -216,6 +229,8 @@ def _assess(root: Path) -> dict[str, Any]:
                 if "side" in static_fields:
                     failed.append({"path": rel, "status": "side_must_not_be_static_transfer_field"})
             if rel.startswith("hybrid_graph."):
+                if status != "PASS":
+                    failed.append({"path": rel, "status": status or "missing"})
                 slope_range = payload.get("numeric_field_ranges", {}).get("slope", {}) if isinstance(payload.get("numeric_field_ranges"), dict) else {}
                 try:
                     slope_max = float(slope_range.get("max")) if slope_range.get("max") is not None else None
@@ -225,6 +240,14 @@ def _assess(root: Path) -> dict[str, Any]:
                     failed.append({"path": rel, "status": f"implausible_slope_max={slope_max:.6g}"})
             if "hybrid_dataset_audit" in rel and status != "PASS":
                 failed.append({"path": rel, "status": status or "missing"})
+            if "/dataset_quality." in rel:
+                blocking = set(((payload.get("publication_readiness") or {}).get("blocking_issues") or []))
+                sparse = sorted(blocking.intersection({
+                    "oracle_passenger_complete_skeletons_too_sparse",
+                    "passenger_feasible_edges_too_sparse",
+                }))
+                if sparse:
+                    failed.append({"path": rel, "status": "freeze_quality_gate:" + ",".join(sparse)})
             if rel == "hybrid_site_consistency.json" and status != "PASS":
                 failed.append({"path": rel, "status": status or "missing"})
             if "merged_validation_report.hybrid.json" in rel:
@@ -253,6 +276,7 @@ def _assess(root: Path) -> dict[str, Any]:
         "run_id": run_context_payload.get("run_id") if run_context_payload else None,
         "run_start_mtime_ns": run_start_ns,
         "run_start_utc": _iso_from_ns(run_start_ns),
+        "reused_upstream_required": [rel for rel in fresh if _is_reused_upstream(rel)],
         "fresh_required": fresh,
         "missing_required": missing,
         "stale_required": stale,

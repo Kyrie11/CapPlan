@@ -1,10 +1,17 @@
 """Passenger-service transition generation."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Tuple
 
-from capplan.data.accessibility_layer import NoAccessiblePathError, _adjacency, shortest_accessible_path_stats
+from capplan.data.accessibility_layer import (
+    NoAccessiblePathError,
+    _adjacency,
+    shortest_accessible_path_stats,
+    shortest_accessible_path_stats_from_tree,
+    shortest_path_tree,
+)
 from capplan.data.schemas import AccessibilityGraph, CandidateTransition, PUDOAnchor, ResourceEvidence, TransitionTests, VehicleInterface
 
 
@@ -15,6 +22,11 @@ class TransitionGeneratorConfig:
     deterministic_wait_s: float = 120.0
     default_speed_mps: float = 8.0
     min_dynamic_availability: float = 0.05
+    # Keep the graph compact, but choose the capped candidates by actual service
+    # topology rather than lexicographic PUDO id order.  The previous first-N
+    # truncation was arbitrary because hybrid PUDO rows are emitted sorted by
+    # anchor id, not by entrance proximity.
+    route_aware_pudo_selection: bool = True
 
 
 class TransitionGenerator:
@@ -32,24 +44,39 @@ class TransitionGenerator:
         scene_context: Dict[str, Any] | None = None,
     ) -> List[CandidateTransition]:
         scene_context = scene_context or {}
-        pickups = [p for p in pudo_anchors if p.kind in ("pickup", "pickup_dropoff")][: self.config.max_pudo]
-        dropoffs = [p for p in pudo_anchors if p.kind in ("dropoff", "pickup_dropoff")][: self.config.max_pudo]
-        if not pickups:
-            pickups = pudo_anchors[: self.config.max_pudo]
-        if not dropoffs:
-            dropoffs = pudo_anchors[: self.config.max_pudo]
+        pickup_pool = [p for p in pudo_anchors if p.kind in ("pickup", "pickup_dropoff")]
+        dropoff_pool = [p for p in pudo_anchors if p.kind in ("dropoff", "pickup_dropoff")]
+        if not pickup_pool:
+            pickup_pool = list(pudo_anchors)
+        if not dropoff_pool:
+            dropoff_pool = list(pudo_anchors)
         out: List[CandidateTransition] = []
 
         # A real-city graph can contain tens of thousands of pedestrian edges.
-        # The old implementation rebuilt the full undirected adjacency map for
-        # every access/egress candidate.  Build it once per episode and cache
-        # repeated OD-to-PUDO path summaries instead.
+        # Build one adjacency and two exact single-source shortest-path trees:
+        # origin -> all nodes and destination -> all nodes.  Every pickup/access
+        # and dropoff/egress path can then be reconstructed exactly without
+        # running 4+4 independent Dijkstras per episode.
         adjacency = _adjacency(graph)
         graph_node_ids = {n.node_id for n in graph.nodes}
+        node_kinds = {n.node_id: n.kind for n in graph.nodes}
+        origin_tree = self._safe_path_tree(graph, origin_anchor, adjacency, graph_node_ids)
+        destination_tree = self._safe_path_tree(graph, destination_anchor, adjacency, graph_node_ids)
+
+        if self.config.route_aware_pudo_selection:
+            pickups = self._select_pudo_candidates(pickup_pool, origin_tree[0] if origin_tree else {}, self.config.max_pudo)
+            dropoffs = self._select_pudo_candidates(dropoff_pool, destination_tree[0] if destination_tree else {}, self.config.max_pudo)
+        else:
+            pickups = pickup_pool[: self.config.max_pudo]
+            dropoffs = dropoff_pool[: self.config.max_pudo]
+
         path_cache: Dict[Tuple[str, str], Dict[str, Any] | NoAccessiblePathError] = {}
 
         for pu in pickups:
-            out.append(self._access_transition(episode_id, graph, origin_anchor, pu, scene_context, adjacency, graph_node_ids, path_cache))
+            out.append(self._access_transition(
+                episode_id, graph, origin_anchor, pu, scene_context,
+                adjacency, graph_node_ids, node_kinds, path_cache, origin_tree,
+            ))
             out.append(self._wait_transition(episode_id, pu, vehicle, scene_context))
             out.append(self._board_transition(episode_id, pu, vehicle))
 
@@ -58,18 +85,97 @@ class TransitionGenerator:
                 if pu.anchor_id == do.anchor_id and len(dropoffs) > 1:
                     continue
                 out.append(self._ride_transition(episode_id, pu, do, vehicle, scene_context))
-                out.append(self._alight_transition(episode_id, pu, do, vehicle))
-                out.append(self._egress_transition(episode_id, graph, do, destination_anchor, pu.anchor_id, scene_context, adjacency, graph_node_ids, path_cache))
-                out.append(self._destination_transition(episode_id, do, pu.anchor_id, destination_anchor))
+
+        # All rides that end at the same drop-off converge to the same
+        # ``veh:*:alight:<dropoff>`` state.  Alight/egress/destination evidence
+        # depends only on the drop-off, destination and vehicle, not on which
+        # pickup produced the ride.  Emitting one copy per pickup created exact
+        # duplicate state transitions (12 alight + 12 egress + 12 destination
+        # edges with the default 4x4 candidate grid).  Generate each suffix edge
+        # once per drop-off; the typed ledger still carries pickup-specific ride
+        # history into the shared state.
+        for do in dropoffs:
+            out.append(self._alight_transition(episode_id, do, vehicle))
+            out.append(self._egress_transition(
+                episode_id, graph, do, destination_anchor,
+                scene_context, adjacency, graph_node_ids, node_kinds,
+                path_cache, destination_tree,
+            ))
+            out.append(self._destination_transition(episode_id, do, destination_anchor))
 
         if self.config.include_replan:
             out.extend(self._replan_transitions(episode_id, pickups, dropoffs))
         return out
 
+    @staticmethod
+    def _safe_path_tree(graph, root: str, adjacency, graph_node_ids):
+        try:
+            return shortest_path_tree(
+                graph, root, adjacency=adjacency, node_ids=graph_node_ids
+            )
+        except NoAccessiblePathError:
+            return None
+
+    @staticmethod
+    def _select_pudo_candidates(
+        candidates: List[PUDOAnchor],
+        distances: Dict[str, float],
+        limit: int,
+    ) -> List[PUDOAnchor]:
+        """Choose a deterministic, topology-aware compact PUDO candidate set.
+
+        Candidate generation in the paper is explicitly conditioned on entrance
+        distance and stopping feasibility.  Hybrid evidence JSONL is sorted by
+        anchor id for reproducibility, so ``rows[:4]`` is not a meaningful
+        service policy and can accidentally choose four distant/unreachable
+        curbs while closer legal anchors exist.
+
+        We therefore rank by exact pedestrian shortest-path distance.  Legal,
+        currently unblocked, graph-connected anchors are preferred; the final
+        slot may retain a connected challenge candidate so transition-level
+        negatives are not artificially removed.  The rule is passenger-agnostic
+        and deterministic, preserving same-scene capability counterfactuals.
+        """
+        if limit <= 0 or not candidates:
+            return []
+
+        def node_id(p: PUDOAnchor) -> str:
+            return str(p.adjacent_ped_node_id or p.anchor_id)
+
+        def distance(p: PUDOAnchor) -> float:
+            return float(distances.get(node_id(p), float("inf")))
+
+        def rank(p: PUDOAnchor) -> tuple[float, float, str]:
+            # Higher confidence wins only as a deterministic tie breaker after
+            # service distance; it must not replace topological accessibility.
+            return (distance(p), -float(min(p.map_confidence, p.dynamic_confidence)), p.anchor_id)
+
+        connected = [p for p in candidates if math.isfinite(distance(p))]
+        viable = [p for p in connected if bool(p.legal_stop) and float(p.blockage_risk) < 0.85]
+        viable.sort(key=rank)
+        connected.sort(key=rank)
+        disconnected = sorted((p for p in candidates if not math.isfinite(distance(p))), key=lambda p: p.anchor_id)
+
+        # Preserve one slot for an informative challenge when such a candidate
+        # exists.  With the default limit=4 this gives up to three plausible
+        # service anchors plus one negative/harder anchor.
+        preferred_slots = limit if len(connected) <= limit else max(2, limit - 1)
+        selected: List[PUDOAnchor] = viable[:preferred_slots]
+        selected_ids = {p.anchor_id for p in selected}
+        for p in connected + disconnected:
+            if len(selected) >= limit:
+                break
+            if p.anchor_id in selected_ids:
+                continue
+            selected.append(p)
+            selected_ids.add(p.anchor_id)
+        return selected
+
     def _access_transition(
         self, episode_id: str, graph: AccessibilityGraph, origin_anchor: str,
-        pu: PUDOAnchor, scene_context: Dict[str, Any], adjacency, graph_node_ids,
+        pu: PUDOAnchor, scene_context: Dict[str, Any], adjacency, graph_node_ids, node_kinds,
         path_cache: Dict[Tuple[str, str], Dict[str, Any] | NoAccessiblePathError],
+        origin_tree,
     ) -> CandidateTransition:
         start = origin_anchor
         end = pu.adjacent_ped_node_id or pu.anchor_id
@@ -78,9 +184,15 @@ class TransitionGenerator:
             if isinstance(cached, NoAccessiblePathError):
                 raise cached
             if cached is None:
-                cached = shortest_accessible_path_stats(
-                    graph, start, end, adjacency=adjacency, node_ids=graph_node_ids
-                )
+                if origin_tree is not None:
+                    cached = shortest_accessible_path_stats_from_tree(
+                        graph, start, end, origin_tree[0], origin_tree[1], node_kinds=node_kinds
+                    )
+                else:
+                    cached = shortest_accessible_path_stats(
+                        graph, start, end, adjacency=adjacency, node_ids=graph_node_ids,
+                        node_kinds=node_kinds,
+                    )
                 path_cache[(start, end)] = cached
             path = cached
             tests = TransitionTests(True, True, True, True, True, not path.get("obstacle", False), ["obstacle_on_path"] if path.get("obstacle") else [])
@@ -176,13 +288,13 @@ class TransitionGenerator:
             metadata={"route_length_m": route_length, "pickup_anchor": pu.anchor_id, "dropoff_anchor": do.anchor_id},
         )
 
-    def _alight_transition(self, episode_id: str, pu: PUDOAnchor, do: PUDOAnchor, vehicle: VehicleInterface) -> CandidateTransition:
+    def _alight_transition(self, episode_id: str, do: PUDOAnchor, vehicle: VehicleInterface) -> CandidateTransition:
         interface_valid, reasons = self._interface_valid(do, vehicle)
         evidence = self._interface_evidence(do, vehicle, "alight")
         tests = TransitionTests(True, bool(do.adjacent_ped_node_id), True, bool(do.legal_stop), interface_valid, do.blockage_risk < 0.85, reasons + ([] if do.legal_stop else ["illegal_stop"]))
         return self._make_transition(
             episode_id,
-            f"{episode_id}:alight:{do.anchor_id}:{vehicle.vehicle_id}:from_{pu.anchor_id}",
+            f"{episode_id}:alight:{do.anchor_id}:{vehicle.vehicle_id}",
             f"veh:{vehicle.vehicle_id}:alight:{do.anchor_id}",
             do.anchor_id,
             "ride",
@@ -200,9 +312,10 @@ class TransitionGenerator:
 
     def _egress_transition(
         self, episode_id: str, graph: AccessibilityGraph, do: PUDOAnchor,
-        destination_anchor: str, pickup_id: str, scene_context: Dict[str, Any],
-        adjacency, graph_node_ids,
+        destination_anchor: str, scene_context: Dict[str, Any],
+        adjacency, graph_node_ids, node_kinds,
         path_cache: Dict[Tuple[str, str], Dict[str, Any] | NoAccessiblePathError],
+        destination_tree,
     ) -> CandidateTransition:
         start = do.adjacent_ped_node_id or do.anchor_id
         end = destination_anchor
@@ -211,9 +324,19 @@ class TransitionGenerator:
             if isinstance(cached, NoAccessiblePathError):
                 raise cached
             if cached is None:
-                cached = shortest_accessible_path_stats(
-                    graph, start, end, adjacency=adjacency, node_ids=graph_node_ids
-                )
+                if destination_tree is not None:
+                    # The precomputed tree is rooted at destination.  Graph edges
+                    # are undirected in the accessibility router, so reconstruct
+                    # destination->dropoff and reverse the displayed path.
+                    cached = shortest_accessible_path_stats_from_tree(
+                        graph, end, start, destination_tree[0], destination_tree[1],
+                        node_kinds=node_kinds, reverse_output=True,
+                    )
+                else:
+                    cached = shortest_accessible_path_stats(
+                        graph, start, end, adjacency=adjacency, node_ids=graph_node_ids,
+                        node_kinds=node_kinds,
+                    )
                 path_cache[(start, end)] = cached
             path = cached
             tests = TransitionTests(True, True, True, True, True, not path.get("obstacle", False), ["obstacle_on_path"] if path.get("obstacle") else [])
@@ -224,7 +347,7 @@ class TransitionGenerator:
         evidence = self._path_evidence("egress", path, scene_context)
         return self._make_transition(
             episode_id,
-            f"{episode_id}:egress:{do.anchor_id}->{destination_anchor}:from_{pickup_id}",
+            f"{episode_id}:egress:{do.anchor_id}->{destination_anchor}",
             do.anchor_id,
             destination_anchor,
             "alight",
@@ -239,10 +362,10 @@ class TransitionGenerator:
             metadata={"path_edge_ids": path.get("path_edge_ids", []), "adjacent_ped_node_id": start},
         )
 
-    def _destination_transition(self, episode_id: str, do: PUDOAnchor, pickup_id: str, destination_anchor: str) -> CandidateTransition:
+    def _destination_transition(self, episode_id: str, do: PUDOAnchor, destination_anchor: str) -> CandidateTransition:
         return self._make_transition(
             episode_id,
-            f"{episode_id}:destination:{do.anchor_id}:from_{pickup_id}",
+            f"{episode_id}:destination:{do.anchor_id}",
             destination_anchor,
             destination_anchor,
             "egress",

@@ -16,7 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from capplan.data.accessibility_layer import PreparedAccessibilityBuilder, SyntheticAccessibilityBuilder, attach_pudo_nodes_to_graph, write_accessibility_graph
+from capplan.data.accessibility_layer import (
+    PreparedAccessibilityBuilder,
+    SyntheticAccessibilityBuilder,
+    attach_pudo_nodes_to_graph,
+    materialize_prepared_accessibility_graph,
+    write_accessibility_graph,
+)
 from capplan.data.capability_contracts import load_contracts_from_profiles, sample_contracts_with_pairs
 from capplan.data.label_oracle import IndependentLabelOracle
 from capplan.data.nuplan_adapter import NuPlanAdapter
@@ -766,6 +772,7 @@ def main() -> None:
     certificate_labels: List[Dict[str, Any]] = []
     counterfactual_pairs: List[Dict[str, Any]] = []
     service_request_records: List[Dict[str, Any]] = []
+    graph_storage_modes: Dict[str, int] = {}
 
     # An episode allowlist is selected from evidence *after* candidate generation,
     # so it may contain IDs that occur late in the DB stream. Do not apply the
@@ -866,13 +873,34 @@ def main() -> None:
                 },
             )
             pudo = _apply_pudo_evidence_overrides(pudo, pudo_evidence_overrides)
+        prepared_nodes_path = graph.metadata.get("nodes_path") if isinstance(acc_builder, PreparedAccessibilityBuilder) else None
+        prepared_edges_path = graph.metadata.get("edges_path") if isinstance(acc_builder, PreparedAccessibilityBuilder) else None
+        graph_shape_before_pudo = (len(graph.nodes), len(graph.edges))
         graph, pudo = attach_pudo_nodes_to_graph(graph, pudo)
         _enforce_paper_episode_quality(args, eid, graph, origin, destination, pudo)
         _enforce_hybrid_episode_quality(args, eid, graph, pudo)
         # Canonical node/edge graph files are sufficient for training/evaluation.
         # Avoid duplicating the full graph into a legacy combined JSONL record;
-        # this materially reduces hybrid build serialization and disk I/O.
-        write_accessibility_graph(out, graph, write_legacy_combined=False)
+        # this materially reduces hybrid build serialization and disk I/O.  In
+        # the common hybrid case every PUDO already references an existing
+        # pedestrian node, so attaching PUDOs does not change topology at all.
+        # Reuse the byte-identical prepared graph files instead of serializing
+        # 20k--40k edges per episode again.
+        graph_shape_after_pudo = (len(graph.nodes), len(graph.edges))
+        if (
+            prepared_nodes_path
+            and prepared_edges_path
+            and graph_shape_after_pudo == graph_shape_before_pudo
+            and Path(str(prepared_nodes_path)).is_file()
+            and Path(str(prepared_edges_path)).is_file()
+        ):
+            storage_mode = materialize_prepared_accessibility_graph(
+                out, graph, str(prepared_nodes_path), str(prepared_edges_path)
+            )
+        else:
+            write_accessibility_graph(out, graph, write_legacy_combined=False)
+            storage_mode = "serialized"
+        graph_storage_modes[storage_mode] = graph_storage_modes.get(storage_mode, 0) + 1
         pudo_records.extend(to_dict(x) for x in pudo)
 
         trip_context = {
@@ -973,6 +1001,9 @@ def main() -> None:
         "num_episodes": len(episodes),
         "num_contracts": len(contracts),
         "num_transitions": len(transitions),
+        "transition_candidate_selection": "route_aware_exact_pedestrian_distance_v1_20260828",
+        "transition_suffix_deduplication": "dropoff_state_suffix_edges_v1_20260828",
+        "graph_storage_modes": graph_storage_modes,
     }
     dump_json(out / "dataset_manifest.json", manifest)
     validation = validate_dataset(out, strict=args.strict)

@@ -28,6 +28,7 @@ from capplan.semantics.typed_resource_algebra import (
     active_clauses,
     active_groups,
     conservative_value,
+    dominates,
     init_ledger,
     satisfy_all,
     signed_margin,
@@ -86,21 +87,19 @@ class IndependentLabelOracle:
         })
         if not origin_states:
             origin_states = [("origin", "origin")]
-        q = deque(
-            (anchor, phase, dict(ledger0), [], [], 0.0)
-            for anchor, phase in origin_states
-        )
-        visited = set()
+        q = deque()
+        pareto: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for anchor, phase in origin_states:
+            ledger = dict(ledger0)
+            state = {"anchor": anchor, "phase": phase, "resource_ledger": ledger, "cost": 0.0}
+            pareto.setdefault((anchor, phase), []).append(state)
+            q.append((anchor, phase, ledger, [], [], 0.0))
         violations: List[ViolationRecord] = []
         outgoing: Dict[Tuple[str, str], List[CandidateTransition]] = {}
         for e in transitions:
             outgoing.setdefault((e.from_anchor, e.from_phase), []).append(e)
         while q:
             anchor, phase, ledger, hist, steps, cost = q.popleft()
-            key = (anchor, phase, tuple(e.transition_id for e in hist))
-            if key in visited:
-                continue
-            visited.add(key)
             ok_final, _, _ = satisfy_all(ledger, clauses, groups, self.registry)
             if self.automaton.accept(phase) and ok_final:
                 return PassengerCompleteSkeleton(episode_id, compiled.passenger_id, True, [e.transition_id for e in hist], steps, ledger, cost), None
@@ -123,7 +122,25 @@ class IndependentLabelOracle:
                     violations.extend(edge_vios)
                     continue
                 step = LedgerStep(e.transition_id, e.to_phase, e.action, ledger2, margins, [ev.__dict__ for ev in e.resource_evidence])
-                q.append((e.to_anchor, e.to_phase, ledger2, hist + [e], steps + [step], cost + e.cost))
+                cost2 = cost + e.cost
+                candidate = {
+                    "anchor": e.to_anchor,
+                    "phase": e.to_phase,
+                    "resource_ledger": ledger2,
+                    "cost": cost2,
+                }
+                bucket = pareto.setdefault((e.to_anchor, e.to_phase), [])
+                # Exact resource/cost dominance is the same state reduction used
+                # by TSBS: at one anchor/phase a label that is no cheaper and no
+                # better in every typed resource cannot unlock a future service
+                # transition that the dominating label could not also unlock.
+                # This removes replan-cycle history explosions without changing
+                # the symbolic feasibility predicate.
+                if any(dominates(existing, candidate, self.registry) for existing in bucket):
+                    continue
+                bucket[:] = [existing for existing in bucket if not dominates(candidate, existing, self.registry)]
+                bucket.append(candidate)
+                q.append((e.to_anchor, e.to_phase, ledger2, hist + [e], steps + [step], cost2))
         return None, select_certificate(episode_id, contract.passenger_id, violations)
 
     def verify_episode(
