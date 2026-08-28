@@ -771,7 +771,7 @@ def main() -> None:
             legal = bool(_as_bool(row.get("legal_stop")))
             eligible = complete and legal and float(row.get("blockage_risk") or 0.0) < 0.85 and float(row.get("deployment_clearance_m") or 0.0) > 0
             row.update({
-                "truth_mode": "hybrid_geometry_anchored_site_correlated_simulated_interface_v4",
+                "truth_mode": "hybrid_geometry_anchored_site_correlated_simulated_interface_v6",
                 "evidence_kind": "mixed" if simulated and any(isinstance(v, Mapping) and str(v.get("kind")) in {"observed", "derived"} for v in prov.values()) else ("simulated" if simulated else "observed_or_derived"),
                 "field_provenance": prov,
                 "hybrid_evidence_complete": complete,

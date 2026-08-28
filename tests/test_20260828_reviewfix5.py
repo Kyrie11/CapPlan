@@ -97,7 +97,7 @@ def test_diagnostics_cli_registers_fast_graph_scan():
 
 def test_reviewfix5_bundle_uses_fresh_dataset_context_and_reuses_only_graph_v3():
     text = (ROOT / "scripts/build_hybrid_review_bundle.py").read_text()
-    assert 'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_20260828"' in text
+    assert 'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828"' in text
     assert 'commands/hybrid_run_context.reviewfix5_dataset.json' in text
     assert 'return rel.startswith("hybrid_graph.")' in text
 
@@ -108,3 +108,73 @@ def test_hybrid_pudo_v6_records_dynamic_blockage_provenance():
     assert '"kind": "derived"' in text
     assert '"source": "nuplan_agent_history"' in text
     assert '"nearest_agent_distance_dynamic_blockage_risk"' in text
+
+
+def test_reviewfix5_preflight_executes_bash_helpers(tmp_path: Path):
+    env = dict(os.environ)
+    env.update({
+        "CAP_HOME": str(ROOT),
+        "DATA_ROOT": str(tmp_path / "data"),
+        "CAP_DATA": str(tmp_path / "data"),
+        "CONFIG": str(ROOT / "configs/abilitybench_nuplan_real_data0.yaml"),
+    })
+    proc = subprocess.run(
+        ["bash", str(ROOT / "scripts/build_abilitybench_data0_20260817.sh"), "reviewfix5-preflight"],
+        check=True, capture_output=True, text=True, env=env,
+    )
+    assert "CAPPLAN_REVIEWFIX5_RUNTIME_GUARD=PASS" in proc.stdout
+    assert "CAPPLAN_REVIEWFIX5_HELPER_DEFINITIONS=present" in proc.stdout
+    assert "CAPPLAN_REVIEWFIX5_HELPER_SMOKE=PASS" in proc.stdout
+    assert "CAPPLAN_PIPELINE_VERSION=abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828" in proc.stdout
+    assert "CAPPLAN_REVIEWFIX5_DIAGNOSE_FAST_GRAPH_SCAN=present" in proc.stdout
+
+
+def test_reviewfix5_helper_is_not_inside_python_heredoc():
+    text = (ROOT / "scripts/build_abilitybench_data0_20260817.sh").read_text(encoding="utf-8")
+    ctx_start = text.index("<<'PYCTX5'")
+    ctx_end = text.index("\nPYCTX5", ctx_start)
+    heredoc_body = text[ctx_start:ctx_end]
+    assert "write_reviewfix5_dataset_hashes()" not in heredoc_body
+    assert text.index("write_reviewfix5_dataset_hashes()") > ctx_end
+
+
+def test_reviewfix5_bundle_requires_fresh_hash_and_upstream_graph_lineage():
+    text = (ROOT / "scripts/build_hybrid_review_bundle.py").read_text(encoding="utf-8")
+    assert 'commands/reviewfix5_dataset_fix.sha256' in text
+    assert 'reused_upstream_run_id' in text
+    assert 'upstream_start_ns' in text
+    assert 'path.stat().st_mtime_ns <= upstream_start_ns' in text
+
+
+def test_reviewfix5_reused_graph_preflight_accepts_bound_reviewfix3_lineage(tmp_path: Path):
+    import time
+    data_root = tmp_path / "data"
+    reports = data_root / "external" / "reports"
+    commands = reports / "commands"
+    commands.mkdir(parents=True)
+    start_ns = time.time_ns() - 2_000_000_000
+    context = {
+        "run_id": "reviewfix3_test_lineage",
+        "start_time_ns": start_ns,
+    }
+    (commands / "hybrid_run_context.reviewfix3.json").write_text(
+        json.dumps(context), encoding="utf-8"
+    )
+    graph_report = {
+        "status": "PASS",
+        "version": "abilitybench_hybrid_accessibility_v3_20260825",
+        "numeric_field_ranges": {"slope": {"max": 0.45}},
+    }
+    for split in ("train", "val", "test"):
+        for city in ("boston", "pittsburgh", "vegas", "singapore"):
+            (reports / f"hybrid_graph.{split}.{city}.json").write_text(
+                json.dumps(graph_report), encoding="utf-8"
+            )
+    env = dict(os.environ)
+    env.update({"CAP_HOME": str(ROOT), "DATA_ROOT": str(data_root), "CAP_DATA": str(data_root)})
+    proc = subprocess.run(
+        ["bash", str(ROOT / "scripts/build_abilitybench_data0_20260817.sh"), "reviewfix5-reused-graph-preflight"],
+        check=True, capture_output=True, text=True, env=env,
+    )
+    assert "CAPPLAN_REVIEWFIX5_REUSED_GRAPH_REPORTS=12/12" in proc.stdout
+    assert "CAPPLAN_REVIEWFIX5_REUSED_GRAPH_PREFLIGHT=PASS" in proc.stdout

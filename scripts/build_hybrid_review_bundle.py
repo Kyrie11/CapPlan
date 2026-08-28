@@ -19,13 +19,13 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "capplan_hybrid_review_bundle_v5_20260828"
+VERSION = "capplan_hybrid_review_bundle_v5_hotfix1_20260828"
 EXPECTED_GRAPH_VERSION = "abilitybench_hybrid_accessibility_v3_20260825"
 EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v6_20260828"
 EXPECTED_READY_VERSION = "abilitybench_hybrid_ready_allowlist_v1_20260823"
 EXPECTED_AUDIT_VERSION = "abilitybench_hybrid_dataset_audit_v4_20260825"
 EXPECTED_SITE_AUDIT_VERSION = "abilitybench_hybrid_site_consistency_v2_20260825"
-EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_20260828"
+EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828"
 SPLITS = ("train", "val", "test")
 CITIES = ("boston", "pittsburgh", "vegas", "singapore")
 
@@ -153,6 +153,7 @@ def _required_paths(root: Path) -> list[tuple[Path, str | None]]:
         req.append((root / f"commands/hybrid_build.{split}.log", None))
     req.append((root / "hybrid_site_consistency.json", EXPECTED_SITE_AUDIT_VERSION))
     req.append((root / "commands/hybrid_run_context.reviewfix5_dataset.json", None))
+    req.append((root / "commands/reviewfix5_dataset_fix.sha256", None))
     return req
 
 
@@ -180,6 +181,27 @@ def _assess(root: Path) -> dict[str, Any]:
         run_start_ns = int(run_context_payload.get("start_time_ns")) if run_context_payload.get("start_time_ns") else (identity.stat().st_mtime_ns if identity else None)
     except Exception:
         run_start_ns = identity.stat().st_mtime_ns if identity else None
+
+    # Dataset-only reviewfix5 intentionally reuses the expensive graph-v3 layer.
+    # Reuse is valid only when the current run context names the upstream
+    # reviewfix3 context and that context proves the graph reports were produced
+    # after its own start.  Do not exempt arbitrary same-version historical graph
+    # reports merely because their filename begins with ``hybrid_graph.``.
+    upstream_context: Path | None = None
+    upstream_payload: dict[str, Any] = {}
+    upstream_start_ns: int | None = None
+    raw_upstream = run_context_payload.get("reused_upstream_context") if run_context_payload else None
+    if raw_upstream:
+        candidate = Path(str(raw_upstream))
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        if candidate.is_file():
+            upstream_context = candidate.resolve()
+            upstream_payload = _json(upstream_context)
+            try:
+                upstream_start_ns = int(upstream_payload.get("start_time_ns")) if upstream_payload.get("start_time_ns") else None
+            except Exception:
+                upstream_start_ns = None
     missing: list[str] = []
     stale: list[str] = []
     version_mismatch: list[dict[str, str]] = []
@@ -202,12 +224,40 @@ def _assess(root: Path) -> dict[str, Any]:
             if str(expected_sha or "") != actual_sha:
                 version_mismatch.append({"path": f"runtime_sha256:{rel}", "expected": str(expected_sha or "missing"), "actual": actual_sha})
 
+    reused_artifacts = set(run_context_payload.get("reused_artifacts") or []) if run_context_payload else set()
+    if "hybrid_graph_v3" in reused_artifacts:
+        expected_upstream_run_id = str(run_context_payload.get("reused_upstream_run_id") or "")
+        if upstream_context is None:
+            version_mismatch.append({
+                "path": "reused_upstream_context",
+                "expected": expected_upstream_run_id or "reviewfix3 context",
+                "actual": "missing",
+            })
+        else:
+            actual_upstream_run_id = str(upstream_payload.get("run_id") or "")
+            if not expected_upstream_run_id or actual_upstream_run_id != expected_upstream_run_id:
+                version_mismatch.append({
+                    "path": str(upstream_context),
+                    "expected": expected_upstream_run_id or "non-empty reused_upstream_run_id",
+                    "actual": actual_upstream_run_id or "missing",
+                })
+            if upstream_start_ns is None:
+                version_mismatch.append({
+                    "path": str(upstream_context),
+                    "expected": "valid start_time_ns",
+                    "actual": "missing_or_invalid",
+                })
+
     for path, expected_version in _required_paths(root):
         rel = str(path.relative_to(root))
         if not path.exists():
             missing.append(rel)
             continue
-        if run_start_ns is not None and path.stat().st_mtime_ns <= run_start_ns and not _is_reused_upstream(rel):
+        if _is_reused_upstream(rel):
+            if upstream_start_ns is None or path.stat().st_mtime_ns <= upstream_start_ns:
+                stale.append(rel)
+                continue
+        elif run_start_ns is not None and path.stat().st_mtime_ns <= run_start_ns:
             stale.append(rel)
             continue
         fresh.append(rel)
@@ -276,6 +326,9 @@ def _assess(root: Path) -> dict[str, Any]:
         "run_id": run_context_payload.get("run_id") if run_context_payload else None,
         "run_start_mtime_ns": run_start_ns,
         "run_start_utc": _iso_from_ns(run_start_ns),
+        "reused_upstream_context": str(upstream_context) if upstream_context else None,
+        "reused_upstream_run_id": upstream_payload.get("run_id") if upstream_payload else None,
+        "reused_upstream_start_ns": upstream_start_ns,
         "reused_upstream_required": [rel for rel in fresh if _is_reused_upstream(rel)],
         "fresh_required": fresh,
         "missing_required": missing,

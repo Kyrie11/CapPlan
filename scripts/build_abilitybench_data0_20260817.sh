@@ -8,7 +8,7 @@ EXT="$DATA_ROOT/external"
 REPORTS="$EXT/reports"
 # Historical compatibility marker retained for regression tests/documentation:
 # PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix3_20260825"
-PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix5_20260828"
+PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828"
 
 mkdir -p "$REPORTS/commands" "$REPORTS/build" "$REPORTS/model" "$REPORTS/eval"
 cd "$CAP_HOME"
@@ -36,7 +36,7 @@ pipeline_version() {
     && echo "CAPPLAN_HYBRID_PUDO_V6=present" || echo "CAPPLAN_HYBRID_PUDO_V6=MISSING"
   grep -q 'abilitybench_hybrid_dataset_audit_v4_20260825' "$CAP_HOME/scripts/audit_hybrid_benchmark.py" 2>/dev/null \
     && echo "CAPPLAN_HYBRID_AUDIT_V4=present" || echo "CAPPLAN_HYBRID_AUDIT_V4=MISSING"
-  grep -q 'capplan_hybrid_review_bundle_v5_20260828' "$CAP_HOME/scripts/build_hybrid_review_bundle.py" 2>/dev/null \
+  grep -q 'capplan_hybrid_review_bundle_v5_hotfix1_20260828' "$CAP_HOME/scripts/build_hybrid_review_bundle.py" 2>/dev/null \
     && echo "CAPPLAN_REVIEW_BUNDLE_V5=present" || echo "CAPPLAN_REVIEW_BUNDLE_V5=MISSING"
 }
 
@@ -76,8 +76,8 @@ checks = {
         "def _link_or_copy(",
     ],
     "scripts/build_hybrid_review_bundle.py": [
-        'VERSION = "capplan_hybrid_review_bundle_v5_20260828"',
-        'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_20260828"',
+        'VERSION = "capplan_hybrid_review_bundle_v5_hotfix1_20260828"',
+        'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828"',
     ],
 }
 errors=[]
@@ -96,21 +96,34 @@ if errors:
     raise SystemExit(2)
 print("CAPPLAN_REVIEWFIX5_RUNTIME_GUARD=PASS")
 PYGUARD5
+  local helper
+  for helper in write_reviewfix5_dataset_hashes write_reviewfix5_dataset_run_context reviewfix5_helper_selfcheck reviewfix5_reused_graph_preflight; do
+    if ! declare -F "$helper" >/dev/null 2>&1; then
+      echo "CAPPLAN_REVIEWFIX5_RUNTIME_GUARD=FAIL helper_missing=$helper" >&2
+      return 2
+    fi
+  done
 }
 
 write_reviewfix5_dataset_run_context() {
-  local out="$REPORTS/commands/hybrid_run_context.reviewfix5_dataset.json"
+  local out="${1:-$REPORTS/commands/hybrid_run_context.reviewfix5_dataset.json}"
   python - "$CAP_HOME" "$CONFIG" "$PIPELINE_VERSION" "$out" <<'PYCTX5'
 from pathlib import Path
 import datetime as dt, hashlib, json, os, sys, time
-root=Path(sys.argv[1]).resolve(); config=Path(sys.argv[2]).resolve(); version=sys.argv[3]; out=Path(sys.argv[4])
+root=Path(sys.argv[1]).resolve(); config=Path(sys.argv[2]).resolve(); version=sys.argv[3]; out=Path(sys.argv[4]).resolve()
 critical=[
   "scripts/build_abilitybench_data0_20260817.sh",
   "scripts/build_hybrid_pudo_evidence.py",
   "scripts/audit_hybrid_site_consistency.py",
+  "scripts/build_hybrid_ready_allowlist.py",
+  "scripts/build_service_layer.py",
   "capplan/data/label_oracle.py",
   "capplan/data/accessibility_layer.py",
+  "capplan/data/pudo_interface_layer.py",
   "capplan/planning/transition_generator.py",
+  "capplan/semantics/capability_compiler.py",
+  "capplan/semantics/service_automaton.py",
+  "capplan/semantics/typed_resource_algebra.py",
   "scripts/build_dataset.py",
   "scripts/audit_dataset_quality.py",
   "scripts/diagnose_capplan_outputs.py",
@@ -123,8 +136,14 @@ sha={}
 for rel in critical:
     p=root/rel
     sha[rel]=hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+missing=[rel for rel,val in sha.items() if val is None]
+if missing:
+    raise SystemExit("reviewfix5 run-context critical files missing: " + ", ".join(missing))
 now_ns=time.time_ns()
-run_id=f"reviewfix5_dataset_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{sha[critical[0]][:12]}"
+run_id=(
+    f"reviewfix5_dataset_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    f"_{now_ns}_{sha[critical[0]][:12]}"
+)
 upstream=out.parent/"hybrid_run_context.reviewfix3.json"
 upstream_payload={}
 if upstream.exists():
@@ -138,14 +157,29 @@ payload={
   "reused_upstream_run_id":upstream_payload.get("run_id") if upstream_payload else None,
   "reused_artifacts":["hybrid_graph_v3"],
 }
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(payload, indent=2, sort_keys=True)+"\n", encoding="utf-8")
+print(f"CAPPLAN_HYBRID_RUN_ID={run_id}")
+print(f"CAPPLAN_HYBRID_RUN_CONTEXT={out}")
+PYCTX5
+}
 
 write_reviewfix5_dataset_hashes() {
+  local out="${1:-$REPORTS/commands/reviewfix5_dataset_fix.sha256}"
+  mkdir -p "$(dirname "$out")"
   sha256sum \
     scripts/build_abilitybench_data0_20260817.sh \
     scripts/build_hybrid_pudo_evidence.py \
+    scripts/audit_hybrid_site_consistency.py \
+    scripts/build_hybrid_ready_allowlist.py \
+    scripts/build_service_layer.py \
     capplan/data/label_oracle.py \
     capplan/data/accessibility_layer.py \
+    capplan/data/pudo_interface_layer.py \
     capplan/planning/transition_generator.py \
+    capplan/semantics/capability_compiler.py \
+    capplan/semantics/service_automaton.py \
+    capplan/semantics/typed_resource_algebra.py \
     scripts/build_dataset.py \
     scripts/audit_dataset_quality.py \
     scripts/diagnose_capplan_outputs.py \
@@ -153,12 +187,107 @@ write_reviewfix5_dataset_hashes() {
     scripts/audit_hybrid_benchmark.py \
     scripts/merge_datasets.py \
     scripts/build_hybrid_review_bundle.py \
-    | tee "$REPORTS/commands/reviewfix5_dataset_fix.sha256"
+    | tee "$out"
 }
-out.parent.mkdir(parents=True, exist_ok=True); out.write_text(json.dumps(payload, indent=2, sort_keys=True)+"\n")
-print(f"CAPPLAN_HYBRID_RUN_ID={run_id}")
-print(f"CAPPLAN_HYBRID_RUN_CONTEXT={out}")
-PYCTX5
+
+reviewfix5_helper_selfcheck() {
+  local helper tmpdir
+  for helper in write_reviewfix5_dataset_hashes write_reviewfix5_dataset_run_context; do
+    if ! declare -F "$helper" >/dev/null 2>&1; then
+      echo "CAPPLAN_REVIEWFIX5_HELPER_DEFINITIONS=FAIL helper_missing=$helper" >&2
+      return 2
+    fi
+  done
+  command -v sha256sum >/dev/null 2>&1 || {
+    echo "CAPPLAN_REVIEWFIX5_HELPER_DEFINITIONS=FAIL missing_command=sha256sum" >&2
+    return 2
+  }
+  echo "CAPPLAN_REVIEWFIX5_HELPER_DEFINITIONS=present"
+
+  # Execute both helpers against a temporary directory. This catches exactly the
+  # class of bug where a Bash helper name exists textually inside a Python heredoc
+  # but was never defined by Bash, and also validates the embedded Python syntax.
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/capplan-reviewfix5-preflight.XXXXXX")
+  if ! write_reviewfix5_dataset_run_context "$tmpdir/context.json" >/dev/null; then
+    rm -rf "$tmpdir"
+    echo "CAPPLAN_REVIEWFIX5_HELPER_SMOKE=FAIL helper=run_context" >&2
+    return 2
+  fi
+  if ! write_reviewfix5_dataset_hashes "$tmpdir/hashes.sha256" >/dev/null; then
+    rm -rf "$tmpdir"
+    echo "CAPPLAN_REVIEWFIX5_HELPER_SMOKE=FAIL helper=hashes" >&2
+    return 2
+  fi
+  python - "$tmpdir/context.json" "$PIPELINE_VERSION" <<'PYSELF5'
+import json, sys
+from pathlib import Path
+p=Path(sys.argv[1]); expected=sys.argv[2]
+obj=json.loads(p.read_text(encoding="utf-8"))
+if obj.get("pipeline_version") != expected:
+    raise SystemExit(f"pipeline version mismatch in helper smoke: {obj.get('pipeline_version')} != {expected}")
+if not obj.get("run_id") or not isinstance(obj.get("critical_file_sha256"), dict):
+    raise SystemExit("invalid reviewfix5 helper smoke context")
+PYSELF5
+  rm -rf "$tmpdir"
+  echo "CAPPLAN_REVIEWFIX5_HELPER_SMOKE=PASS"
+}
+
+reviewfix5_reused_graph_preflight() {
+  # This resume deliberately reuses the expensive reviewfix3 graph-v3 reports.
+  # Prove their lineage before starting PUDO/dataset work so a missing/stale
+  # upstream context cannot turn into a many-hour build followed by bundle FAIL.
+  python - "$REPORTS" <<'PYGRAPH5'
+from pathlib import Path
+import json, math, sys
+root=Path(sys.argv[1]).resolve()
+ctx=root/"commands/hybrid_run_context.reviewfix3.json"
+errors=[]
+if not ctx.is_file():
+    errors.append(f"missing_upstream_context:{ctx}")
+    payload={}; start_ns=None
+else:
+    try:
+        payload=json.loads(ctx.read_text(encoding="utf-8"))
+    except Exception as e:
+        payload={}; errors.append(f"invalid_upstream_context_json:{type(e).__name__}:{e}")
+    try:
+        start_ns=int(payload.get("start_time_ns")) if payload.get("start_time_ns") else None
+    except Exception:
+        start_ns=None
+    if not payload.get("run_id"):
+        errors.append("upstream_context_missing_run_id")
+    if start_ns is None:
+        errors.append("upstream_context_missing_start_time_ns")
+for split in ("train","val","test"):
+    for city in ("boston","pittsburgh","vegas","singapore"):
+        p=root/f"hybrid_graph.{split}.{city}.json"
+        if not p.is_file():
+            errors.append(f"missing_graph_report:{p.name}"); continue
+        try:
+            obj=json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            errors.append(f"invalid_graph_report:{p.name}:{type(e).__name__}:{e}"); continue
+        if obj.get("version") != "abilitybench_hybrid_accessibility_v3_20260825":
+            errors.append(f"wrong_graph_version:{p.name}:{obj.get('version')}")
+        if str(obj.get("status") or "").upper() != "PASS":
+            errors.append(f"graph_status_not_pass:{p.name}:{obj.get('status')}")
+        if start_ns is not None and p.stat().st_mtime_ns <= start_ns:
+            errors.append(f"graph_report_stale_vs_upstream_context:{p.name}")
+        try:
+            slope=(obj.get("numeric_field_ranges") or {}).get("slope") or {}
+            vmax=slope.get("max")
+            if vmax is not None and math.isfinite(float(vmax)) and float(vmax) > 1.0 + 1e-9:
+                errors.append(f"implausible_graph_slope:{p.name}:{vmax}")
+        except Exception:
+            errors.append(f"invalid_graph_slope_summary:{p.name}")
+if errors:
+    print("CAPPLAN_REVIEWFIX5_REUSED_GRAPH_PREFLIGHT=FAIL", file=sys.stderr)
+    for e in errors[:100]: print(e, file=sys.stderr)
+    raise SystemExit(2)
+print(f"CAPPLAN_REVIEWFIX5_REUSED_GRAPH_RUN_ID={payload.get('run_id')}")
+print("CAPPLAN_REVIEWFIX5_REUSED_GRAPH_REPORTS=12/12")
+print("CAPPLAN_REVIEWFIX5_REUSED_GRAPH_PREFLIGHT=PASS")
+PYGRAPH5
 }
 
 reviewfix3_runtime_guard() {
@@ -935,6 +1064,7 @@ hybrid_build() {
 
 reviewfix5_preflight() {
   reviewfix5_runtime_guard
+  reviewfix5_helper_selfcheck
   pipeline_version
   python scripts/diagnose_capplan_outputs.py --help | grep -q -- '--fast_graph_scan'
   echo "CAPPLAN_REVIEWFIX5_DIAGNOSE_FAST_GRAPH_SCAN=present"
@@ -947,9 +1077,11 @@ hybrid_dataset_resume_reviewfix5() {
   # labels/audits/merge only, and let the review bundle distinguish these new
   # artifacts from the reused reviewfix3 lineage.
   reviewfix5_runtime_guard
+  reviewfix5_helper_selfcheck
+  reviewfix5_reused_graph_preflight
   pipeline_version | tee "$REPORTS/commands/pipeline_identity.reviewfix5_dataset.txt"
-  write_reviewfix5_dataset_hashes
   write_reviewfix5_dataset_run_context | tee "$REPORTS/commands/hybrid_run_context.reviewfix5_dataset.log"
+  write_reviewfix5_dataset_hashes
   # PUDO is cheap to refresh and v6 closes the missing dynamic-blockage
   # provenance gap.  The expensive hybrid accessibility graph v3 is reused.
   hybrid_pudo_evidence_only
@@ -1218,7 +1350,8 @@ Usage: $0 <stage>
 Stages:
   version                              # print exact pipeline/check-out identity before long runs
   reviewfix3-preflight                 # hard-check critical script semantic versions/hashes before data writes
-  reviewfix5-preflight                 # zero-write check for Oracle/PUDO-selection/diagnose/performance fixes
+  reviewfix5-preflight                 # code/helper smoke check; no benchmark data writes
+  reviewfix5-reused-graph-preflight    # verify reviewfix3 graph-v3 lineage before dataset-only resume
   migrate
   inspect-nuplan
   prepare-osm
@@ -1246,7 +1379,7 @@ Stages:
   hybrid-evidence                      # explicit observed/derived/simulated benchmark truth overlays
   hybrid-ready-allowlists              # select evidence-valid hybrid episodes; no geometry synthesis
   hybrid-build                         # build benchmark datasets under outputs/datasets/abilitybench_av_hybrid_*
-  hybrid-dataset-resume-reviewfix5     # RECOMMENDED here: reuse graph v3/PUDO v5 and rebuild only final datasets/audits
+  hybrid-dataset-resume-reviewfix5     # RECOMMENDED here: reuse graph v3, refresh PUDO v6, and rebuild final datasets/audits
   hybrid-from-existing                 # recommended continuation: source refresh -> recovery -> overlays -> build
   hybrid-full-build                    # complete from-zero four-city train/val/test hybrid benchmark pipeline
   hybrid-reality-refresh               # Rebuild hybrid priors/service/labels only when base graph semantics are already current
@@ -1284,6 +1417,7 @@ case "${1:-}" in
   version|pipeline-version) pipeline_version ;;
   reviewfix3-preflight) reviewfix3_preflight ;;
   reviewfix5-preflight) reviewfix5_preflight ;;
+  reviewfix5-reused-graph-preflight) reviewfix5_reused_graph_preflight ;;
   migrate) migrate ;;
   inspect-nuplan) inspect_nuplan ;;
   prepare-osm) prepare_osm ;;

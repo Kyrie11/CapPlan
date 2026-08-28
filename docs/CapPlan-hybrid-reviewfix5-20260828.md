@@ -1,3 +1,7 @@
+# Reviewfix5 hotfix1 (2026-08-28)
+
+Hotfix1 repairs a Bash/Python heredoc placement bug in the original reviewfix5 delivery: `write_reviewfix5_dataset_hashes()` had been inserted inside the Python heredoc of `write_reviewfix5_dataset_run_context()`, so Bash never defined the helper and the dataset resume stopped before any PUDO/dataset write. The preflight now executes both helpers against a temporary directory, and the review bundle validates the reused reviewfix3 graph lineage plus a fresh dataset-code SHA256 artifact.
+
 # CapPlan hybrid dataset reviewfix5 — 2026-08-28
 
 ## Scope
@@ -64,7 +68,17 @@ bash scripts/build_abilitybench_data0_20260817.sh reviewfix5-preflight \
   2>&1 | tee "$REPORTS/commands/manual_reviewfix5_preflight.txt"
 ```
 
-Do not continue unless the preflight prints `CAPPLAN_REVIEWFIX5_RUNTIME_GUARD=PASS`, pipeline version `abilitybench_data0_realism_v4_reviewfix5_20260828`, and `CAPPLAN_REVIEWFIX5_DIAGNOSE_FAST_GRAPH_SCAN=present`.
+Do not continue unless the preflight prints `CAPPLAN_REVIEWFIX5_RUNTIME_GUARD=PASS`, `CAPPLAN_REVIEWFIX5_HELPER_DEFINITIONS=present`, `CAPPLAN_REVIEWFIX5_HELPER_SMOKE=PASS`, pipeline version `abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828`, and `CAPPLAN_REVIEWFIX5_DIAGNOSE_FAST_GRAPH_SCAN=present`.
+
+Because this continuation reuses the expensive reviewfix3 graph-v3 layer, validate that upstream lineage before the long dataset build:
+
+```bash
+set -o pipefail
+bash scripts/build_abilitybench_data0_20260817.sh reviewfix5-reused-graph-preflight \
+  2>&1 | tee "$REPORTS/commands/manual_reviewfix5_reused_graph_preflight.txt"
+```
+
+Require `CAPPLAN_REVIEWFIX5_REUSED_GRAPH_REPORTS=12/12` and `CAPPLAN_REVIEWFIX5_REUSED_GRAPH_PREFLIGHT=PASS`. This stage checks the preserved `hybrid_run_context.reviewfix3.json`, all 12 graph-v3 report versions/statuses/freshness, and the graph slope summary.
 
 Then:
 
