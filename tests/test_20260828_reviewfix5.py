@@ -97,14 +97,14 @@ def test_diagnostics_cli_registers_fast_graph_scan():
 
 def test_reviewfix5_bundle_uses_fresh_dataset_context_and_reuses_only_graph_v3():
     text = (ROOT / "scripts/build_hybrid_review_bundle.py").read_text()
-    assert 'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828"' in text
+    assert 'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_hotfix2_20260828"' in text
     assert 'commands/hybrid_run_context.reviewfix5_dataset.json' in text
     assert 'return rel.startswith("hybrid_graph.")' in text
 
 
 def test_hybrid_pudo_v6_records_dynamic_blockage_provenance():
     text = (ROOT / "scripts/build_hybrid_pudo_evidence.py").read_text()
-    assert 'VERSION = "abilitybench_hybrid_pudo_v6_20260828"' in text
+    assert 'VERSION = "abilitybench_hybrid_pudo_v7_20260828"' in text
     assert '"kind": "derived"' in text
     assert '"source": "nuplan_agent_history"' in text
     assert '"nearest_agent_distance_dynamic_blockage_risk"' in text
@@ -125,7 +125,7 @@ def test_reviewfix5_preflight_executes_bash_helpers(tmp_path: Path):
     assert "CAPPLAN_REVIEWFIX5_RUNTIME_GUARD=PASS" in proc.stdout
     assert "CAPPLAN_REVIEWFIX5_HELPER_DEFINITIONS=present" in proc.stdout
     assert "CAPPLAN_REVIEWFIX5_HELPER_SMOKE=PASS" in proc.stdout
-    assert "CAPPLAN_PIPELINE_VERSION=abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828" in proc.stdout
+    assert "CAPPLAN_PIPELINE_VERSION=abilitybench_data0_realism_v4_reviewfix5_hotfix2_20260828" in proc.stdout
     assert "CAPPLAN_REVIEWFIX5_DIAGNOSE_FAST_GRAPH_SCAN=present" in proc.stdout
 
 
@@ -178,3 +178,34 @@ def test_reviewfix5_reused_graph_preflight_accepts_bound_reviewfix3_lineage(tmp_
     )
     assert "CAPPLAN_REVIEWFIX5_REUSED_GRAPH_REPORTS=12/12" in proc.stdout
     assert "CAPPLAN_REVIEWFIX5_REUSED_GRAPH_PREFLIGHT=PASS" in proc.stdout
+
+
+def test_hybrid_pudo_v7_replaces_invalid_zero_width_with_provenance():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("pudo_v7", ROOT / "scripts/build_hybrid_pudo_evidence.py")
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    row = mod._normalize_base({
+        "episode_id": "ep", "anchor_id": "a", "side": "right",
+        "curb_height_m": 0.10, "sidewalk_width_m": 0.0,
+        "deployment_clearance_m": 1.5, "curb_ramp": True,
+        "legal_stop": True, "legal_basis": "existing", "blockage_risk": 0.1,
+        "source": "legacy_base_pudo",
+    })
+    assert row["sidewalk_width_m"] is None
+    prov = {}
+    profile = mod._profile("singapore")
+    mod._fill_missing(
+        row, prov, city="singapore", split="train", site_class="accessible_loading",
+        site_seed=123, dynamic_seed=456, site_key="singapore|site", profile=profile,
+    )
+    mod._ensure_core_provenance(
+        row, prov, city="singapore", split="train", site_seed=123, dynamic_seed=456,
+        site_key="singapore|site", profile=profile, counters=mod.Counter(),
+    )
+    assert float(row["sidewalk_width_m"]) > 0.05
+    assert prov["sidewalk_width_m"]["kind"] == "simulated"
+    assert prov["sidewalk_width_m"]["method"] == "site_correlated_pedestrian_clear_width_prior"
+    for field in ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp", "legal_stop", "side", "blockage_risk"):
+        assert field in prov

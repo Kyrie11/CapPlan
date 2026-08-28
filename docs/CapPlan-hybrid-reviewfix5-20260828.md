@@ -26,7 +26,7 @@ The old review bundle was anchored to `hybrid_run_context.reviewfix3.json`, so h
 
 1. **Oracle origin fix retained.** The new Boston quality report has 41 skeletons and no `origin` certificate phase, confirming that the hard-coded origin-anchor problem is fixed.
 2. **PUDO selection is now route-aware.** Hybrid PUDO JSONL is emitted in deterministic anchor-id order. Taking `rows[:4]` was therefore arbitrary. Candidate transitions now choose the compact PUDO set using exact pedestrian shortest-path distance, prioritizing graph-connected legal/unblocked anchors while retaining a challenge candidate when appropriate. The rule is passenger-independent and preserves same-scene counterfactuals.
-3. **Dynamic blockage provenance is explicit.** PUDO v6 records existing nuPlan-agent-history blockage risk as derived evidence; source-uncertain existing scores are conservatively declared simulated. This closes the previous one-missing-core-provenance-per-PUDO audit failure without pretending dynamic scores are municipal measurements.
+3. **Dynamic blockage provenance is explicit.** PUDO v7 records existing nuPlan-agent-history blockage risk as derived evidence; source-uncertain existing scores are conservatively declared simulated. This closes the previous one-missing-core-provenance-per-PUDO audit failure without pretending dynamic scores are municipal measurements.
 4. **No threshold relaxation.** Access distance, width, slope, confidence, interface and capability limits are not loosened to manufacture positives. The final quality gate still rejects a benchmark whose passenger-complete skeleton or passenger-edge positives remain below the existing 5% sparsity guard.
 
 ## Performance fixes without semantic relaxation
@@ -68,7 +68,7 @@ bash scripts/build_abilitybench_data0_20260817.sh reviewfix5-preflight \
   2>&1 | tee "$REPORTS/commands/manual_reviewfix5_preflight.txt"
 ```
 
-Do not continue unless the preflight prints `CAPPLAN_REVIEWFIX5_RUNTIME_GUARD=PASS`, `CAPPLAN_REVIEWFIX5_HELPER_DEFINITIONS=present`, `CAPPLAN_REVIEWFIX5_HELPER_SMOKE=PASS`, pipeline version `abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828`, and `CAPPLAN_REVIEWFIX5_DIAGNOSE_FAST_GRAPH_SCAN=present`.
+Do not continue unless the preflight prints `CAPPLAN_REVIEWFIX5_RUNTIME_GUARD=PASS`, `CAPPLAN_REVIEWFIX5_HELPER_DEFINITIONS=present`, `CAPPLAN_REVIEWFIX5_HELPER_SMOKE=PASS`, pipeline version `abilitybench_data0_realism_v4_reviewfix5_hotfix2_20260828`, and `CAPPLAN_REVIEWFIX5_DIAGNOSE_FAST_GRAPH_SCAN=present`.
 
 Because this continuation reuses the expensive reviewfix3 graph-v3 layer, validate that upstream lineage before the long dataset build:
 
@@ -98,7 +98,7 @@ bash scripts/build_abilitybench_data0_20260817.sh \
   "$REPORTS/commands/hybrid_dataset_resume.reviewfix5.master.log"
 ```
 
-This refreshes cheap PUDO v6 + site consistency + hybrid-ready allowlists, then rebuilds service/dataset/oracle/quality/semantic-audit/merge for train, val and test. It reuses hybrid graph v3.
+This refreshes cheap PUDO v7 + site consistency + hybrid-ready allowlists, then rebuilds service/dataset/oracle/quality/semantic-audit/merge for train, val and test. It reuses hybrid graph v3.
 
 Finally:
 

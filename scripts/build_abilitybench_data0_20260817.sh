@@ -8,7 +8,7 @@ EXT="$DATA_ROOT/external"
 REPORTS="$EXT/reports"
 # Historical compatibility marker retained for regression tests/documentation:
 # PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix3_20260825"
-PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828"
+PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix5_hotfix2_20260828"
 
 mkdir -p "$REPORTS/commands" "$REPORTS/build" "$REPORTS/model" "$REPORTS/eval"
 cd "$CAP_HOME"
@@ -32,11 +32,11 @@ pipeline_version() {
     && echo "CAPPLAN_SITE_AUDIT_V2=present" || echo "CAPPLAN_SITE_AUDIT_V2=MISSING"
   grep -q 'abilitybench_hybrid_accessibility_v3_20260825' "$CAP_HOME/scripts/build_hybrid_accessibility_overlay.py" 2>/dev/null \
     && echo "CAPPLAN_HYBRID_GRAPH_V3=present" || echo "CAPPLAN_HYBRID_GRAPH_V3=MISSING"
-  grep -q 'abilitybench_hybrid_pudo_v6_20260828' "$CAP_HOME/scripts/build_hybrid_pudo_evidence.py" 2>/dev/null \
-    && echo "CAPPLAN_HYBRID_PUDO_V6=present" || echo "CAPPLAN_HYBRID_PUDO_V6=MISSING"
+  grep -q 'abilitybench_hybrid_pudo_v7_20260828' "$CAP_HOME/scripts/build_hybrid_pudo_evidence.py" 2>/dev/null \
+    && echo "CAPPLAN_HYBRID_PUDO_V7=present" || echo "CAPPLAN_HYBRID_PUDO_V7=MISSING"
   grep -q 'abilitybench_hybrid_dataset_audit_v4_20260825' "$CAP_HOME/scripts/audit_hybrid_benchmark.py" 2>/dev/null \
     && echo "CAPPLAN_HYBRID_AUDIT_V4=present" || echo "CAPPLAN_HYBRID_AUDIT_V4=MISSING"
-  grep -q 'capplan_hybrid_review_bundle_v5_hotfix1_20260828' "$CAP_HOME/scripts/build_hybrid_review_bundle.py" 2>/dev/null \
+  grep -q 'capplan_hybrid_review_bundle_v5_hotfix2_20260828' "$CAP_HOME/scripts/build_hybrid_review_bundle.py" 2>/dev/null \
     && echo "CAPPLAN_REVIEW_BUNDLE_V5=present" || echo "CAPPLAN_REVIEW_BUNDLE_V5=MISSING"
 }
 
@@ -66,7 +66,8 @@ checks = {
         "write_legacy_combined=False",
     ],
     "scripts/build_hybrid_pudo_evidence.py": [
-        'VERSION = "abilitybench_hybrid_pudo_v6_20260828"',
+        'VERSION = "abilitybench_hybrid_pudo_v7_20260828"',
+        '"preserved_preexisting_core_value_without_audited_source"',
         '"nearest_agent_distance_dynamic_blockage_risk"',
     ],
     "scripts/diagnose_capplan_outputs.py": [
@@ -76,8 +77,8 @@ checks = {
         "def _link_or_copy(",
     ],
     "scripts/build_hybrid_review_bundle.py": [
-        'VERSION = "capplan_hybrid_review_bundle_v5_hotfix1_20260828"',
-        'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828"',
+        'VERSION = "capplan_hybrid_review_bundle_v5_hotfix2_20260828"',
+        'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_hotfix2_20260828"',
     ],
 }
 errors=[]
@@ -1082,7 +1083,7 @@ hybrid_dataset_resume_reviewfix5() {
   pipeline_version | tee "$REPORTS/commands/pipeline_identity.reviewfix5_dataset.txt"
   write_reviewfix5_dataset_run_context | tee "$REPORTS/commands/hybrid_run_context.reviewfix5_dataset.log"
   write_reviewfix5_dataset_hashes
-  # PUDO is cheap to refresh and v6 closes the missing dynamic-blockage
+  # PUDO is cheap to refresh and v7 closes invalid/sentinel core-field and dynamic-blockage
   # provenance gap.  The expensive hybrid accessibility graph v3 is reused.
   hybrid_pudo_evidence_only
   hybrid_dataset_build_only
@@ -1379,7 +1380,7 @@ Stages:
   hybrid-evidence                      # explicit observed/derived/simulated benchmark truth overlays
   hybrid-ready-allowlists              # select evidence-valid hybrid episodes; no geometry synthesis
   hybrid-build                         # build benchmark datasets under outputs/datasets/abilitybench_av_hybrid_*
-  hybrid-dataset-resume-reviewfix5     # RECOMMENDED here: reuse graph v3, refresh PUDO v6, and rebuild final datasets/audits
+  hybrid-dataset-resume-reviewfix5     # RECOMMENDED here: reuse graph v3, refresh PUDO v7, and rebuild final datasets/audits
   hybrid-from-existing                 # recommended continuation: source refresh -> recovery -> overlays -> build
   hybrid-full-build                    # complete from-zero four-city train/val/test hybrid benchmark pipeline
   hybrid-reality-refresh               # Rebuild hybrid priors/service/labels only when base graph semantics are already current

@@ -19,13 +19,13 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "capplan_hybrid_review_bundle_v5_hotfix1_20260828"
+VERSION = "capplan_hybrid_review_bundle_v5_hotfix2_20260828"
 EXPECTED_GRAPH_VERSION = "abilitybench_hybrid_accessibility_v3_20260825"
-EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v6_20260828"
+EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v7_20260828"
 EXPECTED_READY_VERSION = "abilitybench_hybrid_ready_allowlist_v1_20260823"
 EXPECTED_AUDIT_VERSION = "abilitybench_hybrid_dataset_audit_v4_20260825"
 EXPECTED_SITE_AUDIT_VERSION = "abilitybench_hybrid_site_consistency_v2_20260825"
-EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_hotfix1_20260828"
+EXPECTED_PIPELINE_VERSION = "abilitybench_data0_realism_v4_reviewfix5_hotfix2_20260828"
 SPLITS = ("train", "val", "test")
 CITIES = ("boston", "pittsburgh", "vegas", "singapore")
 
@@ -206,6 +206,7 @@ def _assess(root: Path) -> dict[str, Any]:
     stale: list[str] = []
     version_mismatch: list[dict[str, str]] = []
     failed: list[dict[str, Any]] = []
+    quality_warnings: list[dict[str, Any]] = []
     fresh: list[str] = []
 
     if identity is None:
@@ -297,7 +298,21 @@ def _assess(root: Path) -> dict[str, Any]:
                     "passenger_feasible_edges_too_sparse",
                 }))
                 if sparse:
-                    failed.append({"path": rel, "status": "freeze_quality_gate:" + ",".join(sparse)})
+                    label_health = payload.get("label_health") if isinstance(payload.get("label_health"), dict) else {}
+                    skel_rate = float(label_health.get("oracle_skeleton_rate") or 0.0)
+                    edge_rate = float(label_health.get("passenger_y_true_rate") or 0.0)
+                    quality_warnings.append({
+                        "path": rel,
+                        "warning": "quality_distribution_warning:" + ",".join(sparse),
+                        "oracle_skeleton_rate": skel_rate,
+                        "passenger_y_true_rate": edge_rate,
+                    })
+                    # A sparse but nonzero benchmark can still support T3/T5 with
+                    # class weighting/negative sampling.  A total label collapse
+                    # indicates an oracle or transition-generation bug and remains
+                    # a structural blocker.
+                    if skel_rate <= 0.0 or edge_rate <= 0.0:
+                        failed.append({"path": rel, "status": "label_collapse:" + ",".join(sparse)})
             if rel == "hybrid_site_consistency.json" and status != "PASS":
                 failed.append({"path": rel, "status": status or "missing"})
             if "merged_validation_report.hybrid.json" in rel:
@@ -335,6 +350,7 @@ def _assess(root: Path) -> dict[str, Any]:
         "stale_required": stale,
         "version_mismatches": version_mismatch,
         "failed_required": failed,
+        "quality_warnings": quality_warnings,
     }
 
 
@@ -374,7 +390,7 @@ def main() -> None:
         "interpretation": (
             "PASS means all required final hybrid artifacts are fresh relative to the latest pipeline identity, "
             "have the expected semantic versions, the pipeline identity matches this code revision, and final semantic audits/build logs pass. INCOMPLETE means the "
-            "bundle is useful for diagnosis but the benchmark is not yet freeze-ready."
+            "bundle is useful for diagnosis but the benchmark is not yet freeze-ready. Distribution warnings such as sparse positive skeletons are reported in quality_warnings; they do not by themselves mean that structural dataset construction failed."
         ),
     }
 

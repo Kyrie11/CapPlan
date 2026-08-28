@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl, write_jsonl
 
-VERSION = "abilitybench_hybrid_pudo_v6_20260828"
+VERSION = "abilitybench_hybrid_pudo_v7_20260828"
 PHYSICAL_FIELDS = ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp")
 STATIC_TRANSFER_FIELDS = PHYSICAL_FIELDS
 SIDE_SEMANTICS = "episode_route_relative_service_approach_relation"
@@ -46,6 +46,32 @@ def _as_float(v: Any) -> Optional[float]:
         return x if math.isfinite(x) else None
     except Exception:
         return None
+
+
+def _valid_numeric_field(field: str, value: Any) -> Optional[float]:
+    """Return a physically usable numeric PUDO value, else None.
+
+    Base PUDO builders may emit sentinel values such as 0.0 for fields that
+    were geometrically present but not actually measured.  Treating those as
+    complete benchmark truth bypasses the hybrid evidence completion layer and
+    leaves the final semantic audit without field-level provenance.
+    """
+    x = _as_float(value)
+    if x is None:
+        return None
+    if field == "curb_height_m":
+        return x if 0.0 <= x <= 0.50 else None
+    if field == "sidewalk_width_m":
+        return x if 0.05 < x <= 12.0 else None
+    if field == "deployment_clearance_m":
+        return x if 0.05 < x <= 8.0 else None
+    if field == "blockage_risk":
+        return x if 0.0 <= x <= 1.0 else None
+    return x
+
+
+def _numeric_missing(field: str, value: Any) -> bool:
+    return _valid_numeric_field(field, value) is None
 
 
 def _as_bool(v: Any) -> Optional[bool]:
@@ -93,7 +119,7 @@ def _load_audit_map(path: Optional[str], split: str) -> Dict[str, Dict[str, Any]
 
 def _audit_value(row: Mapping[str, Any], field: str) -> Any:
     if field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m"}:
-        return _as_float(row.get(field))
+        return _valid_numeric_field(field, row.get(field))
     if field in {"curb_ramp", "legal_stop"}:
         return _as_bool(row.get(field))
     value = row.get(field)
@@ -136,7 +162,7 @@ def _audit_provenance(audit: Mapping[str, Any], field: str) -> Optional[Dict[str
 def _base_provenance(row: Mapping[str, Any], field: str) -> Optional[Dict[str, Any]]:
     value = row.get(field)
     if field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m"}:
-        value = _as_float(value)
+        value = _valid_numeric_field(field, value)
     elif field in {"curb_ramp", "legal_stop"}:
         value = _as_bool(value)
     if value is None or _blank(value):
@@ -241,9 +267,9 @@ def _observed_site_class(row: Mapping[str, Any]) -> Optional[str]:
     observed accessible ramp/flush curb.
     """
     legal = _as_bool(row.get("legal_stop"))
-    curb_h = _as_float(row.get("curb_height_m"))
-    sw = _as_float(row.get("sidewalk_width_m"))
-    cl = _as_float(row.get("deployment_clearance_m"))
+    curb_h = _valid_numeric_field("curb_height_m", row.get("curb_height_m"))
+    sw = _valid_numeric_field("sidewalk_width_m", row.get("sidewalk_width_m"))
+    cl = _valid_numeric_field("deployment_clearance_m", row.get("deployment_clearance_m"))
     ramp = _as_bool(row.get("curb_ramp"))
     if legal is False:
         return "simulated_loading_prohibited"
@@ -297,7 +323,7 @@ def _canonical_site_static_evidence(
                     continue
                 value: Any
                 if field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m"}:
-                    value = _as_float(row.get(field))
+                    value = _valid_numeric_field(field, row.get(field))
                 elif field == "curb_ramp":
                     value = _as_bool(row.get(field))
                 else:
@@ -353,7 +379,7 @@ def _apply_site_static_evidence(
     facts = canonical.get(site_key) or {}
     for field, (value, pv) in facts.items():
         current_missing = (
-            _as_float(row.get(field)) is None if field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m"}
+            _numeric_missing(field, row.get(field)) if field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m"}
             else _as_bool(row.get(field)) is None if field == "curb_ramp"
             else _blank(row.get(field)) or str(row.get(field)).lower() == "unknown"
         )
@@ -366,9 +392,9 @@ def _apply_site_static_evidence(
 def _scenario_from_row(row: Mapping[str, Any]) -> str:
     legal = _as_bool(row.get("legal_stop"))
     blocked = float(row.get("blockage_risk") or 0.0) >= 0.85
-    curb_h = _as_float(row.get("curb_height_m"))
-    sw = _as_float(row.get("sidewalk_width_m"))
-    cl = _as_float(row.get("deployment_clearance_m"))
+    curb_h = _valid_numeric_field("curb_height_m", row.get("curb_height_m"))
+    sw = _valid_numeric_field("sidewalk_width_m", row.get("sidewalk_width_m"))
+    cl = _valid_numeric_field("deployment_clearance_m", row.get("deployment_clearance_m"))
     ramp = _as_bool(row.get("curb_ramp"))
     if legal is False:
         base = "simulated_or_observed_loading_prohibited"
@@ -406,7 +432,12 @@ def _fill_missing(
     eid = str(row.get("episode_id")); aid = str(row.get("anchor_id") or row.get("pudo_id"))
 
     def put_static(field: str, value: Any, method: str) -> None:
-        if row.get(field) is None or _blank(row.get(field)) or (field == "side" and str(row.get(field)).lower() == "unknown"):
+        missing = (
+            _numeric_missing(field, row.get(field))
+            if field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m"}
+            else (_as_bool(row.get(field)) is None if field == "curb_ramp" else row.get(field) is None or _blank(row.get(field)) or (field == "side" and str(row.get(field)).lower() == "unknown"))
+        )
+        if missing:
             row[field] = value
             pv = _sim_prov(city, split, eid, aid, field, site_seed, profile_name, method)
             pv.update({"physical_site_key": site_key, "correlation_scope": "physical_site_across_splits"})
@@ -442,7 +473,7 @@ def _fill_missing(
     clearance = round(static_rng.uniform(float(cl_lo), float(cl_hi)), 3)
 
     observed_ramp = _as_bool(row.get("curb_ramp"))
-    observed_curb_h = _as_float(row.get("curb_height_m"))
+    observed_curb_h = _valid_numeric_field("curb_height_m", row.get("curb_height_m"))
     # Keep simulated curb height/ramp mutually coherent with any observed
     # counterpart. A verified ramp should not be paired with a simulated
     # 25-cm barrier at the same anchor, and an observed missing-ramp curb should
@@ -493,7 +524,7 @@ def _fill_missing(
 
     # Dynamic availability is intentionally episode/time dependent even at the
     # same physical site. Existing observed blockage is never overwritten.
-    if row.get("blockage_risk") is None:
+    if _valid_numeric_field("blockage_risk", row.get("blockage_risk")) is None:
         blocked = dyn_rng.random() < 0.05
         row["blockage_risk"] = round(dyn_rng.uniform(0.88, 0.98) if blocked else dyn_rng.uniform(0.01, 0.10), 3)
         pv = _sim_prov(city, split, eid, aid, "blockage_risk", dynamic_seed, profile_name, "episode_time_dynamic_blockage_prior")
@@ -550,6 +581,61 @@ def _fill_missing(
         pv = _sim_prov(city, split, eid, aid, "dynamic_confidence", dynamic_seed, profile_name, "simulator_state_confidence")
         pv.update({"physical_site_key": site_key})
         prov["dynamic_confidence"] = pv
+
+def _ensure_core_provenance(
+    row: MutableMapping[str, Any],
+    prov: MutableMapping[str, Any],
+    *,
+    city: str,
+    split: str,
+    site_seed: int,
+    dynamic_seed: int,
+    site_key: str,
+    profile: Mapping[str, Any],
+    counters: Counter,
+) -> None:
+    """Guarantee every retained PUDO core field has explicit provenance.
+
+    This is deliberately a provenance backstop, not a way to bless unknown data
+    as measured evidence. Values preserved from older base PUDO artifacts without
+    an auditable source are marked simulated benchmark truth, while invalid
+    numeric sentinels should already have been replaced by _fill_missing().
+    """
+    eid = str(row.get("episode_id")); aid = str(row.get("anchor_id") or row.get("pudo_id"))
+    profile_name = str(profile["name"])
+    core_fields = ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp", "legal_stop", "side", "blockage_risk")
+    for field in core_fields:
+        if isinstance(prov.get(field), Mapping):
+            continue
+        if field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "blockage_risk"}:
+            if _valid_numeric_field(field, row.get(field)) is None:
+                continue
+        elif field in {"curb_ramp", "legal_stop"}:
+            if _as_bool(row.get(field)) is None:
+                continue
+        elif _blank(row.get(field)) or str(row.get(field)).lower() == "unknown":
+            continue
+
+        seed = dynamic_seed if field in {"blockage_risk", "side"} else site_seed
+        method = {
+            "blockage_risk": "preserved_preexisting_dynamic_score_without_audited_source",
+            "side": "preserved_preexisting_route_side_without_audited_source",
+        }.get(field, "preserved_preexisting_core_value_without_audited_source")
+        pv = _sim_prov(city, split, eid, aid, field, seed, profile_name, method)
+        pv.update({"physical_site_key": site_key})
+        if field == "blockage_risk":
+            pv.update({"correlation_scope": "episode_time_at_physical_site"})
+        elif field == "side":
+            pv.update({
+                "semantic_scope": "episode_route_relative_service_relation",
+                "correlation_scope": "episode_route_approach",
+                "claim_scope": "benchmark_route_relation_not_static_site_ground_truth",
+            })
+        else:
+            pv.update({"correlation_scope": "physical_site_across_splits"})
+        prov[field] = pv
+        counters[f"backfilled:{field}"] += 1
+
 def _copy_observed_from_audit(row: MutableMapping[str, Any], audit: Mapping[str, Any], prov: MutableMapping[str, Any]) -> None:
     for field in (*PHYSICAL_FIELDS, "legal_stop", "legal_basis"):
         p = _audit_provenance(audit, field)
@@ -567,7 +653,7 @@ def _copy_observed_from_audit(row: MutableMapping[str, Any], audit: Mapping[str,
 def _normalize_base(row: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(row)
     for field in ("curb_height_m", "sidewalk_width_m", "deployment_clearance_m"):
-        out[field] = _as_float(out.get(field))
+        out[field] = _valid_numeric_field(field, out.get(field))
     for field in ("legal_stop", "curb_ramp"):
         val = _as_bool(out.get(field))
         if val is not None:
@@ -576,7 +662,7 @@ def _normalize_base(row: Dict[str, Any]) -> Dict[str, Any]:
     # assert "definitely unblocked" and prevent the hybrid dynamic prior from
     # being applied. Eligibility code already treats None conservatively after
     # the overlay has had a chance to fill it.
-    out["blockage_risk"] = _as_float(out.get("blockage_risk"))
+    out["blockage_risk"] = _valid_numeric_field("blockage_risk", out.get("blockage_risk"))
     return out
 
 
@@ -615,6 +701,7 @@ def main() -> None:
     eligible_eps = 0
     insufficient_eps: List[Dict[str, Any]] = []
     simulated_rows = 0
+    core_provenance_backfills: Counter = Counter()
 
     # Apply all available evidence before sampling any static site class.  This
     # lets the same physical curb reuse one evidence-consistent latent class
@@ -736,11 +823,16 @@ def main() -> None:
                 site_seed=site_seed, dynamic_seed=dynamic_seed, site_key=site_key,
                 profile=profile,
             )
+            _ensure_core_provenance(
+                row, prov, city=args.city, split=args.split,
+                site_seed=site_seed, dynamic_seed=dynamic_seed, site_key=site_key,
+                profile=profile, counters=core_provenance_backfills,
+            )
             scenario = _scenario_from_row(row)
             physical_site_keys.add(site_key)
             curb_sides[str(row.get("side") or "unknown")] += 1
             for field, bounds in numeric_minmax.items():
-                val = _as_float(row.get(field))
+                val = _valid_numeric_field(field, row.get(field))
                 if val is not None:
                     bounds[0] = val if bounds[0] is None else min(float(bounds[0]), val)
                     bounds[1] = val if bounds[1] is None else max(float(bounds[1]), val)
@@ -760,7 +852,7 @@ def main() -> None:
                 if field == "legal_stop":
                     if _as_bool(val) is None: missing.append(field)
                 elif field in {"curb_height_m", "sidewalk_width_m", "deployment_clearance_m"}:
-                    if _as_float(val) is None: missing.append(field)
+                    if _numeric_missing(field, val): missing.append(field)
                 elif field == "curb_ramp":
                     if _as_bool(val) is None: missing.append(field)
                 elif _blank(val) or (field == "side" and str(val).lower() == "unknown"):
@@ -769,9 +861,11 @@ def main() -> None:
                     missing.append(field + ":provenance")
             complete = not missing
             legal = bool(_as_bool(row.get("legal_stop")))
-            eligible = complete and legal and float(row.get("blockage_risk") or 0.0) < 0.85 and float(row.get("deployment_clearance_m") or 0.0) > 0
+            blockage = _valid_numeric_field("blockage_risk", row.get("blockage_risk"))
+            clearance_ok = _valid_numeric_field("deployment_clearance_m", row.get("deployment_clearance_m")) is not None
+            eligible = complete and legal and float(blockage if blockage is not None else 1.0) < 0.85 and clearance_ok
             row.update({
-                "truth_mode": "hybrid_geometry_anchored_site_correlated_simulated_interface_v6",
+                "truth_mode": "hybrid_geometry_anchored_site_correlated_simulated_interface_v7",
                 "evidence_kind": "mixed" if simulated and any(isinstance(v, Mapping) and str(v.get("kind")) in {"observed", "derived"} for v in prov.values()) else ("simulated" if simulated else "observed_or_derived"),
                 "field_provenance": prov,
                 "hybrid_evidence_complete": complete,
@@ -821,6 +915,7 @@ def main() -> None:
         "static_transfer_fields": list(STATIC_TRANSFER_FIELDS),
         "numeric_field_ranges": {k: {"min": v[0], "max": v[1]} for k, v in numeric_minmax.items()},
         "field_provenance_kind_counts": {k: dict(v) for k, v in sorted(field_kinds.items())},
+        "core_provenance_backfill_counts": dict(core_provenance_backfills),
         "same_site_static_evidence_counts": dict(site_static_counts),
         "cross_split_site_evidence_peer_rows_loaded": peer_rows_loaded,
         "same_site_static_evidence_conflict_count": len(site_static_conflicts),

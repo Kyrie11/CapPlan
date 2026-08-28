@@ -191,7 +191,7 @@ def test_review_bundle_rejects_fresh_hybrid_pudo_report_with_static_conflicts(tm
     identity.write_text("CAPPLAN_PIPELINE_VERSION=test\n")
     pudo = root / "hybrid_pudo.train.boston.json"
     pudo.write_text(json.dumps({
-        "status": "PASS", "version": "abilitybench_hybrid_pudo_v6_20260828",
+        "status": "PASS", "version": "abilitybench_hybrid_pudo_v7_20260828",
         "side_semantics": "episode_route_relative_service_approach_relation",
         "static_transfer_fields": ["curb_height_m", "sidewalk_width_m", "deployment_clearance_m", "curb_ramp"],
         "same_site_static_evidence_conflict_count": 3,
