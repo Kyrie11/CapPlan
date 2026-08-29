@@ -254,7 +254,16 @@ def _assess(root: Path) -> dict[str, Any]:
         if not path.exists():
             missing.append(rel)
             continue
-        if _is_reused_upstream(rel):
+        # The run-context JSON is the freshness anchor itself.  Comparing its
+        # filesystem mtime against the nanosecond timestamp recorded immediately
+        # before writing it is vulnerable to filesystem timestamp granularity and
+        # can make a completely successful run appear INCOMPLETE.  Its pipeline
+        # version and critical hashes are already validated above, so accept the
+        # selected context itself as fresh.
+        is_run_context_anchor = run_context is not None and path.resolve() == run_context.resolve()
+        if is_run_context_anchor:
+            pass
+        elif _is_reused_upstream(rel):
             if upstream_start_ns is None or path.stat().st_mtime_ns <= upstream_start_ns:
                 stale.append(rel)
                 continue

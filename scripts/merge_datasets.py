@@ -61,6 +61,34 @@ def _link_or_copy(src: Path, dst: Path) -> str:
         return "copy"
 
 
+def _manifest_leaf_values(manifest: Dict[str, Any], key: str) -> List[Any]:
+    """Collect a semantic manifest field through nested merged datasets.
+
+    Split-level city merges wrap the original manifests under ``input_manifests``.
+    A second merge (train+val+test) used to lose ``scene_source`` and the other
+    provenance/source-policy fields, which made paper-safe evaluators reject an
+    otherwise valid nuPlan dataset.
+    """
+    vals: List[Any] = []
+    if key in manifest and manifest.get(key) is not None:
+        vals.append(manifest.get(key))
+    for child in manifest.get("input_manifests") or []:
+        if isinstance(child, dict):
+            vals.extend(_manifest_leaf_values(child, key))
+    return vals
+
+
+def _consensus_manifest_field(manifests: List[Dict[str, Any]], key: str) -> Any | None:
+    vals: List[Any] = []
+    for manifest in manifests:
+        vals.extend(_manifest_leaf_values(manifest, key))
+    canonical: Dict[str, Any] = {}
+    for v in vals:
+        token = json.dumps(v, sort_keys=True, default=str)
+        canonical[token] = v
+    return next(iter(canonical.values())) if len(canonical) == 1 else None
+
+
 def merge_datasets(input_dirs: List[Path], output_dir: Path, strict: bool = False, clean_output: bool = False) -> Dict[str, Any]:
     if not input_dirs:
         raise RuntimeError("at least one input dataset is required")
@@ -140,6 +168,17 @@ def merge_datasets(input_dirs: List[Path], output_dir: Path, strict: bool = Fals
         "num_transitions": len(read_jsonl(output_dir / "candidate_transitions.jsonl")),
         "graph_storage": graph_storage,
     }
+    # Preserve consensus source semantics across city-level and split-level
+    # merges.  This does not upgrade hybrid simulated fields to measured truth;
+    # it simply keeps the original nuPlan/source-policy identity visible to
+    # downstream paper-safe training/evaluation code.
+    for key in (
+        "scene_source", "accessibility_source", "pudo_source",
+        "service_layer_source", "source_policy", "benchmark_ready",
+    ):
+        value = _consensus_manifest_field(manifests, key)
+        if value is not None:
+            manifest[key] = value
     dump_json(output_dir / "dataset_manifest.json", manifest)
     validation = validate_dataset(output_dir, strict=strict)
     dump_json(output_dir / "validation_report.json", validation)

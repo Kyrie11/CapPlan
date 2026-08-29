@@ -210,6 +210,38 @@ def _farthest_from(candidates: Sequence[AccessibilityNode], origin: Accessibilit
     return max(pool, key=lambda n: ((n.x-origin.x)**2 + (n.y-origin.y)**2, n.node_id)) if pool else None
 
 
+def _route_local_destination_candidate(
+    candidates: Sequence[AccessibilityNode],
+    route_xy: Tuple[float, float],
+    origin: AccessibilityNode,
+    *,
+    max_route_distance_m: float,
+    min_od_separation_m: float,
+    avoid: str | None = None,
+) -> AccessibilityNode | None:
+    """Choose a non-degenerate destination without abandoning route anchoring.
+
+    The old fallback used the globally farthest pedestrian/entrance node when
+    the initially selected OD pair was shorter than ``min_od_separation_m``.
+    On a full-city graph that can move the destination more than a kilometre
+    away from the nuPlan route endpoint.  Passenger-complete requests should
+    stay tied to the traffic episode, so only candidates inside the route-local
+    service radius are considered here.
+    """
+    ranked = []
+    for n in candidates:
+        if n.node_id == origin.node_id or (avoid is not None and n.node_id == avoid):
+            continue
+        route_d = _dist(n, route_xy)
+        if route_d > max_route_distance_m:
+            continue
+        separation = math.hypot(n.x-origin.x, n.y-origin.y)
+        if separation + 1e-9 < min_od_separation_m:
+            continue
+        ranked.append((route_d, -separation, n.node_id, n))
+    return min(ranked, key=lambda x: (x[0], x[1], x[2]))[3] if ranked else None
+
+
 def _frontage_near_route_or_proxy(
     nodes: Sequence[AccessibilityNode],
     route_xy: Tuple[float, float],
@@ -305,14 +337,41 @@ def _choose_realistic_od(
         raise RuntimeError("no physically anchored destination access point available")
 
     sep = math.hypot(d.x-o.x, d.y-o.y)
+    separation_adjustment = "none"
     if sep < min_od_separation_m:
-        # Preserve route anchoring where possible, but avoid degenerate OD pairs.
-        pool = list(entrances) + [n for n in frontage if n.node_id not in {x.node_id for x in entrances}]
-        far = _farthest_from(pool, o)
-        if far is not None and math.hypot(far.x-o.x, far.y-o.y) > sep:
-            d = far
-            d_kind = "observed_entrance" if far in entrances else "simulated_frontage_access_point"
+        # Do not solve a short OD by jumping to the globally farthest graph node:
+        # that breaks the correspondence between the passenger request and the
+        # nuPlan route endpoint.  Prefer another route-local mapped entrance, then
+        # a route-local real-map sidewalk frontage.  If neither can meet the
+        # target, retain the best route-anchored destination and explicitly mark
+        # that the target separation was relaxed.
+        replacement = _route_local_destination_candidate(
+            entrances, end_xy, o,
+            max_route_distance_m=max_entrance_route_distance_m,
+            min_od_separation_m=min_od_separation_m,
+            avoid=o.node_id,
+        )
+        replacement_kind = "observed_entrance"
+        if replacement is None and allow_non_entrance_od:
+            frontage_pool = frontage or _frontage_nodes(nodes)
+            replacement = _route_local_destination_candidate(
+                frontage_pool, end_xy, o,
+                max_route_distance_m=max_entrance_route_distance_m,
+                min_od_separation_m=min_od_separation_m,
+                avoid=o.node_id,
+            )
+            replacement_kind = "simulated_frontage_access_point"
+        if replacement is not None:
+            d = replacement
+            d_kind = replacement_kind
+            d_extra = {
+                "reselected_for_min_od_separation": True,
+                "route_endpoint_distance_m": round(_dist(d, end_xy), 3),
+            }
             sep = math.hypot(d.x-o.x, d.y-o.y)
+            separation_adjustment = "route_local_destination_reselection"
+        else:
+            separation_adjustment = "kept_route_anchored_short_od"
 
     prov = {
         "origin_kind": o_kind,
@@ -321,6 +380,9 @@ def _choose_realistic_od(
         "route_origin_distance_m": round(_dist(o, start_xy), 3),
         "route_destination_distance_m": round(_dist(d, end_xy), 3),
         "od_euclidean_separation_m": round(sep, 3),
+        "od_separation_target_m": round(float(min_od_separation_m), 3),
+        "od_separation_target_met": bool(sep + 1e-9 >= min_od_separation_m),
+        "od_separation_adjustment": separation_adjustment,
         "claim_scope": "request_level_benchmark_anchor_not_measured_building_door" if "simulated" in (o_kind+d_kind) else "mapped_entrance_anchor",
         "origin_proxy_context": o_extra,
         "destination_proxy_context": d_extra,
