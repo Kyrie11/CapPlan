@@ -63,6 +63,9 @@ service:
   capability_profiles: "{project_root}/configs/capability_profiles.counterfactual.yaml"
   demand_sources_config: "{project_root}/configs/demand.counterfactual.yaml"
   num_requests_per_episode: 8
+  # Passenger OD anchors remain an extension of the nuPlan route endpoints.
+  max_entrance_route_distance_m: 250.0
+  min_od_separation_m: 80.0
 
 pudo:
   candidate_radius_m: 120

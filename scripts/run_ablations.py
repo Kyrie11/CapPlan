@@ -19,13 +19,23 @@ def _bad_source(v: object) -> bool:
     return (not s) or any(tok in s for tok in ["synthetic", "smoke", "mock", "proxy", "toy"])
 
 
-def _validate_paper(dataset_dir: Path, trajectory_mode: str, casa_mode: str, casa_checkpoint: str | None, nuplan_sim_config: str | None) -> None:
+def _validate_paper(dataset_dir: Path, trajectory_mode: str, casa_mode: str, casa_checkpoint: str | None, nuplan_sim_config: str | None, allow_posthoc_episode_vehicle_metrics: bool) -> None:
     if trajectory_mode != "nuplan_closed_loop":
         raise RuntimeError("paper_mode ablations require --trajectory_mode nuplan_closed_loop; mock_strict is smoke-only")
     if casa_mode != "learned" or not casa_checkpoint:
         raise RuntimeError("paper_mode ablations require --casa_mode learned and --casa_checkpoint")
-    if not nuplan_sim_config:
-        raise RuntimeError("paper_mode ablations require --nuplan_sim_config")
+    metrics_path = dataset_dir / "nuplan_vehicle_metrics.jsonl"
+    if not metrics_path.exists():
+        raise RuntimeError(
+            "paper_mode ablations cannot execute nuPlan Hydra from this wrapper. Import real nuPlan metrics into "
+            "dataset_dir/nuplan_vehicle_metrics.jsonl first; --nuplan_sim_config alone is not sufficient."
+        )
+    if not allow_posthoc_episode_vehicle_metrics:
+        raise RuntimeError(
+            "current ablations reuse imported episode-level nuPlan metrics and do not run method-specific integrated "
+            "closed-loop simulations for each variant. Pass --allow_posthoc_episode_vehicle_metrics only when "
+            "explicitly reporting this as post-hoc development analysis rather than final paper closed-loop evidence."
+        )
     manifest = load_json(dataset_dir / "dataset_manifest.json")
     if manifest.get("scene_source") != "nuplan":
         raise RuntimeError(f"paper_mode ablations require scene_source=nuplan; got {manifest.get('scene_source')!r}")
@@ -43,12 +53,13 @@ def main() -> None:
     p.add_argument("--casa_mode", choices=["heuristic_oracle_baseline", "learned"], default="heuristic_oracle_baseline")
     p.add_argument("--casa_checkpoint", default=None)
     p.add_argument("--paper_mode", action="store_true")
-    p.add_argument("--nuplan_sim_config", default=None)
+    p.add_argument("--nuplan_sim_config", default=None, help="Optional provenance path for the external nuPlan simulation config; this wrapper does not execute Hydra.")
+    p.add_argument("--allow_posthoc_episode_vehicle_metrics", action="store_true")
     args = p.parse_args()
     dataset_dir = Path(args.dataset_dir)
     output_dir = Path(args.output_dir)
     if args.paper_mode:
-        _validate_paper(dataset_dir, args.trajectory_mode, args.casa_mode, args.casa_checkpoint, args.nuplan_sim_config)
+        _validate_paper(dataset_dir, args.trajectory_mode, args.casa_mode, args.casa_checkpoint, args.nuplan_sim_config, args.allow_posthoc_episode_vehicle_metrics)
     variants = args.variants or list(ABLATION_FLAGS.keys())
     rows = {}
     for name in variants:

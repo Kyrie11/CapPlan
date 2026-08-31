@@ -1,12 +1,11 @@
 """Optional PyTorch CASA multi-head model.
 
-The implementation remains dependency-light but is no longer a plain MLP for
-paper-facing model types.  The ``hgt``/``rgcn`` modes inject relation-aware
-embeddings for the automaton transition tuple (action, source phase, target
-phase) before the multi-head predictor.  This is a compact surrogate for the
-paper CASA-Net interface when PyG/HGT is unavailable; it preserves the same
-checkpoint schema and the required heads (edge, phase, typed demand,
-uncertainty, availability, completion value).
+The implementation is a dependency-light *relation-aware transition MLP*.
+It injects embeddings for the automaton transition tuple (action, source phase,
+target phase) before the multi-head predictor, but it does **not** perform
+heterogeneous graph message passing.  The historical ``hgt``/``rgcn`` names are
+kept only as backward-compatible surrogate aliases; new experiments should use
+``relation_mlp`` unless a true service-graph encoder is implemented.
 """
 from __future__ import annotations
 
@@ -26,7 +25,7 @@ def make_torch_model(input_dim: int):  # pragma: no cover - depends on torch
 
 
 class CASAHetGraphNet:  # pragma: no cover - class body exercised only when torch is available
-    def __new__(cls, input_dim: int, num_phases: int, num_resources: int, hidden_dim: int = 128, model_type: str = "hgt", num_actions: int = 16):
+    def __new__(cls, input_dim: int, num_phases: int, num_resources: int, hidden_dim: int = 128, model_type: str = "relation_mlp", num_actions: int = 16):
         import torch
         from torch import nn
 
@@ -34,7 +33,9 @@ class CASAHetGraphNet:  # pragma: no cover - class body exercised only when torc
             def __init__(self) -> None:
                 super().__init__()
                 self.model_type = model_type
-                self.relation_aware = model_type in {"hgt", "rgcn"}
+                self.architecture_semantics = "relation_aware_transition_mlp_surrogate"
+                self.true_heterogeneous_message_passing = False
+                self.relation_aware = model_type in {"relation_mlp", "hgt", "rgcn"}
                 emb_dim = 16 if self.relation_aware else 0
                 if self.relation_aware:
                     self.action_emb = nn.Embedding(max(1, num_actions), emb_dim)

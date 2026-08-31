@@ -713,6 +713,8 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
         else:
             service_episode_allowlist = ready_dir / "all.txt"
     fleet_jsonl = _path(service_cfg.get("hybrid_fleet")) if source_policy == "hybrid" and service_cfg.get("hybrid_fleet") else _path(config["fleet_jsonl"])
+    max_route_anchor_m = float(service_cfg.get("max_entrance_route_distance_m", 250.0))
+    min_od_separation_m = float(service_cfg.get("min_od_separation_m", 80.0))
     if "service" in stages or "all" in stages:
         _require_artifact(graph_dir, "accessibility graphs", dry_run)
         if not dry_run and not fleet_jsonl.exists():
@@ -743,6 +745,8 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                 *( ["--demand_sources_config", str(demand_cfg)] if demand_cfg else [] ),
                 "--num_requests_per_episode",
                 str(service_cfg.get("num_requests_per_episode", 3)),
+                "--max_entrance_route_distance_m", str(max_route_anchor_m),
+                "--min_od_separation_m", str(min_od_separation_m),
                 "--source_name",
                 ("abilitybench_calibrated_od" if source_policy == "paper" else
                  "abilitybench_hybrid_request_od" if source_policy == "hybrid" else
@@ -887,6 +891,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                         "scripts/audit_hybrid_benchmark.py",
                         "--dataset_dir", str(city_dataset),
                         "--expected_requests_per_episode", str(int((config.get("service", {}) or {}).get("num_requests_per_episode", 8))),
+                        "--max_route_anchor_distance_m", str(max_route_anchor_m),
                         "--output", str(reports_root / f"hybrid_dataset_audit.{city}.json"),
                         "--fail_on_error",
                     ], dry_run)
@@ -926,6 +931,7 @@ def build_pipeline(config: Dict[str, Any], split_name: str, stages: set[str], dr
                     "scripts/audit_hybrid_benchmark.py",
                     "--dataset_dir", str(merged_dataset),
                     "--expected_requests_per_episode", str(int((config.get("service", {}) or {}).get("num_requests_per_episode", 8))),
+                    "--max_route_anchor_distance_m", str(max_route_anchor_m),
                     "--output", str(reports_root / "hybrid_dataset_audit.merged.json"),
                     "--fail_on_error",
                 ], dry_run)

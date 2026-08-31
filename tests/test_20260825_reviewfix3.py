@@ -69,6 +69,6 @@ def test_hybrid_graph_rejects_extreme_dem_grade_and_nonpositive_width():
     assert mod.VERSION == "abilitybench_hybrid_accessibility_v3_20260825"
 
 
-def test_dataset_audit_v4_is_provenance_strict():
-    mod = _load("audit_v4", "scripts/audit_hybrid_benchmark.py")
-    assert mod.VERSION == "abilitybench_hybrid_dataset_audit_v4_20260825"
+def test_dataset_audit_v5_is_provenance_and_route_anchor_strict():
+    mod = _load("audit_v5", "scripts/audit_hybrid_benchmark.py")
+    assert mod.VERSION == "abilitybench_hybrid_dataset_audit_v5_20260830"

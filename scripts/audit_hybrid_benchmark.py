@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl
 from capplan.data.capability_contracts import contract_episode_id
 
-VERSION = "abilitybench_hybrid_dataset_audit_v4_20260825"
+VERSION = "abilitybench_hybrid_dataset_audit_v5_20260830"
 
 
 def _rows(path: Path) -> Iterable[Dict[str, Any]]:
@@ -46,8 +46,9 @@ def _quantiles(xs: List[float]) -> Dict[str, float | None]:
     return {"min": ys[0], "p10": q(.10), "median": q(.50), "p90": q(.90), "max": ys[-1]}
 
 
-def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str, Any]:
+def audit(dataset_dir: Path, expected_requests_per_episode: int = 8, max_route_anchor_distance_m: float = 250.0) -> Dict[str, Any]:
     manifest = json.loads((dataset_dir / "dataset_manifest.json").read_text())
+    require_nuplan_route_anchoring = str(manifest.get("scene_source") or "").lower() == "nuplan"
     episode_ids = [str(r["episode_id"]) for r in _rows(dataset_dir / "episodes.jsonl")]
     episode_set = set(episode_ids)
     requests = list(_rows(dataset_dir / "service_requests.jsonl"))
@@ -196,18 +197,58 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
     od_sep: List[float] = []
     route_o_dist: List[float] = []
     route_d_dist: List[float] = []
+    route_anchor_violations: List[Dict[str, Any]] = []
+    route_anchor_missing: List[Dict[str, Any]] = []
+    route_anchor_method_invalid: List[Dict[str, Any]] = []
+    od_semantics_versions = Counter()
     time_sources = Counter()
     local_hours: List[float] = []
     for r in requests:
         prov = r.get("od_provenance") if isinstance(r.get("od_provenance"), Mapping) else {}
         od_kind_counts[str(prov.get("kind") or "unknown")] += 1
+        od_semantics_versions[str(prov.get("od_semantics_version") or "missing")] += 1
         frontage_count += int(bool(r.get("hybrid_frontage_proxy_od")))
+        parsed_route: Dict[str, float] = {}
         for dest, key in [(od_sep, "od_euclidean_separation_m"), (route_o_dist, "route_origin_distance_m"), (route_d_dist, "route_destination_distance_m")]:
             try:
                 if prov.get(key) is not None:
-                    dest.append(float(prov[key]))
+                    value = float(prov[key])
+                    if math.isfinite(value):
+                        dest.append(value)
+                        parsed_route[key] = value
             except Exception:
                 pass
+        method = str(prov.get("method") or "")
+        if require_nuplan_route_anchoring and not method.startswith("nuplan_route_endpoint"):
+            route_anchor_method_invalid.append({
+                "episode_id": str(r.get("episode_id") or ""),
+                "request_id": str(r.get("request_id") or ""),
+                "method": method or "missing",
+            })
+        if method.startswith("nuplan_route_endpoint"):
+            try:
+                limit = float(prov.get("route_anchor_max_distance_m", max_route_anchor_distance_m))
+                if not math.isfinite(limit) or limit <= 0:
+                    limit = float(max_route_anchor_distance_m)
+            except Exception:
+                limit = float(max_route_anchor_distance_m)
+            missing_keys = [k for k in ("route_origin_distance_m", "route_destination_distance_m") if k not in parsed_route]
+            if missing_keys:
+                route_anchor_missing.append({
+                    "episode_id": str(r.get("episode_id") or ""),
+                    "request_id": str(r.get("request_id") or ""),
+                    "missing": missing_keys,
+                })
+            for key in ("route_origin_distance_m", "route_destination_distance_m"):
+                value = parsed_route.get(key)
+                if value is not None and value > limit + 1e-9:
+                    route_anchor_violations.append({
+                        "episode_id": str(r.get("episode_id") or ""),
+                        "request_id": str(r.get("request_id") or ""),
+                        "field": key,
+                        "value_m": value,
+                        "limit_m": limit,
+                    })
         time_sources[str(r.get("request_time_source") or "unknown")] += 1
         try:
             if r.get("request_local_hour") is not None:
@@ -220,6 +261,14 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
     scene_time_count = int(time_sources.get("nuplan_scene_timestamp", 0))
     if requests and scene_time_count < len(requests):
         warnings.append(f"{len(requests) - scene_time_count} service requests do not use the nuPlan scene timestamp")
+    if route_anchor_method_invalid:
+        errors.append(f"{len(route_anchor_method_invalid)} nuPlan service requests are not anchored to the nuPlan route endpoints")
+    if route_anchor_missing:
+        errors.append(f"{len(route_anchor_missing)} nuPlan route-anchored service requests lack explicit route-anchor distance evidence")
+    if route_anchor_violations:
+        errors.append(
+            f"{len(route_anchor_violations)} nuPlan route-anchored service requests exceed their allowed route-anchor radius"
+        )
 
     pudo_by_ep = Counter(str(p.get("episode_id")) for p in pudo)
     hybrid_eligible_by_ep = Counter(str(p.get("episode_id")) for p in pudo if bool(p.get("hybrid_eligible")) and bool(p.get("legal_stop")))
@@ -311,6 +360,14 @@ def audit(dataset_dir: Path, expected_requests_per_episode: int = 8) -> Dict[str
         "od_separation_m": _quantiles(od_sep),
         "route_origin_anchor_distance_m": _quantiles(route_o_dist),
         "route_destination_anchor_distance_m": _quantiles(route_d_dist),
+        "od_semantics_version_counts": dict(od_semantics_versions),
+        "od_route_anchor_default_limit_m": float(max_route_anchor_distance_m),
+        "od_route_anchor_method_invalid_count": len(route_anchor_method_invalid),
+        "od_route_anchor_method_invalid_examples": route_anchor_method_invalid[:20],
+        "od_route_anchor_missing_count": len(route_anchor_missing),
+        "od_route_anchor_violation_count": len(route_anchor_violations),
+        "od_route_anchor_violation_examples": route_anchor_violations[:20],
+        "od_route_anchor_missing_examples": route_anchor_missing[:20],
         "request_time_source_counts": dict(time_sources),
         "request_local_hour": _quantiles(local_hours),
         "pudo_curb_side_counts": dict(curb_sides),
@@ -338,9 +395,10 @@ def main() -> None:
     p.add_argument("--dataset_dir", required=True)
     p.add_argument("--expected_requests_per_episode", type=int, default=8)
     p.add_argument("--output", required=True)
+    p.add_argument("--max_route_anchor_distance_m", type=float, default=250.0, help="Fallback hard radius for nuPlan route-anchored OD when a request lacks an explicit per-request route_anchor_max_distance_m.")
     p.add_argument("--fail_on_error", action="store_true")
     args = p.parse_args()
-    report = audit(Path(args.dataset_dir), args.expected_requests_per_episode)
+    report = audit(Path(args.dataset_dir), args.expected_requests_per_episode, args.max_route_anchor_distance_m)
     out = Path(args.output); out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps(report, indent=2, sort_keys=True))

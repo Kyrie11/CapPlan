@@ -18,10 +18,22 @@ from scripts.import_nuplan_vehicle_metrics import import_metrics
 def _fail_paper_if_mock(args: argparse.Namespace) -> None:
     if args.paper_mode and args.trajectory_mode != "nuplan_closed_loop":
         raise RuntimeError("paper_mode closed-loop evaluation requires --trajectory_mode nuplan_closed_loop; mock_strict is smoke-only")
-    if args.paper_mode and not args.nuplan_sim_config:
+    if args.paper_mode:
         dataset_dir = Path(args.dataset_dir)
-        if not (dataset_dir / "nuplan_vehicle_metrics.jsonl").exists():
-            raise RuntimeError("paper_mode closed-loop evaluation requires either --nuplan_sim_config or dataset_dir/nuplan_vehicle_metrics.jsonl exported from a nuPlan simulation run")
+        metrics_path = dataset_dir / "nuplan_vehicle_metrics.jsonl"
+        if not metrics_path.exists():
+            raise RuntimeError(
+                "paper_mode cannot execute nuPlan Hydra from this wrapper. Import real nuPlan closed-loop metrics first "
+                "with --import_nuplan_metrics_from (or materialize dataset_dir/nuplan_vehicle_metrics.jsonl). "
+                "--nuplan_sim_config is metadata only and is not sufficient."
+            )
+        if not args.allow_posthoc_episode_vehicle_metrics:
+            raise RuntimeError(
+                "the current CapPlan evaluator couples imported episode-level nuPlan metrics to passenger/service plans; "
+                "it does not run a method-specific integrated nuPlan simulation for every selected PUDO/trajectory. "
+                "This is suitable for post-hoc development analysis, not a final paper closed-loop claim. "
+                "Pass --allow_posthoc_episode_vehicle_metrics only when explicitly reporting that limitation."
+            )
     if args.paper_mode and args.casa_mode != "learned":
         raise RuntimeError("paper_mode closed-loop evaluation requires --casa_mode learned with a trained CASA checkpoint")
     if args.paper_mode and not args.casa_checkpoint:
@@ -54,7 +66,8 @@ def main() -> None:
     p.add_argument("--casa_mode", choices=["heuristic_oracle_baseline", "learned"], default="heuristic_oracle_baseline")
     p.add_argument("--casa_checkpoint", default=None, help="Checkpoint produced by scripts.train_casa; required for a meaningful learned CASA run.")
     p.add_argument("--paper_mode", action="store_true", help="Fail if the run would use smoke/mock/proxy components.")
-    p.add_argument("--nuplan_sim_config", default=None, help="Path to a nuPlan simulation config for paper-mode closed-loop execution.")
+    p.add_argument("--nuplan_sim_config", default=None, help="Optional provenance path for the external nuPlan simulation configuration. This wrapper does not execute Hydra itself.")
+    p.add_argument("--allow_posthoc_episode_vehicle_metrics", action="store_true", help="Explicitly allow paper_mode to use imported episode-level nuPlan metrics as post-hoc vehicle evidence. This is not method-specific integrated closed-loop simulation.")
     p.add_argument("--vehicle_metrics", default=None, help="Optional output JSON path for vehicle-only metrics copied from aggregate metrics.")
     p.add_argument("--passenger_metrics", default=None, help="Optional output JSON path for passenger-complete metrics copied from aggregate metrics.")
     p.add_argument("--import_nuplan_metrics_from", default=None, help="Optional nuPlan metrics file/dir to import into dataset_dir/nuplan_vehicle_metrics.jsonl before evaluation.")

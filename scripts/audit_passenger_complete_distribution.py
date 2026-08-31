@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterable, Mapping
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl
 
-VERSION = "capplan_passenger_complete_distribution_audit_v1_20260829"
+VERSION = "capplan_passenger_complete_distribution_audit_v2_20260830"
 
 
 def _rows(path: Path) -> Iterable[Dict[str, Any]]:
@@ -48,8 +48,11 @@ def _q(xs: list[float]) -> Dict[str, float | None]:
     return {"min": ys[0], "p10": at(.1), "median": at(.5), "p90": at(.9), "max": ys[-1]}
 
 
-def audit(dataset_dir: Path) -> Dict[str, Any]:
+def audit(dataset_dir: Path, max_route_anchor_distance_m: float = 250.0) -> Dict[str, Any]:
     requests = list(_rows(dataset_dir / "service_requests.jsonl"))
+    manifest_path = dataset_dir / "dataset_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    require_nuplan_route_anchoring = str(manifest.get("scene_source") or "").lower() == "nuplan"
     skeletons = list(_rows(dataset_dir / "skeleton_labels.jsonl"))
     certs = list(_rows(dataset_dir / "certificate_labels.jsonl"))
     pairs = list(_rows(dataset_dir / "counterfactual_pairs.jsonl"))
@@ -127,15 +130,47 @@ def audit(dataset_dir: Path) -> Dict[str, Any]:
     route_o: list[float] = []
     route_d: list[float] = []
     sep: list[float] = []
+    route_anchor_violations: list[dict[str, Any]] = []
+    route_anchor_missing: list[dict[str, Any]] = []
+    route_anchor_method_invalid: list[dict[str, Any]] = []
+    od_semantics_versions = Counter()
     adjustment = Counter(); target_met = Counter()
     for r in requests:
         prov = r.get("od_provenance") if isinstance(r.get("od_provenance"), Mapping) else {}
+        od_semantics_versions[str(prov.get("od_semantics_version") or "missing")] += 1
+        parsed: dict[str, float] = {}
         for arr, key in ((route_o, "route_origin_distance_m"), (route_d, "route_destination_distance_m"), (sep, "od_euclidean_separation_m")):
             try:
                 v = float(prov.get(key))
-                if math.isfinite(v): arr.append(v)
+                if math.isfinite(v):
+                    arr.append(v)
+                    parsed[key] = v
             except Exception:
                 pass
+        method = str(prov.get("method") or "")
+        if require_nuplan_route_anchoring and not method.startswith("nuplan_route_endpoint"):
+            route_anchor_method_invalid.append({
+                "episode_id": str(r.get("episode_id") or ""),
+                "request_id": str(r.get("request_id") or ""),
+                "method": method or "missing",
+            })
+        if method.startswith("nuplan_route_endpoint"):
+            try:
+                limit = float(prov.get("route_anchor_max_distance_m", max_route_anchor_distance_m))
+                if not math.isfinite(limit) or limit <= 0:
+                    limit = float(max_route_anchor_distance_m)
+            except Exception:
+                limit = float(max_route_anchor_distance_m)
+            missing = [k for k in ("route_origin_distance_m", "route_destination_distance_m") if k not in parsed]
+            if missing:
+                route_anchor_missing.append({"episode_id": str(r.get("episode_id") or ""), "missing": missing})
+            for key in ("route_origin_distance_m", "route_destination_distance_m"):
+                if key in parsed and parsed[key] > limit + 1e-9:
+                    route_anchor_violations.append({
+                        "episode_id": str(r.get("episode_id") or ""),
+                        "request_id": str(r.get("request_id") or ""),
+                        "field": key, "value_m": parsed[key], "limit_m": limit,
+                    })
         if "od_separation_adjustment" in prov:
             adjustment[str(prov.get("od_separation_adjustment") or "unknown")] += 1
         if "od_separation_target_met" in prov:
@@ -146,16 +181,28 @@ def audit(dataset_dir: Path) -> Dict[str, Any]:
         return {"count": n, "rate": _rate(n, len(xs))}
 
     quality_flags: list[str] = []
+    hard_errors: list[str] = []
     overall_success = _rate(len(success), len(outcome))
     if overall_success < 0.05:
         quality_flags.append("overall_passenger_complete_success_below_5pct")
     if route_d and over(route_d, 500.0)["rate"] > 0.01:
         quality_flags.append("route_destination_anchor_outliers_gt500m")
+    if route_anchor_method_invalid:
+        hard_errors.append(f"nuplan_route_anchor_method_invalid:{len(route_anchor_method_invalid)}")
+    if route_anchor_missing:
+        hard_errors.append(f"nuplan_route_anchor_distance_missing:{len(route_anchor_missing)}")
+    if route_anchor_violations:
+        hard_errors.append(f"nuplan_route_anchor_radius_violation:{len(route_anchor_violations)}")
+    total_monotonic = sum(int(s.get("monotonic_violation") or 0) for s in axis_summary.values())
+    if total_monotonic:
+        hard_errors.append(f"counterfactual_monotonic_violation:{total_monotonic}")
     for axis, s in axis_summary.items():
         if s["pair_count"] and s["binding_rate_all_pairs"] < 0.01:
             quality_flags.append(f"counterfactual_axis_nearly_inactive:{axis}")
 
+    status = "FAIL" if hard_errors else ("WARN" if quality_flags else "PASS")
     return {
+        "status": status,
         "version": VERSION,
         "dataset_dir": str(dataset_dir),
         "passenger_contract_outcomes": {
@@ -176,9 +223,18 @@ def audit(dataset_dir: Path) -> Dict[str, Any]:
             "destination_gt350m": over(route_d, 350.0),
             "origin_gt500m": over(route_o, 500.0),
             "destination_gt500m": over(route_d, 500.0),
+            "od_semantics_version_counts": dict(od_semantics_versions),
+            "default_route_anchor_limit_m": float(max_route_anchor_distance_m),
+            "route_anchor_method_invalid_count": len(route_anchor_method_invalid),
+            "route_anchor_method_invalid_examples": route_anchor_method_invalid[:20],
+            "route_anchor_missing_count": len(route_anchor_missing),
+            "route_anchor_violation_count": len(route_anchor_violations),
+            "route_anchor_violation_examples": route_anchor_violations[:20],
+            "route_anchor_missing_examples": route_anchor_missing[:20],
             "separation_adjustment_counts": dict(adjustment),
             "separation_target_met_counts": dict(target_met),
         },
+        "hard_errors": hard_errors,
         "quality_flags": quality_flags,
         "interpretation": (
             "This report measures benchmark informativeness, not structural validity. "
@@ -192,11 +248,16 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset_dir", required=True)
     p.add_argument("--output", required=True)
+    p.add_argument("--max_route_anchor_distance_m", type=float, default=250.0)
+    p.add_argument("--fail_on_error", action="store_true")
     args = p.parse_args()
-    report = audit(Path(args.dataset_dir))
+    report = audit(Path(args.dataset_dir), args.max_route_anchor_distance_m)
     out = Path(args.output); out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True))
+    print(f"PASSENGER_COMPLETE_DISTRIBUTION_AUDIT={report['status']}")
+    if args.fail_on_error and report["status"] == "FAIL":
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

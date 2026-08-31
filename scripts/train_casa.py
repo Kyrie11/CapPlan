@@ -238,6 +238,8 @@ def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_ava
     checkpoint = {
         "mode": args.casa_mode,
         "model_type": f"casa_{args.model_type}_multihead",
+        "architecture_semantics": "relation_aware_transition_mlp_surrogate",
+        "true_heterogeneous_message_passing": False,
         "torch_state_dict": model.state_dict(),
         "weights": {"mean": mean.tolist(), "std": std.tolist()},
         "input_dim": int(input_dim), "num_phases": len(vocab.phases), "num_resources": len(vocab.resources), "vocab": vocab.to_dict(), "config": {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight)},
@@ -256,8 +258,10 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--device", default="auto")
     p.add_argument("--casa_mode", choices=["learned", "heuristic_oracle_baseline"], default="learned")
-    p.add_argument("--model_type", choices=["hgt", "rgcn", "linear_smoke"], default="linear_smoke")
+    p.add_argument("--model_type", choices=["relation_mlp", "hgt", "rgcn", "linear_smoke"], default="linear_smoke")
     p.add_argument("--paper_mode", action="store_true")
+    p.add_argument("--feature_policy", choices=["auto", "legacy", "paper_safe"], default="auto", help="Feature masking policy. paper_safe removes oracle/label-derived transition slots without implying the current surrogate is a true HGT/R-GCN.")
+    p.add_argument("--allow_relation_surrogate_paper_mode", action="store_true", help="Explicit acknowledgement that current hgt/rgcn modes are relation-aware transition MLP surrogates, not the heterogeneous message-passing CASA-Net described in the paper.")
     p.add_argument("--phase_supervision", action="store_true")
     p.add_argument("--predict_typed_demand", action="store_true")
     p.add_argument("--predict_uncertainty", action="store_true")
@@ -269,7 +273,13 @@ def main() -> None:
     p.add_argument("--edge_pos_weight", default="auto", help="Positive-class weight for sparse passenger edge labels. Use auto or a numeric value.")
     args = p.parse_args()
     if args.paper_mode and args.model_type == "linear_smoke":
-        raise RuntimeError("paper_mode training requires --model_type hgt or rgcn; linear_smoke is CI/smoke only")
+        raise RuntimeError("paper_mode training cannot use linear_smoke")
+    if args.paper_mode and args.model_type in {"relation_mlp", "hgt", "rgcn"} and not args.allow_relation_surrogate_paper_mode:
+        raise RuntimeError(
+            "paper_mode is publication-facing, but the current relation_mlp/hgt/rgcn backend is a relation-aware transition MLP surrogate, "
+            "not true heterogeneous graph message passing. Use --feature_policy paper_safe without --paper_mode for baseline development, "
+            "or pass --allow_relation_surrogate_paper_mode only when explicitly reporting it as a surrogate baseline."
+        )
     if args.paper_mode:
         missing_flags = [
             name for name, enabled in {
@@ -288,7 +298,11 @@ def main() -> None:
     random.seed(args.seed); np.random.seed(args.seed)
     out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
     vocab = FeatureVocab()
-    feature_policy = "paper_safe" if args.paper_mode else "legacy"
+    feature_policy = args.feature_policy
+    if feature_policy == "auto":
+        feature_policy = "paper_safe" if args.paper_mode else "legacy"
+    if args.paper_mode and feature_policy != "paper_safe":
+        raise RuntimeError("paper_mode requires --feature_policy paper_safe (or auto)")
     # Persist the resolved policy in checkpoints so inference uses the exact
     # same masking semantics as training.
     args.feature_policy = feature_policy
@@ -318,7 +332,7 @@ def main() -> None:
     if args.paper_mode and (val_metrics.get("L_phase", 0.0) <= 0.0 or val_metrics.get("L_demand", 0.0) <= 0.0):
         raise RuntimeError(f"paper_mode requires non-zero L_phase and L_demand; got L_phase={val_metrics.get('L_phase')} L_demand={val_metrics.get('L_demand')}")
     dump_json(out / "vocab.json", vocab.to_dict())
-    dump_json(out / "config.json", {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight), "mode": args.casa_mode, "device_resolved": device, "input_dim": int(x.shape[1]), "feature_policy": feature_policy, "num_train_samples": len(train.samples), "edge_train_positive_rate": float(np.mean(y_edge >= 0.5)), "model_type": checkpoint.get("model_type"), "sampler_report": sampler_report})
+    dump_json(out / "config.json", {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight), "mode": args.casa_mode, "device_resolved": device, "input_dim": int(x.shape[1]), "feature_policy": feature_policy, "num_train_samples": len(train.samples), "edge_train_positive_rate": float(np.mean(y_edge >= 0.5)), "model_type": checkpoint.get("model_type"), "architecture_semantics": checkpoint.get("architecture_semantics", "linear_smoke"), "true_heterogeneous_message_passing": bool(checkpoint.get("true_heterogeneous_message_passing", False)), "sampler_report": sampler_report})
     write_jsonl(out / "train_metrics.jsonl", metrics_rows)
     dump_json(out / "val_metrics.json", val_metrics)
     if args.save_calibration_report:

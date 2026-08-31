@@ -76,7 +76,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             input_dim = int(self.checkpoint.get("input_dim", 0) or 0)
             num_phases = int(self.checkpoint.get("num_phases", len(self.vocab.phases)) or len(self.vocab.phases))
             num_resources = int(self.checkpoint.get("num_resources", len(self.vocab.resources)) or len(self.vocab.resources))
-            model_type = str(self.checkpoint.get("config", {}).get("model_type", "hgt"))
+            model_type = str(self.checkpoint.get("config", {}).get("model_type", "relation_mlp"))
             model = CASAHetGraphNet(input_dim, num_phases, num_resources, model_type=model_type)
             model.load_state_dict(self.checkpoint["torch_state_dict"], strict=False)
             model.eval()

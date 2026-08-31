@@ -22,6 +22,9 @@ from capplan.data.schemas import AccessibilityNode, node_from_dict
 from capplan.utils.serialization import dump_json, read_jsonl, write_jsonl
 
 
+OD_SEMANTICS_VERSION = "capplan_route_local_od_v2_20260830"
+
+
 def _read_records(path: str | None, key_hint: str | None = None) -> List[Dict[str, Any]]:
     if not path:
         return []
@@ -265,7 +268,17 @@ def _frontage_near_route_or_proxy(
                     "proxy_to_route_endpoint_m": round(_dist(proxy, route_xy), 3),
                 }
     f = _nearest_distinct(frontage, route_xy, avoid=avoid)
-    return f, "simulated_frontage_access_point", {}
+    if f is None:
+        return None, "simulated_frontage_access_point", {}
+    route_d = _dist(f, route_xy)
+    if route_d > max_proxy_route_distance_m:
+        return None, "simulated_frontage_access_point", {
+            "nearest_frontage_to_route_endpoint_m": round(route_d, 3),
+            "route_anchor_rejected_reason": "nearest_frontage_outside_route_local_radius",
+        }
+    return f, "simulated_frontage_access_point", {
+        "frontage_to_route_endpoint_m": round(route_d, 3),
+    }
 
 
 def _choose_realistic_od(
@@ -330,11 +343,9 @@ def _choose_realistic_od(
     else:
         d = d_real; d_kind = "observed_entrance"
     if d is None:
-        pool = entrances if len(entrances) >= 2 else frontage
-        d = _farthest_from(pool, o)
-        d_kind = "observed_entrance" if d in entrances else "simulated_frontage_access_point"
-    if d is None:
-        raise RuntimeError("no physically anchored destination access point available")
+        raise RuntimeError(
+            f"no route-local destination access point within {max_entrance_route_distance_m:.1f} m of nuPlan route destination"
+        )
 
     sep = math.hypot(d.x-o.x, d.y-o.y)
     separation_adjustment = "none"
@@ -373,12 +384,25 @@ def _choose_realistic_od(
         else:
             separation_adjustment = "kept_route_anchored_short_od"
 
+    route_o_m = _dist(o, start_xy)
+    route_d_m = _dist(d, end_xy)
+    if route_o_m > max_entrance_route_distance_m + 1e-9 or route_d_m > max_entrance_route_distance_m + 1e-9:
+        raise RuntimeError(
+            "route-local OD invariant violated: "
+            f"origin={route_o_m:.3f}m destination={route_d_m:.3f}m "
+            f"limit={max_entrance_route_distance_m:.3f}m"
+        )
+
     prov = {
+        "od_semantics_version": OD_SEMANTICS_VERSION,
         "origin_kind": o_kind,
         "destination_kind": d_kind,
         "method": "nuplan_route_endpoint_to_mapped_entrance_or_frontage",
-        "route_origin_distance_m": round(_dist(o, start_xy), 3),
-        "route_destination_distance_m": round(_dist(d, end_xy), 3),
+        "route_origin_distance_m": round(route_o_m, 3),
+        "route_destination_distance_m": round(route_d_m, 3),
+        "route_anchor_max_distance_m": round(float(max_entrance_route_distance_m), 3),
+        "route_origin_anchor_within_limit": True,
+        "route_destination_anchor_within_limit": True,
         "od_euclidean_separation_m": round(sep, 3),
         "od_separation_target_m": round(float(min_od_separation_m), 3),
         "od_separation_target_met": bool(sep + 1e-9 >= min_od_separation_m),
@@ -541,8 +565,14 @@ def _generate_requests(args: argparse.Namespace, profiles: Sequence[Dict[str, An
     purposes = cfg.get("trip_purposes") or ["medical", "work", "shopping", "social", "other"]
     request_time_start = float(cfg.get("request_time_start_s", 8 * 3600))
     request_time_span = float(cfg.get("request_time_span_s", 12 * 3600))
-    max_entrance_route_distance_m = float(cfg.get("max_entrance_route_distance_m", 250.0))
-    min_od_separation_m = float(cfg.get("min_od_separation_m", 80.0))
+    max_entrance_route_distance_m = float(
+        args.max_entrance_route_distance_m if args.max_entrance_route_distance_m is not None
+        else cfg.get("max_entrance_route_distance_m", 250.0)
+    )
+    min_od_separation_m = float(
+        args.min_od_separation_m if args.min_od_separation_m is not None
+        else cfg.get("min_od_separation_m", 80.0)
+    )
     scene_meta = _load_scene_metadata(args.scene_dataset_dir)
     rows: List[Dict[str, Any]] = []
     trusted_tokens = None
@@ -685,6 +715,15 @@ def build(args: argparse.Namespace) -> Dict[str, Any]:
         "frontage_proxy_request_count": sum(1 for r in rows if bool(r.get("hybrid_frontage_proxy_od"))),
         "request_time_source_counts": {k: sum(1 for r in rows if str(r.get("request_time_source")) == k) for k in sorted({str(r.get("request_time_source")) for r in rows})},
         "vehicle_assignment_counts": {k: sum(1 for r in rows if str(r.get("vehicle_id")) == k) for k in sorted({str(r.get("vehicle_id")) for r in rows if r.get("vehicle_id")})},
+        "od_semantics_version": OD_SEMANTICS_VERSION,
+        "route_origin_anchor_distance_max_m": max(
+            [float((r.get("od_provenance") or {}).get("route_origin_distance_m")) for r in rows if (r.get("od_provenance") or {}).get("route_origin_distance_m") is not None],
+            default=None,
+        ),
+        "route_destination_anchor_distance_max_m": max(
+            [float((r.get("od_provenance") or {}).get("route_destination_distance_m")) for r in rows if (r.get("od_provenance") or {}).get("route_destination_distance_m") is not None],
+            default=None,
+        ),
     }
     if args.report_json:
         dump_json(args.report_json, report)
@@ -703,6 +742,8 @@ def main() -> None:
     p.add_argument("--fleet_jsonl", default=None)
     p.add_argument("--output_service_requests_jsonl", required=True)
     p.add_argument("--num_requests_per_episode", type=int, default=3)
+    p.add_argument("--max_entrance_route_distance_m", type=float, default=None, help="Maximum route-endpoint distance for origin/destination service anchors. Overrides demand config when set.")
+    p.add_argument("--min_od_separation_m", type=float, default=None, help="Nominal minimum passenger OD separation. Short route-local OD is retained when no local alternative exists.")
     p.add_argument("--seed", type=int, default=13)
     p.add_argument("--source_name", default="calibrated_service_layer")
     p.add_argument("--allow_non_entrance_od", action="store_true", help="Bootstrap/hybrid only: if mapped entrances are unavailable near route endpoints, use a real-map sidewalk frontage access point with explicit simulated OD provenance. Never valid for paper-mode datasets.")
