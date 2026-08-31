@@ -93,9 +93,9 @@ def test_hybrid_semantic_audit_hard_fails_route_anchor_outlier(tmp_path: Path):
 
 def test_reviewfix7_pipeline_has_final_freeze_stages():
     text = Path("scripts/build_abilitybench_data0_20260817.sh").read_text(encoding="utf-8")
-    assert 'PIPELINE_VERSION="abilitybench_data0_passenger_complete_reviewfix7_20260830"' in text
-    assert "reviewfix7-preflight) reviewfix7_preflight" in text
-    assert "hybrid-dataset-resume-reviewfix7) hybrid_dataset_resume_reviewfix7" in text
+    assert 'PIPELINE_VERSION="abilitybench_data0_passenger_complete_reviewfix8_20260831"' in text
+    assert "reviewfix8-preflight) reviewfix8_preflight" in text
+    assert "hybrid-dataset-resume-reviewfix8) hybrid_dataset_resume_reviewfix8" in text
     assert "passenger_complete_distribution_audit" in text
 
 

@@ -95,10 +95,10 @@ def test_diagnostics_cli_registers_fast_graph_scan():
     assert "--fast_graph_scan" in proc.stdout
 
 
-def test_review_bundle_uses_fresh_reviewfix7_context_and_reuses_only_graph_v3():
+def test_review_bundle_uses_fresh_reviewfix8_context_and_reuses_only_graph_v3():
     text = (ROOT / "scripts/build_hybrid_review_bundle.py").read_text()
-    assert 'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix7_20260830"' in text
-    assert 'commands/hybrid_run_context.reviewfix7_dataset.json' in text
+    assert 'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix8_20260831"' in text
+    assert 'commands/hybrid_run_context.reviewfix8_dataset.json' in text
     assert 'return rel.startswith("hybrid_graph.")' in text
 
 
@@ -125,7 +125,7 @@ def test_reviewfix5_preflight_executes_bash_helpers(tmp_path: Path):
     assert "CAPPLAN_REVIEWFIX5_RUNTIME_GUARD=PASS" in proc.stdout
     assert "CAPPLAN_REVIEWFIX5_HELPER_DEFINITIONS=present" in proc.stdout
     assert "CAPPLAN_REVIEWFIX5_HELPER_SMOKE=PASS" in proc.stdout
-    assert "CAPPLAN_PIPELINE_VERSION=abilitybench_data0_passenger_complete_reviewfix7_20260830" in proc.stdout
+    assert "CAPPLAN_PIPELINE_VERSION=abilitybench_data0_passenger_complete_reviewfix8_20260831" in proc.stdout
     assert "CAPPLAN_REVIEWFIX5_DIAGNOSE_FAST_GRAPH_SCAN=present" in proc.stdout
 
 

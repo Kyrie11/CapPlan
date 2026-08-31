@@ -76,7 +76,7 @@ def test_review_bundle_does_not_mark_run_context_anchor_stale(tmp_path: Path, mo
     commands.mkdir()
     identity = commands / "pipeline_identity.reviewfix7_dataset.txt"
     identity.write_text(f"CAPPLAN_PIPELINE_VERSION={mod.EXPECTED_PIPELINE_VERSION}\n", encoding="utf-8")
-    context = commands / "hybrid_run_context.reviewfix7_dataset.json"
+    context = commands / "hybrid_run_context.reviewfix8_dataset.json"
     # Deliberately place start_time_ns in the future: the context file is the
     # anchor, so its own mtime must not be judged against itself.
     context.write_text(json.dumps({

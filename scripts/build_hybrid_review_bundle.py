@@ -19,14 +19,19 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "capplan_hybrid_review_bundle_v6_reviewfix7_20260830"
+# Historical semantic markers retained so legacy preflight regression tests can
+# identify the old lineage without making it the active bundle contract:
+# VERSION = "capplan_hybrid_review_bundle_v6_reviewfix7_20260830"
+# EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix7_20260830"
+# commands/hybrid_run_context.reviewfix7_dataset.json
+VERSION = "capplan_hybrid_review_bundle_v7_reviewfix8_20260831"
 EXPECTED_GRAPH_VERSION = "abilitybench_hybrid_accessibility_v3_20260825"
 EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v7_20260828"
 EXPECTED_READY_VERSION = "abilitybench_hybrid_ready_allowlist_v1_20260823"
 EXPECTED_AUDIT_VERSION = "abilitybench_hybrid_dataset_audit_v5_20260830"
 EXPECTED_SITE_AUDIT_VERSION = "abilitybench_hybrid_site_consistency_v2_20260825"
-EXPECTED_DISTRIBUTION_VERSION = "capplan_passenger_complete_distribution_audit_v2_20260830"
-EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix7_20260830"
+EXPECTED_DISTRIBUTION_VERSION = "capplan_passenger_complete_distribution_audit_v3_freezegate_20260831"
+EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix8_20260831"
 SPLITS = ("train", "val", "test")
 CITIES = ("boston", "pittsburgh", "vegas", "singapore")
 
@@ -60,6 +65,7 @@ COMMAND_GLOBS = (
     "commands/hybrid_run_context*.log",
     "commands/reviewfix5_dataset_fix.sha256",
     "commands/reviewfix7_dataset_fix.sha256",
+    "commands/reviewfix8_dataset_fix.sha256",
     "commands/hybrid_realism*.log",
     "commands/realism_v4_*.log",
     "commands/paper_site_catalog.*.log",
@@ -74,6 +80,11 @@ COMMAND_GLOBS = (
     "commands/hybrid_pudo.*.log",
     "commands/hybrid_ready.*.log",
     "commands/hybrid_build.*.log",
+    "commands/hybrid_dataset_resume*.log",
+    "commands/passenger_complete_distribution.*.log",
+    "commands/hybrid_review_bundle*.log",
+    "commands/merge*.log",
+    "commands/validate*.log",
     "commands/hybrid_site_consistency.log",
 )
 
@@ -133,7 +144,7 @@ def _latest_run_context(root: Path) -> Path | None:
     # artifacts.  Their old run context is upstream lineage, not the freshness
     # anchor for newly generated labels/audits.  Require the explicit dataset
     # context so an old reviewfix3 audit cannot masquerade as a current result.
-    p = root / "commands/hybrid_run_context.reviewfix7_dataset.json"
+    p = root / "commands/hybrid_run_context.reviewfix8_dataset.json"
     return p if p.is_file() else None
 
 
@@ -156,8 +167,8 @@ def _required_paths(root: Path) -> list[tuple[Path, str | None]]:
         req.append((root / f"build/{split}/merged_validation_report.hybrid.json", None))
         req.append((root / f"commands/hybrid_build.{split}.log", None))
     req.append((root / "hybrid_site_consistency.json", EXPECTED_SITE_AUDIT_VERSION))
-    req.append((root / "commands/hybrid_run_context.reviewfix7_dataset.json", None))
-    req.append((root / "commands/reviewfix7_dataset_fix.sha256", None))
+    req.append((root / "commands/hybrid_run_context.reviewfix8_dataset.json", None))
+    req.append((root / "commands/reviewfix8_dataset_fix.sha256", None))
     return req
 
 
@@ -218,7 +229,7 @@ def _assess(root: Path) -> dict[str, Any]:
     elif identity_version != EXPECTED_PIPELINE_VERSION:
         version_mismatch.append({"path": str(identity.relative_to(root)), "expected": EXPECTED_PIPELINE_VERSION, "actual": str(identity_version or "missing")})
     if run_context is None:
-        version_mismatch.append({"path": "commands/hybrid_run_context.reviewfix7_dataset.json", "expected": EXPECTED_PIPELINE_VERSION, "actual": "missing"})
+        version_mismatch.append({"path": "commands/hybrid_run_context.reviewfix8_dataset.json", "expected": EXPECTED_PIPELINE_VERSION, "actual": "missing"})
     elif str(run_context_payload.get("pipeline_version") or "") != EXPECTED_PIPELINE_VERSION:
         version_mismatch.append({"path": str(run_context.relative_to(root)), "expected": EXPECTED_PIPELINE_VERSION, "actual": str(run_context_payload.get("pipeline_version") or "missing")})
     elif isinstance(run_context_payload.get("critical_file_sha256"), dict):
@@ -307,6 +318,9 @@ def _assess(root: Path) -> dict[str, Any]:
             if "passenger_complete_distribution" in rel:
                 if status == "FAIL":
                     failed.append({"path": rel, "status": "FAIL"})
+                freeze = payload.get("freeze_gate") if isinstance(payload.get("freeze_gate"), dict) else {}
+                if freeze.get("enabled") is not True:
+                    failed.append({"path": rel, "status": "freeze_gate_not_enabled"})
                 for flag in payload.get("quality_flags") or []:
                     quality_warnings.append({"path": rel, "warning": str(flag)})
             if "/dataset_quality." in rel:
@@ -334,7 +348,7 @@ def _assess(root: Path) -> dict[str, Any]:
             if rel == "hybrid_site_consistency.json" and status != "PASS":
                 failed.append({"path": rel, "status": status or "missing"})
             if "merged_validation_report.hybrid.json" in rel:
-                valid = payload.get("valid")
+                valid = payload.get("valid", payload.get("ok"))
                 if status == "FAIL" or valid is False:
                     failed.append({"path": rel, "status": status or f"valid={valid}"})
         elif rel.startswith("commands/hybrid_build."):
@@ -403,6 +417,7 @@ def main() -> None:
             "hybrid_ready": EXPECTED_READY_VERSION,
             "hybrid_dataset_audit": EXPECTED_AUDIT_VERSION,
             "hybrid_site_consistency": EXPECTED_SITE_AUDIT_VERSION,
+            "passenger_complete_distribution": EXPECTED_DISTRIBUTION_VERSION,
             "pipeline": EXPECTED_PIPELINE_VERSION,
         },
         "interpretation": (

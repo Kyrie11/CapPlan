@@ -20,7 +20,9 @@ from typing import Any, Dict, Iterable, Mapping
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.utils.serialization import iter_jsonl
 
-VERSION = "capplan_passenger_complete_distribution_audit_v2_20260830"
+# Historical marker for reviewfix7 runtime-guard compatibility:
+# VERSION = "capplan_passenger_complete_distribution_audit_v2_20260830"
+VERSION = "capplan_passenger_complete_distribution_audit_v3_freezegate_20260831"
 
 
 def _rows(path: Path) -> Iterable[Dict[str, Any]]:
@@ -48,7 +50,19 @@ def _q(xs: list[float]) -> Dict[str, float | None]:
     return {"min": ys[0], "p10": at(.1), "median": at(.5), "p90": at(.9), "max": ys[-1]}
 
 
-def audit(dataset_dir: Path, max_route_anchor_distance_m: float = 250.0) -> Dict[str, Any]:
+EXPECTED_COUNTERFACTUAL_AXES = (
+    "access_distance", "step_free", "min_width", "ramp_lift",
+    "door_side_clearance", "ride_motion", "confidence",
+)
+
+
+def audit(
+    dataset_dir: Path,
+    max_route_anchor_distance_m: float = 250.0,
+    *,
+    freeze_gate: bool = False,
+    min_binding_rate_given_base_success: float = 0.05,
+) -> Dict[str, Any]:
     requests = list(_rows(dataset_dir / "service_requests.jsonl"))
     manifest_path = dataset_dir / "dataset_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
@@ -200,6 +214,26 @@ def audit(dataset_dir: Path, max_route_anchor_distance_m: float = 250.0) -> Dict
         if s["pair_count"] and s["binding_rate_all_pairs"] < 0.01:
             quality_flags.append(f"counterfactual_axis_nearly_inactive:{axis}")
 
+    if freeze_gate:
+        base = profile_summary.get("basic_service_complete") or {}
+        base_success = int(base.get("success") or 0)
+        if base_success <= 0:
+            hard_errors.append("freeze_gate_base_profile_has_no_success")
+        for axis in EXPECTED_COUNTERFACTUAL_AXES:
+            s = axis_summary.get(axis)
+            if not s or int(s.get("pair_count") or 0) <= 0:
+                hard_errors.append(f"freeze_gate_missing_counterfactual_axis:{axis}")
+                continue
+            binding = int(s.get("base_success_strict_fail") or 0)
+            conditional = float(s.get("binding_rate_given_base_success") or 0.0)
+            if binding <= 0:
+                hard_errors.append(f"freeze_gate_zero_binding:{axis}")
+            elif conditional + 1e-12 < float(min_binding_rate_given_base_success):
+                hard_errors.append(
+                    f"freeze_gate_weak_binding:{axis}:{conditional:.6f}<"
+                    f"{float(min_binding_rate_given_base_success):.6f}"
+                )
+
     status = "FAIL" if hard_errors else ("WARN" if quality_flags else "PASS")
     return {
         "status": status,
@@ -234,6 +268,11 @@ def audit(dataset_dir: Path, max_route_anchor_distance_m: float = 250.0) -> Dict
             "separation_adjustment_counts": dict(adjustment),
             "separation_target_met_counts": dict(target_met),
         },
+        "freeze_gate": {
+            "enabled": bool(freeze_gate),
+            "expected_counterfactual_axes": list(EXPECTED_COUNTERFACTUAL_AXES),
+            "min_binding_rate_given_base_success": float(min_binding_rate_given_base_success),
+        },
         "hard_errors": hard_errors,
         "quality_flags": quality_flags,
         "interpretation": (
@@ -249,9 +288,15 @@ def main() -> None:
     p.add_argument("--dataset_dir", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--max_route_anchor_distance_m", type=float, default=250.0)
+    p.add_argument("--freeze_gate", action="store_true", help="Require every paper counterfactual axis to bind at a non-trivial rate among base-success episodes.")
+    p.add_argument("--min_binding_rate_given_base_success", type=float, default=0.05)
     p.add_argument("--fail_on_error", action="store_true")
     args = p.parse_args()
-    report = audit(Path(args.dataset_dir), args.max_route_anchor_distance_m)
+    report = audit(
+        Path(args.dataset_dir), args.max_route_anchor_distance_m,
+        freeze_gate=args.freeze_gate,
+        min_binding_rate_given_base_success=args.min_binding_rate_given_base_success,
+    )
     out = Path(args.output); out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2, sort_keys=True))

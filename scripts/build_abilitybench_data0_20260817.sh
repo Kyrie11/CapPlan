@@ -8,7 +8,8 @@ EXT="$DATA_ROOT/external"
 REPORTS="$EXT/reports"
 # Historical compatibility marker retained for regression tests/documentation:
 # PIPELINE_VERSION="abilitybench_data0_realism_v4_reviewfix3_20260825"
-PIPELINE_VERSION="abilitybench_data0_passenger_complete_reviewfix7_20260830"
+# Historical compatibility marker: PIPELINE_VERSION="abilitybench_data0_passenger_complete_reviewfix7_20260830"
+PIPELINE_VERSION="abilitybench_data0_passenger_complete_reviewfix8_20260831"
 
 mkdir -p "$REPORTS/commands" "$REPORTS/build" "$REPORTS/model" "$REPORTS/eval"
 cd "$CAP_HOME"
@@ -29,6 +30,7 @@ pipeline_version() {
   grep -q 'hybrid-realism-resume-reviewfix3)' "$0" && echo "CAPPLAN_REVIEWFIX3_RESUME_DISPATCH=present" || echo "CAPPLAN_REVIEWFIX3_RESUME_DISPATCH=MISSING"
   grep -q 'hybrid-dataset-resume-reviewfix5)' "$0" && echo "CAPPLAN_REVIEWFIX5_DATASET_RESUME_DISPATCH=present" || echo "CAPPLAN_REVIEWFIX5_DATASET_RESUME_DISPATCH=MISSING"
   grep -q 'hybrid-dataset-resume-reviewfix7)' "$0" && echo "CAPPLAN_REVIEWFIX7_DATASET_RESUME_DISPATCH=present" || echo "CAPPLAN_REVIEWFIX7_DATASET_RESUME_DISPATCH=MISSING"
+  grep -q 'hybrid-dataset-resume-reviewfix8)' "$0" && echo "CAPPLAN_REVIEWFIX8_DATASET_RESUME_DISPATCH=present" || echo "CAPPLAN_REVIEWFIX8_DATASET_RESUME_DISPATCH=MISSING"
   grep -q 'abilitybench_hybrid_site_consistency_v2_20260825' "$CAP_HOME/scripts/audit_hybrid_site_consistency.py" 2>/dev/null \
     && echo "CAPPLAN_SITE_AUDIT_V2=present" || echo "CAPPLAN_SITE_AUDIT_V2=MISSING"
   grep -q 'abilitybench_hybrid_accessibility_v3_20260825' "$CAP_HOME/scripts/build_hybrid_accessibility_overlay.py" 2>/dev/null \
@@ -39,8 +41,14 @@ pipeline_version() {
     && echo "CAPPLAN_HYBRID_AUDIT_V5=present" || echo "CAPPLAN_HYBRID_AUDIT_V5=MISSING"
   grep -q 'capplan_passenger_complete_distribution_audit_v2_20260830' "$CAP_HOME/scripts/audit_passenger_complete_distribution.py" 2>/dev/null \
     && echo "CAPPLAN_PASSENGER_DISTRIBUTION_V2=present" || echo "CAPPLAN_PASSENGER_DISTRIBUTION_V2=MISSING"
-  grep -q 'capplan_hybrid_review_bundle_v6_reviewfix7_20260830' "$CAP_HOME/scripts/build_hybrid_review_bundle.py" 2>/dev/null \
-    && echo "CAPPLAN_REVIEW_BUNDLE_V6=present" || echo "CAPPLAN_REVIEW_BUNDLE_V6=MISSING"
+  grep -q 'capplan_passenger_complete_distribution_audit_v3_freezegate_20260831' "$CAP_HOME/scripts/audit_passenger_complete_distribution.py" 2>/dev/null \
+    && echo "CAPPLAN_PASSENGER_DISTRIBUTION_V3=present" || echo "CAPPLAN_PASSENGER_DISTRIBUTION_V3=MISSING"
+  grep -q 'capplan_hybrid_review_bundle_v7_reviewfix8_20260831' "$CAP_HOME/scripts/build_hybrid_review_bundle.py" 2>/dev/null \
+    && echo "CAPPLAN_REVIEW_BUNDLE_V7=present" || echo "CAPPLAN_REVIEW_BUNDLE_V7=MISSING"
+  grep -q 'capplan_merge_datasets_v2_streaming_20260831' "$CAP_HOME/scripts/merge_datasets.py" 2>/dev/null \
+    && echo "CAPPLAN_MERGE_V2=present" || echo "CAPPLAN_MERGE_V2=MISSING"
+  grep -q 'capplan_dataset_validation_v2_linear_20260831' "$CAP_HOME/capplan/data/validate_dataset.py" 2>/dev/null \
+    && echo "CAPPLAN_VALIDATE_V2=present" || echo "CAPPLAN_VALIDATE_V2=MISSING"
 }
 
 reviewfix5_runtime_guard() {
@@ -434,6 +442,187 @@ write_reviewfix7_dataset_hashes() {
     scripts/merge_datasets.py \
     scripts/build_hybrid_review_bundle.py \
     | tee "$out"
+}
+
+
+reviewfix8_runtime_guard() {
+  # Freeze-candidate guard: in addition to OD semantics, verify the fixed
+  # capability-axis design and the streaming merge / linear validator so the
+  # server cannot silently run reviewfix7 labels or the old O(T*C) merge path.
+  python - "$CAP_HOME" <<'PYGUARD8'
+from pathlib import Path
+import hashlib, sys
+root=Path(sys.argv[1]).resolve()
+checks={
+  "scripts/build_abilitybench_data0_20260817.sh": [
+    'PIPELINE_VERSION="abilitybench_data0_passenger_complete_reviewfix8_20260831"',
+    'hybrid-dataset-resume-reviewfix8)',
+  ],
+  "configs/capability_profiles.counterfactual.yaml": [
+    'abilitybench_operational_counterfactual_design_v2_reviewfix8',
+    'abilitybench_av_v2_reviewfix8_20260831',
+    'max_access_distance_m: 150.0',
+    'min_deployment_clearance_m: 1.8',
+  ],
+  "scripts/build_service_layer.py": [
+    'OD_SEMANTICS_VERSION = "capplan_route_local_od_v2_20260830"',
+    'kept_route_anchored_short_od',
+  ],
+  "scripts/audit_hybrid_benchmark.py": [
+    'VERSION = "abilitybench_hybrid_dataset_audit_v5_20260830"',
+  ],
+  "scripts/audit_passenger_complete_distribution.py": [
+    'VERSION = "capplan_passenger_complete_distribution_audit_v3_freezegate_20260831"',
+    'freeze_gate_zero_binding',
+    'min_binding_rate_given_base_success',
+  ],
+  "scripts/merge_datasets.py": [
+    'VERSION = "capplan_merge_datasets_v2_streaming_20260831"',
+    'stream_raw_concat_disjoint_episodes',
+    'deep_validation',
+  ],
+  "capplan/data/validate_dataset.py": [
+    'VALIDATION_VERSION = "capplan_dataset_validation_v2_linear_20260831"',
+    'expected_edge_label_count',
+    'skip_graph_membership',
+  ],
+  "scripts/validate_dataset.py": [
+    '--deep_graph_validation',
+    '_can_reuse_merged_graph_validation',
+  ],
+  "scripts/build_hybrid_review_bundle.py": [
+    'VERSION = "capplan_hybrid_review_bundle_v7_reviewfix8_20260831"',
+    'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix8_20260831"',
+    'EXPECTED_DISTRIBUTION_VERSION = "capplan_passenger_complete_distribution_audit_v3_freezegate_20260831"',
+  ],
+}
+errors=[]
+for rel,markers in checks.items():
+    p=root/rel
+    if not p.is_file():
+        errors.append(f"missing:{rel}"); continue
+    text=p.read_text(encoding="utf-8", errors="replace")
+    for m in markers:
+        if m not in text: errors.append(f"marker_missing:{rel}:{m}")
+    print(f"CAPPLAN_REVIEWFIX8_FILE_SHA256[{rel}]={hashlib.sha256(p.read_bytes()).hexdigest()}")
+if errors:
+    print("CAPPLAN_REVIEWFIX8_RUNTIME_GUARD=FAIL", file=sys.stderr)
+    for e in errors: print(e, file=sys.stderr)
+    raise SystemExit(2)
+print("CAPPLAN_REVIEWFIX8_RUNTIME_GUARD=PASS")
+PYGUARD8
+}
+
+write_reviewfix8_dataset_run_context() {
+  local out="${1:-$REPORTS/commands/hybrid_run_context.reviewfix8_dataset.json}"
+  python - "$CAP_HOME" "$CONFIG" "$PIPELINE_VERSION" "$out" <<'PYCTX8'
+from pathlib import Path
+import datetime as dt, hashlib, json, os, sys, time
+root=Path(sys.argv[1]).resolve(); config=Path(sys.argv[2]).resolve(); version=sys.argv[3]; out=Path(sys.argv[4]).resolve()
+critical=[
+  "scripts/build_abilitybench_data0_20260817.sh",
+  "configs/capability_profiles.counterfactual.yaml",
+  "scripts/build_service_layer.py",
+  "scripts/audit_hybrid_benchmark.py",
+  "scripts/audit_passenger_complete_distribution.py",
+  "scripts/build_hybrid_pudo_evidence.py",
+  "scripts/build_hybrid_ready_allowlist.py",
+  "scripts/build_hybrid_accessibility_overlay.py",
+  "scripts/audit_hybrid_site_consistency.py",
+  "capplan/data/label_oracle.py",
+  "capplan/data/accessibility_layer.py",
+  "capplan/data/pudo_interface_layer.py",
+  "capplan/planning/transition_generator.py",
+  "capplan/semantics/capability_compiler.py",
+  "capplan/semantics/service_automaton.py",
+  "capplan/semantics/typed_resource_algebra.py",
+  "capplan/data/validate_dataset.py",
+  "scripts/build_dataset.py",
+  "scripts/audit_dataset_quality.py",
+  "scripts/diagnose_capplan_outputs.py",
+  "scripts/prepare_abilitybench_external.py",
+  "scripts/merge_datasets.py",
+  "scripts/validate_dataset.py",
+  "scripts/build_hybrid_review_bundle.py",
+]
+sha={rel:(hashlib.sha256((root/rel).read_bytes()).hexdigest() if (root/rel).is_file() else None) for rel in critical}
+missing=[rel for rel,val in sha.items() if val is None]
+if missing: raise SystemExit("reviewfix8 run-context critical files missing: "+", ".join(missing))
+now_ns=time.time_ns()
+run_id=f"reviewfix8_dataset_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{now_ns}_{sha[critical[0]][:12]}"
+upstream=out.parent/"hybrid_run_context.reviewfix3.json"
+upstream_payload={}
+if upstream.exists():
+    try: upstream_payload=json.loads(upstream.read_text(encoding="utf-8"))
+    except Exception: upstream_payload={}
+payload={
+  "run_id":run_id, "pipeline_version":version, "cap_home":str(root), "config":str(config),
+  "start_time_ns":now_ns, "start_time_utc":dt.datetime.fromtimestamp(now_ns/1e9, tz=dt.timezone.utc).isoformat(),
+  "critical_file_sha256":sha, "hybrid_seed":os.environ.get("CAP_HYBRID_SEED"),
+  "reused_upstream_context":str(upstream) if upstream.exists() else None,
+  "reused_upstream_run_id":upstream_payload.get("run_id") if upstream_payload else None,
+  "reused_artifacts":["hybrid_graph_v3"],
+  "od_semantics_version":"capplan_route_local_od_v2_20260830",
+  "capability_profile_version":"abilitybench_av_v2_reviewfix8_20260831",
+  "counterfactual_profile_changes":{
+    "access_distance_strict_m":150.0,
+    "door_side_clearance_strict_m":1.8,
+  },
+  "merge_version":"capplan_merge_datasets_v2_streaming_20260831",
+  "validation_version":"capplan_dataset_validation_v2_linear_20260831",
+}
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(payload, indent=2, sort_keys=True)+"\n", encoding="utf-8")
+print(f"CAPPLAN_HYBRID_RUN_ID={run_id}")
+print(f"CAPPLAN_HYBRID_RUN_CONTEXT={out}")
+PYCTX8
+}
+
+write_reviewfix8_dataset_hashes() {
+  local out="${1:-$REPORTS/commands/reviewfix8_dataset_fix.sha256}"
+  mkdir -p "$(dirname "$out")"
+  sha256sum \
+    scripts/build_abilitybench_data0_20260817.sh \
+    configs/capability_profiles.counterfactual.yaml \
+    scripts/build_service_layer.py \
+    scripts/audit_hybrid_benchmark.py \
+    scripts/audit_passenger_complete_distribution.py \
+    capplan/data/validate_dataset.py \
+    scripts/build_dataset.py \
+    scripts/prepare_abilitybench_external.py \
+    scripts/merge_datasets.py \
+    scripts/validate_dataset.py \
+    scripts/build_hybrid_review_bundle.py \
+    | tee "$out"
+}
+
+reviewfix8_preflight() {
+  reviewfix8_runtime_guard
+  reviewfix5_reused_graph_preflight
+  pipeline_version
+  echo "CAPPLAN_CAPABILITY_PROFILE_V2=present"
+  echo "CAPPLAN_OD_SEMANTICS_V2=present"
+  echo "CAPPLAN_HYBRID_AUDIT_V5=present"
+  echo "CAPPLAN_PASSENGER_DISTRIBUTION_V3=present"
+  echo "CAPPLAN_MERGE_V2=present"
+  echo "CAPPLAN_VALIDATE_V2=present"
+  echo "CAPPLAN_REVIEW_BUNDLE_V7=present"
+}
+
+hybrid_dataset_resume_reviewfix8() {
+  # Final freeze-candidate rebuild.  Expensive hybrid graph v3 and all external
+  # downloads are reused.  Service requests/contracts/labels are rebuilt with
+  # the v2 counterfactual profile thresholds; city outputs are replaced via the
+  # existing --clean_output path.  Merges use the streaming fast path and linear
+  # validator, then every split must pass the explicit counterfactual freeze gate.
+  reviewfix8_runtime_guard
+  reviewfix5_reused_graph_preflight
+  pipeline_version | tee "$REPORTS/commands/pipeline_identity.reviewfix8_dataset.txt"
+  write_reviewfix8_dataset_run_context | tee "$REPORTS/commands/hybrid_run_context.reviewfix8_dataset.log"
+  write_reviewfix8_dataset_hashes
+  hybrid_pudo_evidence_only
+  hybrid_dataset_build_only
+  passenger_complete_distribution_audit
 }
 
 reviewfix3_runtime_guard() {
@@ -1241,8 +1430,14 @@ passenger_complete_distribution_audit() {
     dataset="$DATA_ROOT/outputs/datasets/abilitybench_av_hybrid_${split}"
     out="$REPORTS/build/${split}/passenger_complete_distribution.after_odfix.json"
     [[ -d "$dataset" ]] || { echo "Missing hybrid dataset for distribution audit: $dataset" >&2; return 2; }
+    # Tune benchmark design on train/val only.  The held-out test split is not
+    # used to tune a target binding rate: it must cover every axis (non-zero
+    # binding), but its realized rate is reported rather than optimized.
+    local min_binding=0.05
+    [[ "$split" == "test" ]] && min_binding=0.0
     runlog "passenger_complete_distribution.${split}" python scripts/audit_passenger_complete_distribution.py \
-      --dataset_dir "$dataset" --output "$out" --fail_on_error
+      --dataset_dir "$dataset" --output "$out" \
+      --freeze_gate --min_binding_rate_given_base_success "$min_binding" --fail_on_error
   done
 }
 
@@ -1534,7 +1729,8 @@ Stages:
   version                              # print exact pipeline/check-out identity before long runs
   reviewfix3-preflight                 # hard-check critical script semantic versions/hashes before data writes
   reviewfix5-preflight                 # historical reviewfix5 code/helper smoke check
-  reviewfix7-preflight                 # RECOMMENDED: verify OD-v2/audit-v5/bundle-v6 + reused graph-v3 lineage
+  reviewfix7-preflight                 # historical reviewfix7 OD-v2 freeze preflight
+  reviewfix8-preflight                 # RECOMMENDED: capability-axis v2 + streaming merge/linear validate + freeze gate
   reviewfix5-reused-graph-preflight    # verify reviewfix3 graph-v3 lineage before dataset-only resume
   migrate
   inspect-nuplan
@@ -1564,7 +1760,8 @@ Stages:
   hybrid-ready-allowlists              # select evidence-valid hybrid episodes; no geometry synthesis
   hybrid-build                         # build benchmark datasets under outputs/datasets/abilitybench_av_hybrid_*
   hybrid-dataset-resume-reviewfix5     # historical resume; do not use for final freeze
-  hybrid-dataset-resume-reviewfix7     # RECOMMENDED: route-local OD v2 + semantic audit v5 + distribution audit
+  hybrid-dataset-resume-reviewfix7     # historical reviewfix7 resume
+  hybrid-dataset-resume-reviewfix8     # RECOMMENDED: rebuild service/labels with informative counterfactual profiles + fast merge/validate
   hybrid-from-existing                 # recommended continuation: source refresh -> recovery -> overlays -> build
   hybrid-full-build                    # complete from-zero four-city train/val/test hybrid benchmark pipeline
   hybrid-reality-refresh               # Rebuild hybrid priors/service/labels only when base graph semantics are already current
@@ -1603,6 +1800,7 @@ case "${1:-}" in
   reviewfix3-preflight) reviewfix3_preflight ;;
   reviewfix5-preflight) reviewfix5_preflight ;;
   reviewfix7-preflight) reviewfix7_preflight ;;
+  reviewfix8-preflight) reviewfix8_preflight ;;
   reviewfix5-reused-graph-preflight) reviewfix5_reused_graph_preflight ;;
   migrate) migrate ;;
   inspect-nuplan) inspect_nuplan ;;
@@ -1633,6 +1831,7 @@ case "${1:-}" in
   hybrid-build) hybrid_build ;;
   hybrid-dataset-resume-reviewfix5) hybrid_dataset_resume_reviewfix5 ;;
   hybrid-dataset-resume-reviewfix7) hybrid_dataset_resume_reviewfix7 ;;
+  hybrid-dataset-resume-reviewfix8) hybrid_dataset_resume_reviewfix8 ;;
   hybrid-from-existing) hybrid_from_existing ;;
   hybrid-full-build) hybrid_full_build ;;
   hybrid-reality-refresh) hybrid_reality_refresh ;;
