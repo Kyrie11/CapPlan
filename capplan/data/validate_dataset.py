@@ -145,6 +145,7 @@ def validate_dataset(
     # PUDO adjacency against the corresponding episode graph, while holding only
     # one episode's node IDs in memory at a time.
     pudo_ped_by_episode: Dict[str, list[tuple[str, str]]] = defaultdict(list)
+    pudo_missing_road_anchor = 0
     for p in pudos:
         eid = str(p.get("episode_id") or "")
         aid = str(p.get("anchor_id") or "")
@@ -153,8 +154,12 @@ def validate_dataset(
         ped = p.get("adjacent_ped_node_id")
         if ped:
             pudo_ped_by_episode[eid].append((aid, str(ped)))
-        if not p.get("roadblock_id") and strict:
-            warnings.append(f"PUDO {aid} lacks roadblock_id")
+        # Either a lane/connector or a roadblock is sufficient road-side
+        # anchoring metadata.  Do not allocate one warning string per PUDO; on
+        # the hybrid corpus that produced ~100k redundant warnings and needless
+        # memory/serialization overhead.
+        if strict and not (p.get("roadblock_id") or p.get("lane_id") or p.get("lane_connector_id")):
+            pudo_missing_road_anchor += 1
 
     graph_iter = tqdm(sorted(episode_ids), desc="validate graph membership", unit="episode", disable=not progress)
     for eid in graph_iter:
@@ -318,6 +323,9 @@ def validate_dataset(
                 if gid and (w.get("counterfactual_group_id") != gid or st.get("counterfactual_group_id") != gid):
                     errors.append(f"counterfactual pair group mismatch {pair.get('pair_id')}")
 
+    if pudo_missing_road_anchor:
+        warnings.append(f"PUDO road-side anchor metadata missing for {pudo_missing_road_anchor}/{len(pudos)} rows")
+
     result = {
         "ok": not errors,
         "valid": not errors,
@@ -330,6 +338,7 @@ def validate_dataset(
         "num_transitions": len(transitions),
         "num_passenger_edge_labels": pel_count,
         "num_resource_labels": resource_count,
+        "pudo_missing_road_anchor_count": int(pudo_missing_road_anchor),
         "expected_passenger_edge_labels": expected_edge_label_count,
         "graph_membership_check": "reused_upstream_validated_inputs" if skip_graph_membership else "deep_episode_scan",
     }

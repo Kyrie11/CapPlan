@@ -44,7 +44,7 @@ def encode_transition(t: CandidateTransition, vocab: FeatureVocab | None = None,
                 numeric_vals.append(float(ev.value))
         except Exception:
             pass
-    if feature_policy not in {"legacy", "paper_safe"}:
+    if feature_policy not in {"legacy", "paper_safe", "paper_safe_v2"}:
         raise ValueError(f"unknown CASA feature policy: {feature_policy}")
     # ``legacy`` retains the original smoke/CI feature vector.  It contains
     # several values that are also direct training targets (z_e, availability,
@@ -52,17 +52,24 @@ def encode_transition(t: CandidateTransition, vocab: FeatureVocab | None = None,
     # for publication claims.  ``paper_safe`` keeps the dimensionality stable
     # but masks those oracle/label-derived slots.  This prevents exact target
     # leakage while a richer graph/scene encoder is developed.
-    paper_safe = feature_policy == "paper_safe"
+    paper_safe = feature_policy in {"paper_safe", "paper_safe_v2"}
+    paper_safe_v2 = feature_policy == "paper_safe_v2"
     return [
         float(action_id),
         float(from_id),
-        -1.0 if paper_safe else float(to_id),
+        # ``to_phase`` is part of the candidate transition tuple e=(u,q,a,u',q')
+        # and is not an oracle target.  reviewfix8's paper_safe masked it, which
+        # made relation embeddings collapse to one destination-phase bucket.
+        # Preserve it in v2 while keeping the legacy policy stable.
+        float(to_id) if paper_safe_v2 else (-1.0 if paper_safe else float(to_id)),
         0.0 if paper_safe else float(t.availability),
         0.0 if paper_safe else float(t.map_confidence),
-        0.0 if paper_safe else float(t.cost),
+        # Transition service cost is known before the learned completion-value
+        # head and is safe structural/search context.
+        float(t.cost) if paper_safe_v2 else (0.0 if paper_safe else float(t.cost)),
         0.0 if paper_safe else float(t.completion_value),
         0.0 if paper_safe else (sum(numeric_vals) / len(numeric_vals) if numeric_vals else 0.0),
-        sum(confidences) / len(confidences) if confidences else 0.0,
+        0.0 if paper_safe_v2 else (sum(confidences) / len(confidences) if confidences else 0.0),
         missing,
         0.0 if paper_safe else (1.0 if t.tests.z_e else 0.0),
     ]

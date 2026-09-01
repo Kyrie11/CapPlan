@@ -22,7 +22,7 @@ from capplan.utils.serialization import iter_jsonl
 
 # Historical marker for reviewfix7 runtime-guard compatibility:
 # VERSION = "capplan_passenger_complete_distribution_audit_v2_20260830"
-VERSION = "capplan_passenger_complete_distribution_audit_v3_freezegate_20260831"
+VERSION = "capplan_passenger_complete_distribution_audit_v4_conditional_binding_20260901"
 
 
 def _rows(path: Path) -> Iterable[Dict[str, Any]]:
@@ -211,8 +211,14 @@ def audit(
     if total_monotonic:
         hard_errors.append(f"counterfactual_monotonic_violation:{total_monotonic}")
     for axis, s in axis_summary.items():
-        if s["pair_count"] and s["binding_rate_all_pairs"] < 0.01:
-            quality_flags.append(f"counterfactual_axis_nearly_inactive:{axis}")
+        # Informativeness is conditioned on episodes where the base passenger
+        # is feasible. With a ~5--8% base PCR, an all-pairs binding rate below
+        # 1% can still represent a healthy capability effect among evaluable
+        # base-success pairs.
+        conditional = float(s.get("binding_rate_given_base_success") or 0.0)
+        warn_floor = max(float(min_binding_rate_given_base_success), 0.02)
+        if s["pair_count"] and int(s.get("base_success_strict_fail") or 0) > 0 and conditional + 1e-12 < warn_floor:
+            quality_flags.append(f"counterfactual_axis_weak_conditional_binding:{axis}")
 
     if freeze_gate:
         base = profile_summary.get("basic_service_complete") or {}

@@ -73,16 +73,40 @@ class TypedSafeBudgetSearch:
         clauses = [] if (compiled.soft_only or self.config.soft_only_capability) else compiled.clauses
         groups = [] if (compiled.soft_only or self.config.soft_only_capability) else compiled.groups
         init_resources = {c.resource_name for c in clauses}
-        ledger = init_ledger(init_resources, self.registry)
-        start = SearchLabel(initial_anchor, initial_phase, ledger, 0.0, [], [])
-        pq: List[Tuple[float, int, SearchLabel]] = []
-        counter = itertools.count()
-        heapq.heappush(pq, (0.0, next(counter), start))
-        labels: List[SearchLabel] = [start]
-        violations: List[ViolationRecord] = []
         outgoing: Dict[Tuple[str, str], List[CandidateTransition]] = {}
         for e in transitions:
             outgoing.setdefault((e.from_anchor, e.from_phase), []).append(e)
+
+        # The dataset uses concrete entrance IDs, not the literal string
+        # ``origin``.  The offline oracle already derives these states from the
+        # access transitions; runtime TSBS must do the same or it can falsely
+        # fail before expanding the first edge.  A caller-provided entrance is
+        # preferred, with transition-derived states as a deterministic fallback.
+        requested_state = (str(initial_anchor), str(initial_phase))
+        origin_states = sorted({
+            (str(e.from_anchor), str(e.from_phase))
+            for e in transitions
+            if str(e.from_phase) == str(initial_phase) and str(e.action) == "access"
+        })
+        if requested_state in outgoing:
+            start_states = [requested_state]
+            initial_state_source = "caller_request_anchor"
+        elif origin_states:
+            start_states = origin_states
+            initial_state_source = "transition_access_origin_fallback"
+        else:
+            start_states = [requested_state]
+            initial_state_source = "literal_fallback"
+
+        pq: List[Tuple[float, int, SearchLabel]] = []
+        counter = itertools.count()
+        labels: List[SearchLabel] = []
+        for anchor, phase in start_states:
+            ledger = init_ledger(init_resources, self.registry)
+            start = SearchLabel(anchor, phase, ledger, 0.0, [], [])
+            labels.append(start)
+            heapq.heappush(pq, (0.0, next(counter), start))
+        violations: List[ViolationRecord] = []
 
         expansions = 0
         while pq and expansions < self.config.max_expansions:
@@ -98,7 +122,7 @@ class TypedSafeBudgetSearch:
                     steps=label.steps,
                     final_ledger=label.resource_ledger,
                     cost=label.cost,
-                ), None, {"expansions": expansions, "violations": len(violations)}
+                ), None, {"expansions": expansions, "violations": len(violations), "initial_states": start_states, "initial_state_source": initial_state_source}
 
             candidates = list(outgoing.get((label.anchor, label.phase), []))
             if not candidates:
@@ -121,7 +145,7 @@ class TypedSafeBudgetSearch:
                 heapq.heappush(pq, (self._priority(new_label, predictions.get(e.transition_id)), next(counter), new_label))
 
         cert = select_certificate(episode_id, compiled.passenger_id, violations)
-        return None, cert, {"expansions": expansions, "violations": len(violations), "frontier_exhausted": True}
+        return None, cert, {"expansions": expansions, "violations": len(violations), "frontier_exhausted": True, "initial_states": start_states, "initial_state_source": initial_state_source}
 
     def _try_expand(self, label: SearchLabel, e: CandidateTransition, compiled: CompiledContract, clauses: Sequence, groups: Sequence, pred: Optional[TransitionPrediction]):
         # 1. Legal lifecycle.

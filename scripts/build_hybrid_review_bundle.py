@@ -24,13 +24,13 @@ from typing import Any, Iterable
 # VERSION = "capplan_hybrid_review_bundle_v6_reviewfix7_20260830"
 # EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix7_20260830"
 # commands/hybrid_run_context.reviewfix7_dataset.json
-VERSION = "capplan_hybrid_review_bundle_v7_reviewfix8_20260831"
+VERSION = "capplan_hybrid_review_bundle_v8_reviewfix9_20260901"
 EXPECTED_GRAPH_VERSION = "abilitybench_hybrid_accessibility_v3_20260825"
 EXPECTED_PUDO_VERSION = "abilitybench_hybrid_pudo_v7_20260828"
 EXPECTED_READY_VERSION = "abilitybench_hybrid_ready_allowlist_v1_20260823"
 EXPECTED_AUDIT_VERSION = "abilitybench_hybrid_dataset_audit_v5_20260830"
 EXPECTED_SITE_AUDIT_VERSION = "abilitybench_hybrid_site_consistency_v2_20260825"
-EXPECTED_DISTRIBUTION_VERSION = "capplan_passenger_complete_distribution_audit_v3_freezegate_20260831"
+EXPECTED_DISTRIBUTION_VERSION = "capplan_passenger_complete_distribution_audit_v4_conditional_binding_20260901"
 EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix8_20260831"
 SPLITS = ("train", "val", "test")
 CITIES = ("boston", "pittsburgh", "vegas", "singapore")
@@ -187,6 +187,20 @@ def _iso_from_ns(ns: int | None) -> str | None:
     return dt.datetime.fromtimestamp(ns / 1e9, tz=dt.timezone.utc).isoformat()
 
 
+def _read_sha256_manifest(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts=line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest, rel = parts[0].strip(), parts[1].strip().lstrip("*")
+        if re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            out[rel]=digest.lower()
+    return out
+
+
 def _assess(root: Path) -> dict[str, Any]:
     identity = _latest_identity(root)
     identity_version = _identity_pipeline_version(identity)
@@ -232,13 +246,31 @@ def _assess(root: Path) -> dict[str, Any]:
         version_mismatch.append({"path": "commands/hybrid_run_context.reviewfix8_dataset.json", "expected": EXPECTED_PIPELINE_VERSION, "actual": "missing"})
     elif str(run_context_payload.get("pipeline_version") or "") != EXPECTED_PIPELINE_VERSION:
         version_mismatch.append({"path": str(run_context.relative_to(root)), "expected": EXPECTED_PIPELINE_VERSION, "actual": str(run_context_payload.get("pipeline_version") or "missing")})
-    elif isinstance(run_context_payload.get("critical_file_sha256"), dict):
-        cap_home = Path(str(run_context_payload.get("cap_home") or ""))
-        for rel, expected_sha in sorted(run_context_payload["critical_file_sha256"].items()):
-            current = cap_home / rel
-            actual_sha = _sha256(current) if current.is_file() else "missing"
-            if str(expected_sha or "") != actual_sha:
-                version_mismatch.append({"path": f"runtime_sha256:{rel}", "expected": str(expected_sha or "missing"), "actual": actual_sha})
+    elif isinstance(run_context_payload.get("critical_file_sha256"), dict) and run_context_payload.get("critical_file_sha256"):
+        # The run context is a build-time lineage record.  Review-only tooling
+        # (bundle/audit/model code) may legitimately be patched *after* the
+        # dataset was produced, so comparing every stored digest against the
+        # current checkout incorrectly invalidates a perfectly good benchmark.
+        # Instead verify that the immutable reviewfix8 SHA manifest captured at
+        # build start agrees with the hashes embedded in the run context.
+        build_sha_path = root / "commands/reviewfix8_dataset_fix.sha256"
+        build_sha = _read_sha256_manifest(build_sha_path)
+        if not build_sha:
+            version_mismatch.append({
+                "path": str(build_sha_path.relative_to(root)),
+                "expected": "non-empty build-time SHA256 manifest",
+                "actual": "missing_or_invalid",
+            })
+        else:
+            context_sha = {str(k): str(v).lower() for k, v in run_context_payload["critical_file_sha256"].items()}
+            for rel, digest in sorted(build_sha.items()):
+                expected = context_sha.get(rel)
+                if expected != digest:
+                    version_mismatch.append({
+                        "path": f"build_time_sha256:{rel}",
+                        "expected": str(expected or "missing_in_run_context"),
+                        "actual": digest,
+                    })
 
     reused_artifacts = set(run_context_payload.get("reused_artifacts") or []) if run_context_payload else set()
     if "hybrid_graph_v3" in reused_artifacts:

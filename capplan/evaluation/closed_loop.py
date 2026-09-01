@@ -1,6 +1,7 @@
 """Closed-loop / strict-mock evaluation over saved dataset artifacts."""
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -51,6 +52,8 @@ def result_to_episode_metrics(result, metadata: Dict[str, Any], contract, oracle
         "collision": bool(traj.get("collision", False)),
         "drivable_area": bool(traj.get("drivable_area", True)),
         "traffic_safe": traffic_safe,
+        "vehicle_metric_semantics": str(traj.get("vehicle_metric_semantics", "unknown")),
+        "method_specific_closed_loop": bool(traj.get("method_specific_closed_loop", False)),
         "completed_route_m": route_length * route_completion_value,
         "planned_route_m": route_length,
         "route_completion": route_completion_value,
@@ -60,6 +63,10 @@ def result_to_episode_metrics(result, metadata: Dict[str, Any], contract, oracle
         "vehicle_distance_m": float(traj.get("distance_m", route_length * route_completion_value)),
         "shortest_route_m": float(metadata.get("shortest_route_length_m", route_length)),
         "passenger_complete": passenger_complete,
+        "plan_returned": bool(skeleton),
+        "selected_transitions": list(skeleton.transitions) if skeleton else [],
+        "search_expansions": int(result.diagnostics.get("expansions", 0) or 0),
+        "search_violations": int(result.diagnostics.get("violations", 0) or 0),
         "phase_accepted": phase_accepted,
         "vehicle_safe": traffic_safe,
         "capability_satisfied": capability_satisfied,
@@ -70,15 +77,24 @@ def result_to_episode_metrics(result, metadata: Dict[str, Any], contract, oracle
         "motion_budget": motion_budget,
         "motion_violation": bool(margins) and any(margins.get(r, 1.0) < 0 for r in ["motion_exposure", "peak_accel_mps2", "peak_jerk_mps3"]),
         "budget_residuals": margins,
-        "inconclusive": (cert or {}).get("resource_type") in ["map_confidence", "dynamic_confidence", "blockage_risk", "availability_risk"],
+        "inconclusive": (cert or {}).get("resource_type") in ["map_confidence", "dynamic_confidence", "blockage_risk", "availability_risk", "availability", "deployment_risk"]
+            or str((cert or {}).get("reason") or "") in ["missing_evidence", "low_confidence", "inconclusive_low_confidence"],
         "certificate": cert,
         "oracle_certificate": oracle_certificate,
         "tt_cap_s": float(traj.get("travel_time_s", 0.0)),
-        "tt_std_s": max(1.0, float(metadata.get("route_length_m", 4000.0)) / 10.0),
+        # ECA requires a measured/evaluated standard-planner baseline.  Do not
+        # synthesize it from route_length/speed because that makes publication
+        # ECA look measured when it is not.
+        **({"tt_std_s": float(metadata.get("standard_travel_time_s"))} if metadata.get("standard_travel_time_s") is not None else {}),
         "failed_resources": failed,
         "failure_phase": (cert or oracle_certificate or {}).get("phase"),
         "failure_resource": (cert or oracle_certificate or {}).get("resource_type"),
         "failure_source": (cert or oracle_certificate or {}).get("evidence_source"),
+        **{k: traj[k] for k in [
+            "at_fault_collision_rate", "drivable_area_compliance", "ego_progress_along_expert_route",
+            "time_to_collision_within_bound", "speed_limit_compliance", "driving_direction_compliance",
+            "comfort", "nuplan_score"
+        ] if k in traj},
     }
 
 
@@ -156,46 +172,109 @@ class ClosedLoopRunner:
                 trip_context = {**trip_context_base, "service_request": request, "request_time_s": request.get("request_time_s", trip_context_base.get("request_time_s")), "origin_entrance_id": request.get("origin_entrance_id", trip_context_base.get("origin_entrance_id")), "destination_entrance_id": request.get("destination_entrance_id", trip_context_base.get("destination_entrance_id"))}
                 if eid in data.get("vehicle_metrics", {}):
                     trip_context["nuplan_vehicle_metrics"] = data["vehicle_metrics"][eid]
+                plan_t0 = time.perf_counter()
                 result = self.planner.plan(eid, contract, graph, pudo, vehicle, transitions=transitions, trip_context=trip_context)
+                planning_latency_ms = (time.perf_counter() - plan_t0) * 1000.0
                 oracle_cert = data["oracle_certs"].get((eid, contract.passenger_id))
                 row = result_to_episode_metrics(result, trip_context, contract, oracle_cert)
+                row["planning_latency_ms"] = float(planning_latency_ms)
                 metrics_rows.append(row)
                 result_lookup[(eid, contract.passenger_id)] = row
                 plans.append({"episode_id": eid, "passenger_id": contract.passenger_id, "success": result.success, "skeleton": to_dict(result.skeleton) if result.skeleton else None, "certificate": to_dict(result.certificate) if result.certificate else None})
-        pair_rows = self._evaluate_counterfactual_pairs(data["counterfactual_pairs"], result_lookup)
+        pair_rows = self._evaluate_counterfactual_pairs(
+            data["counterfactual_pairs"], result_lookup, data["skeletons"], data["oracle_certs"]
+        )
         write_jsonl(output_dir / "episode_metrics.jsonl", metrics_rows)
         write_jsonl(output_dir / "plans.jsonl", plans)
         write_jsonl(output_dir / "counterfactual_metrics.jsonl", pair_rows)
+        axis_summary: Dict[str, Dict[str, Any]] = {}
+        for row in pair_rows:
+            axis = str(row.get("counterfactual_axis") or row.get("axis") or "unknown")
+            rec = axis_summary.setdefault(axis, {"count": 0, "response_correct": 0, "oracle_changed": 0, "model_changed": 0})
+            rec["count"] += 1
+            rec["response_correct"] += int(bool(row.get("response_correct")))
+            rec["oracle_changed"] += int(bool(row.get("oracle_changed")))
+            rec["model_changed"] += int(bool(row.get("model_changed")))
+        for rec in axis_summary.values():
+            n = max(int(rec["count"]), 1)
+            rec["CRsp"] = float(rec["response_correct"]) / n
+            rec["oracle_change_rate"] = float(rec["oracle_changed"]) / n
+            rec["model_change_rate"] = float(rec["model_changed"]) / n
+        dump_json(output_dir / "counterfactual_axis_summary.json", axis_summary)
         aggregate = compute_all_metrics(metrics_rows, pair_rows)
         dump_json(output_dir / "metrics.json", aggregate)
-        return {"episodes": metrics_rows, "metrics": aggregate, "plans": plans, "counterfactual_pairs": pair_rows}
+        vehicle_semantics = sorted({str(r.get("vehicle_metric_semantics") or "unknown") for r in metrics_rows})
+        integrated_ready = bool(metrics_rows) and all(bool(r.get("method_specific_closed_loop")) for r in metrics_rows)
+        eval_semantics = {
+            "vehicle_metric_semantics": vehicle_semantics,
+            "publication_integrated_vehicle_closed_loop_ready": integrated_ready,
+            "passenger_service_metrics_available": bool(metrics_rows),
+            "note": (
+                "Passenger/service metrics can be used for offline/service evaluation. Final vehicle closed-loop claims require "
+                "method-specific nuPlan simulation of CapPlan-selected service decisions; post-hoc episode metrics and mock_strict are not sufficient."
+            ),
+        }
+        dump_json(output_dir / "evaluation_semantics.json", eval_semantics)
+        return {"episodes": metrics_rows, "metrics": aggregate, "plans": plans, "counterfactual_pairs": pair_rows, "evaluation_semantics": eval_semantics}
 
     @staticmethod
-    def _evaluate_counterfactual_pairs(pairs: List[Dict[str, Any]], result_lookup: Dict[Tuple[str, str], Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _evaluate_counterfactual_pairs(
+        pairs: List[Dict[str, Any]],
+        result_lookup: Dict[Tuple[str, str], Dict[str, Any]],
+        oracle_skeletons: Dict[Tuple[str, str], Dict[str, Any]],
+        oracle_certs: Dict[Tuple[str, str], Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Compare model counterfactual behavior with offline-verifier behavior.
+
+        A pair is responsive only when the model changes (or preserves) its
+        success/path/certificate in the same way as the verifier.  Merely having
+        a smaller strict margin is not counted as a plan change.
+        """
+        def oracle_signature(eid: str, pid: str):
+            sk = oracle_skeletons.get((eid, pid))
+            if sk:
+                return ("success", tuple(sk.get("transitions") or []))
+            c = oracle_certs.get((eid, pid)) or {}
+            return ("fail", c.get("phase"), c.get("transition_id"), c.get("resource_type"), c.get("reason"))
+
+        def model_signature(row: Dict[str, Any] | None):
+            if not row:
+                return ("missing",)
+            if row.get("passenger_complete"):
+                return ("success", tuple(row.get("selected_transitions") or []))
+            c = row.get("certificate") or {}
+            return ("fail", c.get("phase"), c.get("transition_id"), c.get("resource_type"), c.get("reason"))
+
         rows = []
         for pair in pairs:
-            eid = pair.get("episode_id")
-            weak = result_lookup.get((eid, pair.get("weak_passenger_id")))
-            strict = result_lookup.get((eid, pair.get("strict_passenger_id")))
-            responsive = False
-            if weak and strict:
-                if weak.get("passenger_complete") and not strict.get("passenger_complete"):
-                    responsive = True
-                elif weak.get("passenger_complete") and strict.get("passenger_complete"):
-                    wm = min((weak.get("capability_margins") or {"m": 0}).values())
-                    sm = min((strict.get("capability_margins") or {"m": 0}).values())
-                    responsive = sm <= wm + 1e-9
-                elif not weak.get("passenger_complete") and not strict.get("passenger_complete"):
-                    wc = weak.get("oracle_certificate") or weak.get("certificate") or {}
-                    sc = strict.get("oracle_certificate") or strict.get("certificate") or {}
-                    same_failure = all(sc.get(k) == wc.get(k) for k in ["phase", "transition_id", "resource_type", "reason"])
-                    margin_drop = float(sc.get("signed_margin", 0.0)) < float(wc.get("signed_margin", 0.0)) - 1e-9
-                    certificate_changed = any(sc.get(k) != wc.get(k) for k in ["phase", "transition_id", "resource_type", "reason"])
-                    # Identical failure certificates are not capability-responsive;
-                    # they usually mean the scene/evidence is already impossible
-                    # before the stricter contract matters.
-                    responsive = (margin_drop or certificate_changed) and not same_failure
-                else:
-                    responsive = pair.get("relation") != "stricter_or_equal"
-            rows.append({**pair, "responsive": bool(responsive)})
+            eid = str(pair.get("episode_id") or "")
+            weak_pid = str(pair.get("weak_passenger_id") or "")
+            strict_pid = str(pair.get("strict_passenger_id") or "")
+            weak = result_lookup.get((eid, weak_pid))
+            strict = result_lookup.get((eid, strict_pid))
+            ow = oracle_signature(eid, weak_pid)
+            os = oracle_signature(eid, strict_pid)
+            mw = model_signature(weak)
+            ms = model_signature(strict)
+            oracle_changed = ow != os
+            model_changed = mw != ms
+            oracle_weak_success = ow[0] == "success"
+            oracle_strict_success = os[0] == "success"
+            model_weak_success = bool(weak and weak.get("passenger_complete"))
+            model_strict_success = bool(strict and strict.get("passenger_complete"))
+            outcomes_match = (model_weak_success == oracle_weak_success and model_strict_success == oracle_strict_success)
+            response_correct = bool(outcomes_match and model_changed == oracle_changed)
+            rows.append({
+                **pair,
+                "oracle_changed": bool(oracle_changed),
+                "model_changed": bool(model_changed),
+                "oracle_weak_success": oracle_weak_success,
+                "oracle_strict_success": oracle_strict_success,
+                "model_weak_success": model_weak_success,
+                "model_strict_success": model_strict_success,
+                "outcomes_match_oracle": bool(outcomes_match),
+                "response_correct": response_correct,
+                "responsive": response_correct,
+            })
         return rows
+

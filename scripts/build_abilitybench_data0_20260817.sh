@@ -493,7 +493,7 @@ checks={
   "scripts/build_hybrid_review_bundle.py": [
     'VERSION = "capplan_hybrid_review_bundle_v7_reviewfix8_20260831"',
     'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix8_20260831"',
-    'EXPECTED_DISTRIBUTION_VERSION = "capplan_passenger_complete_distribution_audit_v3_freezegate_20260831"',
+    'EXPECTED_DISTRIBUTION_VERSION = "capplan_passenger_complete_distribution_audit_v4_conditional_binding_20260901"',
   ],
 }
 errors=[]
@@ -1186,8 +1186,113 @@ audit_review_bundle() {
     --output_zip "$REPORTS/capplan_audit_review_bundle.zip"
 }
 
+reviewfix9_review_guard() {
+  # Post-build review/freeze guard.  The dataset was produced by the frozen
+  # reviewfix8 lineage; review-only tooling may be patched afterwards without
+  # invalidating the build-time hashes stored in its run context.
+  python - "$CAP_HOME" <<'PYGUARD9'
+from pathlib import Path
+import hashlib, sys
+root=Path(sys.argv[1]).resolve()
+checks={
+  "scripts/build_hybrid_review_bundle.py": [
+    'VERSION = "capplan_hybrid_review_bundle_v8_reviewfix9_20260901"',
+    'EXPECTED_PIPELINE_VERSION = "abilitybench_data0_passenger_complete_reviewfix8_20260831"',
+    'EXPECTED_DISTRIBUTION_VERSION = "capplan_passenger_complete_distribution_audit_v4_conditional_binding_20260901"',
+  ],
+  "scripts/audit_dataset_quality.py": [
+    'VERSION = "capplan_dataset_quality_audit_v2_hybrid_semantics_20260901"',
+    'hybrid_sparse_passenger_edges',
+  ],
+  "capplan/planning/typed_safe_budget_search.py": [
+    'origin_states = sorted({',
+    'initial_state_source',
+  ],
+  "capplan/planning/planner.py": [
+    'origin_entrance_id',
+    'initial_anchor=initial_anchor',
+  ],
+  "scripts/train_casa.py": [
+    'paper_safe_v2',
+    'relation_categorical_slots_unnormalized',
+    'edge_auprc',
+    'demand_scale_vector',
+    'F.smooth_l1_loss',
+  ],
+  "capplan/models/casa_dataset.py": [
+    'DEMAND_NORMALIZERS',
+    'kind == "categorical"',
+  ],
+  "capplan/evaluation/closed_loop.py": [
+    'response_correct',
+    'selected_transitions',
+    'search_expansions',
+  ],
+}
+errors=[]
+for rel, markers in checks.items():
+    path=root/rel
+    if not path.is_file():
+        errors.append(f"missing:{rel}"); continue
+    text=path.read_text(encoding="utf-8", errors="replace")
+    for marker in markers:
+        if marker not in text: errors.append(f"marker_missing:{rel}:{marker}")
+    print(f"CAPPLAN_REVIEWFIX9_FILE_SHA256[{rel}]={hashlib.sha256(path.read_bytes()).hexdigest()}")
+if errors:
+    print("CAPPLAN_REVIEWFIX9_REVIEW_GUARD=FAIL", file=sys.stderr)
+    for error in errors: print(error, file=sys.stderr)
+    raise SystemExit(2)
+print("CAPPLAN_REVIEWFIX9_REVIEW_GUARD=PASS")
+PYGUARD9
+}
+
+reviewfix9_preflight() {
+  # Zero-write preflight for post-build freeze/model fixes.  It intentionally
+  # accepts the reviewfix8 dataset lineage and verifies only reviewfix9 tooling
+  # plus the expensive graph artifacts we plan to reuse.
+  reviewfix9_review_guard
+  reviewfix5_reused_graph_preflight
+  for split in train val test; do
+    local dataset="$DATA_ROOT/outputs/datasets/abilitybench_av_hybrid_${split}"
+    [[ -d "$dataset" ]] || { echo "Missing merged reviewfix8 dataset: $dataset" >&2; return 2; }
+  done
+  echo "CAPPLAN_REVIEWFIX9_PREFLIGHT=PASS"
+}
+
+hybrid_freeze_audit_reviewfix9() {
+  # Audit-only path for an already materialized reviewfix8 benchmark.  It does
+  # not rebuild PUDO, service, labels, graphs, or datasets.
+  reviewfix9_review_guard
+  reviewfix5_reused_graph_preflight
+  local split city dataset out
+  for split in train val test; do
+    for city in boston pittsburgh vegas singapore; do
+      dataset="$DATA_ROOT/outputs/datasets/abilitybench_av_hybrid_${split}_${city}"
+      [[ -d "$dataset" ]] || { echo "Missing frozen city dataset: $dataset" >&2; return 2; }
+      runlog "freeze_quality.${split}.${city}" python scripts/audit_dataset_quality.py \
+        --dataset_dir "$dataset" \
+        --output "$REPORTS/build/${split}/dataset_quality.${city}.json"
+    done
+    dataset="$DATA_ROOT/outputs/datasets/abilitybench_av_hybrid_${split}"
+    [[ -d "$dataset" ]] || { echo "Missing frozen merged dataset: $dataset" >&2; return 2; }
+    runlog "freeze_validate.${split}" python scripts/validate_dataset.py \
+      --dataset_dir "$dataset" --strict
+    runlog "freeze_hybrid_audit.${split}" python scripts/audit_hybrid_benchmark.py \
+      --dataset_dir "$dataset" --expected_requests_per_episode 8 \
+      --max_route_anchor_distance_m "${CAP_MAX_ROUTE_ANCHOR_DISTANCE_M:-250}" \
+      --output "$REPORTS/build/${split}/hybrid_dataset_audit.merged.json" --fail_on_error
+    local min_binding=0.05
+    [[ "$split" == "test" ]] && min_binding=0.0
+    runlog "freeze_distribution.${split}" python scripts/audit_passenger_complete_distribution.py \
+      --dataset_dir "$dataset" \
+      --output "$REPORTS/build/${split}/passenger_complete_distribution.after_odfix.json" \
+      --freeze_gate --min_binding_rate_given_base_success "$min_binding" --fail_on_error
+  done
+  echo "CAPPLAN_HYBRID_FREEZE_AUDIT=PASS"
+}
+
 hybrid_review_bundle() {
-  reviewfix7_runtime_guard
+  reviewfix9_review_guard
   # The review bundle is also the final freeze-readiness gate.  Even on an
   # incomplete/failed run the Python packager writes a diagnostic ZIP first,
   # then exits non-zero so stale historical artifacts cannot masquerade as PASS.
@@ -1772,6 +1877,8 @@ Stages:
   hybrid-realism-resume-reviewfix3     # RECOMMENDED: runtime-guarded PUDO v5 + graph v3 + final dataset/audits
   render-audit-packets                # visual rows, or evidence-gap diagnostic packets when visual bucket is empty
   audit-review-bundle                 # small PUDO audit ZIP under reports/ (no NPZ/full dataset)
+  reviewfix9-preflight                 # zero-write post-build guard over reviewfix8 lineage + current review/model tooling
+  hybrid-freeze-audit-reviewfix9      # report-only freeze audit over existing reviewfix8 datasets (no rebuild)
   hybrid-review-bundle                # compact hybrid rebuild/dataset reports ZIP for remote review
   review-source-complete-audits
   import-source-complete-audits
@@ -1801,6 +1908,7 @@ case "${1:-}" in
   reviewfix5-preflight) reviewfix5_preflight ;;
   reviewfix7-preflight) reviewfix7_preflight ;;
   reviewfix8-preflight) reviewfix8_preflight ;;
+  reviewfix9-preflight) reviewfix9_preflight ;;
   reviewfix5-reused-graph-preflight) reviewfix5_reused_graph_preflight ;;
   migrate) migrate ;;
   inspect-nuplan) inspect_nuplan ;;
@@ -1842,6 +1950,7 @@ case "${1:-}" in
   hybrid-realism-resume-reviewfix3) hybrid_realism_resume_reviewfix3 ;;
   render-audit-packets) render_audit_packets ;;
   audit-review-bundle) audit_review_bundle ;;
+  hybrid-freeze-audit-reviewfix9) hybrid_freeze_audit_reviewfix9 ;;
   hybrid-review-bundle) hybrid_review_bundle ;;
   review-source-complete-audits) review_source_complete_audits ;;
   import-source-complete-audits) import_source_complete_audits ;;

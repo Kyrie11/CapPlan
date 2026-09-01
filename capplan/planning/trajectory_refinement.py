@@ -81,6 +81,8 @@ def _normalise_external_vehicle_metrics(metrics: Dict[str, Any], route_length_m:
         "available": True,
         "vehicle_evaluated": True,
         "external_nuplan_metrics": True,
+        "vehicle_metric_semantics": "integrated_method_specific_nuplan" if bool(metrics.get("capplan_method_specific_closed_loop", False)) else "posthoc_episode_level_nuplan",
+        "method_specific_closed_loop": bool(metrics.get("capplan_method_specific_closed_loop", False)),
         "points": metrics.get("trajectory_points", []),
         "collision": collision,
         "drivable_area": drivable_area,
@@ -94,6 +96,27 @@ def _normalise_external_vehicle_metrics(metrics: Dict[str, Any], route_length_m:
     for k in ["motion_exposure", "peak_accel_mps2", "peak_jerk_mps3"]:
         if k in metrics:
             out[k] = float(metrics[k])
+    # Preserve common nuPlan scenario-level closed-loop metrics when the external
+    # runner provides them.  They remain post-hoc evidence until an integrated
+    # CapPlan nuPlan planner executes selected PUDO/trajectory decisions.
+    aliases = {
+        "at_fault_collision_rate": ["at_fault_collision_rate"],
+        "drivable_area_compliance": ["drivable_area_compliance", "drivable_area_compliance_score"],
+        "ego_progress_along_expert_route": ["ego_progress_along_expert_route", "ego_progress_along_expert_route_score"],
+        "time_to_collision_within_bound": ["time_to_collision_within_bound", "time_to_collision_within_bound_score"],
+        "speed_limit_compliance": ["speed_limit_compliance", "speed_limit_compliance_score"],
+        "driving_direction_compliance": ["driving_direction_compliance", "driving_direction_compliance_score"],
+        "comfort": ["comfort", "ego_is_comfortable", "comfort_score"],
+        "nuplan_score": ["nuplan_score", "score", "overall_score"],
+    }
+    for out_key, keys in aliases.items():
+        for key in keys:
+            if key in metrics and metrics[key] is not None:
+                try:
+                    out[out_key] = float(metrics[key])
+                except Exception:
+                    out[out_key] = metrics[key]
+                break
     return out
 
 
@@ -120,6 +143,8 @@ def refine_trajectory(skeleton: PassengerCompleteSkeleton | None, route_length_m
         return {
             "available": False,
             "vehicle_evaluated": True,
+            "vehicle_metric_semantics": "mock_strict",
+            "method_specific_closed_loop": False,
             "points": [],
             "collision": bool(scene_context.get("collision", False)),
             "drivable_area": bool(scene_context.get("drivable_area", True)),
@@ -146,6 +171,8 @@ def refine_trajectory(skeleton: PassengerCompleteSkeleton | None, route_length_m
     return {
         "available": True,
         "vehicle_evaluated": True,
+        "vehicle_metric_semantics": "mock_strict",
+        "method_specific_closed_loop": False,
         "points": points,
         "collision": collision,
         "drivable_area": drivable_area,

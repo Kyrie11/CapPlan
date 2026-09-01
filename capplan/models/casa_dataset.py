@@ -15,6 +15,48 @@ from capplan.semantics.capability_compiler import CapabilityCompiler
 from capplan.utils.serialization import read_jsonl
 
 
+# Resource-specific normalizers used by the paper-facing typed-demand loss.
+# Values are representative service scales (not feasibility thresholds): they
+# put metres, seconds, ratios, acceleration and probabilities on comparable
+# optimization scales while keeping model outputs in the original physical
+# units consumed by TSBS.
+DEMAND_NORMALIZERS: Dict[str, float] = {
+    "access_distance_m": 100.0,
+    "egress_distance_m": 100.0,
+    "crossing_count": 1.0,
+    "wait_exposure_s": 300.0,
+    "motion_exposure": 1.0,
+    "ride_time_s": 600.0,
+    "dwell_time_s": 60.0,
+    "slope": 0.10,
+    "cross_slope": 0.05,
+    "curb_height_m": 0.10,
+    "peak_accel_mps2": 2.0,
+    "peak_jerk_mps3": 3.0,
+    "path_width_m": 1.0,
+    "door_width_m": 1.0,
+    "door_side_clearance_m": 1.0,
+    "deployment_clearance_m": 1.0,
+    "ramp_clearance_m": 1.0,
+    "map_confidence": 1.0,
+    "dynamic_confidence": 1.0,
+    "blockage_risk": 1.0,
+    "deployment_risk": 1.0,
+    "availability_risk": 1.0,
+}
+
+
+def demand_scale_vector(resources: List[str]) -> List[float]:
+    """Return stable per-resource scales for normalized Huber/calibration losses.
+
+    Categorical resources are not numerical demand-regression targets. They
+    remain represented through capability/interface predicates and edge labels.
+    Unknown future numeric resources default to unit scale rather than silently
+    introducing a zero divisor.
+    """
+    return [max(float(DEMAND_NORMALIZERS.get(str(name), 1.0)), 1e-6) for name in resources]
+
+
 @dataclass
 class CASASample:
     transition_id: str
@@ -55,7 +97,7 @@ class CASADataset:
         self.feature_policy = feature_policy
         if value_target not in {"skeleton", "offline_tsbs", "rollout", "legacy"}:
             raise ValueError(f"unknown CASA completion-value target: {value_target}")
-        if feature_policy not in {"legacy", "paper_safe"}:
+        if feature_policy not in {"legacy", "paper_safe", "paper_safe_v2"}:
             raise ValueError(f"unknown CASA feature policy: {feature_policy}")
         self.split_file = self.dataset_dir / "splits" / f"{split}_episodes.txt"
         split_ids = self._read_split(split)
@@ -70,7 +112,7 @@ class CASADataset:
                 if key in passenger_labels:
                     raise RuntimeError(f"duplicate passenger edge label for {key} in {passenger_path}")
                 passenger_labels[key] = row
-        elif self.feature_policy == "paper_safe":
+        elif self.feature_policy in {"paper_safe", "paper_safe_v2"}:
             raise RuntimeError(f"paper_safe CASA loading requires passenger-specific labels: {passenger_path}")
         contracts_by_episode: Dict[str, List] = {}
         contracts_path = self.dataset_dir / "capability_contracts.jsonl"
@@ -94,7 +136,7 @@ class CASADataset:
                 continue
             contracts = contracts_by_episode.get(t.episode_id, [])
             if not contracts:
-                if self.feature_policy == "paper_safe":
+                if self.feature_policy in {"paper_safe", "paper_safe_v2"}:
                     raise RuntimeError(
                         f"paper_safe CASA loading found transition {t.transition_id} in episode {t.episode_id} "
                         "without any passenger capability contract"
@@ -122,7 +164,7 @@ class CASADataset:
                 if plab is not None:
                     y_edge = 1.0 if plab.get("y_e_p") else 0.0
                 else:
-                    if self.feature_policy == "paper_safe":
+                    if self.feature_policy in {"paper_safe", "paper_safe_v2"}:
                         raise RuntimeError(
                             "paper_safe CASA loading requires a passenger-conditioned edge label for every "
                             f"(transition, passenger) pair; missing {(t.transition_id, contract.passenger_id)}"
@@ -205,16 +247,24 @@ class CASADataset:
     def _demand_target(self, t) -> Tuple[List[float], List[float]]:
         values = [0.0 for _ in self.vocab.resources]
         masks = [0.0 for _ in self.vocab.resources]
+        resource_index = {name: i for i, name in enumerate(self.vocab.resources)}
         for ev in t.resource_evidence:
-            if ev.resource_name not in self.vocab.resources or ev.missing or ev.value is None:
+            if ev.resource_name not in resource_index or ev.missing or ev.value is None:
                 continue
-            idx = self.vocab.resources.index(ev.resource_name)
+            # Paper typed-demand regression is numerical. Boolean/category
+            # compatibility is a symbolic/interface predicate and must not be
+            # coerced into a pseudo-continuous 0/1 regression target.
+            if DEFAULT_REGISTRY.has(ev.resource_name) and DEFAULT_REGISTRY.get(ev.resource_name).kind == "categorical":
+                continue
+            idx = resource_index[ev.resource_name]
             try:
-                values[idx] = float(ev.value) if not isinstance(ev.value, bool) else float(bool(ev.value))
-                masks[idx] = 1.0
+                value = float(ev.value)
             except Exception:
-                # Categorical string demand is supervised through edge/interface labels.
                 continue
+            if not np.isfinite(value):
+                continue
+            values[idx] = value
+            masks[idx] = 1.0
         return values, masks
 
     def arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

@@ -63,7 +63,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
         self.weights = weights if isinstance(weights, dict) else {}
         cfg = self.checkpoint.get("config", {}) if isinstance(self.checkpoint, dict) else {}
         self.feature_policy = str(cfg.get("feature_policy", "legacy")) if isinstance(cfg, dict) else "legacy"
-        if self.feature_policy not in {"legacy", "paper_safe"}:
+        if self.feature_policy not in {"legacy", "paper_safe", "paper_safe_v2"}:
             self.feature_policy = "legacy"
         self._torch_model = None
         if isinstance(self.checkpoint, dict) and self.checkpoint.get("torch_state_dict") is not None:
@@ -182,6 +182,10 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                 uncertainty=unc_pred or uncert,
                 dynamic_availability=availability,
                 completion_value=value,
+                # The current relation-MLP checkpoint does not implement the
+                # paper's runtime service-phase recognizer. Keep a local
+                # transition prior rather than mislabeling the auxiliary phase
+                # head as a global phase belief.
                 phase_belief={e.from_phase: 0.4, e.to_phase: 0.6},
             )
         return out

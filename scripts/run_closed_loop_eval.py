@@ -11,8 +11,11 @@ from pathlib import Path
 from capplan.evaluation.ablations import ABLATION_FLAGS, ablation_config
 from capplan.evaluation.closed_loop import ClosedLoopRunner
 from capplan.planning.planner import PlannerConfig
-from capplan.utils.serialization import dump_json, load_json
+from capplan.utils.serialization import dump_json, load_json, read_jsonl
 from scripts.import_nuplan_vehicle_metrics import import_metrics
+
+# Publication guard: this wrapper does not run a method-specific integrated nuPlan simulation;
+# final paper vehicle metrics must come from an external/integrated runner and be explicitly tagged.
 
 
 def _fail_paper_if_mock(args: argparse.Namespace) -> None:
@@ -27,12 +30,14 @@ def _fail_paper_if_mock(args: argparse.Namespace) -> None:
                 "with --import_nuplan_metrics_from (or materialize dataset_dir/nuplan_vehicle_metrics.jsonl). "
                 "--nuplan_sim_config is metadata only and is not sufficient."
             )
-        if not args.allow_posthoc_episode_vehicle_metrics:
+        rows = read_jsonl(metrics_path)
+        integrated = bool(rows) and all(bool(r.get("capplan_method_specific_closed_loop", False)) for r in rows)
+        if not integrated:
             raise RuntimeError(
-                "the current CapPlan evaluator couples imported episode-level nuPlan metrics to passenger/service plans; "
-                "it does not run a method-specific integrated nuPlan simulation for every selected PUDO/trajectory. "
-                "This is suitable for post-hoc development analysis, not a final paper closed-loop claim. "
-                "Pass --allow_posthoc_episode_vehicle_metrics only when explicitly reporting that limitation."
+                "paper_mode requires method-specific integrated nuPlan closed-loop metrics tagged "
+                "capplan_method_specific_closed_loop=true for every imported episode. The current episode-level post-hoc metrics "
+                "are valid for development/TSPIR analysis but cannot support the paper's final vehicle closed-loop claim. "
+                "Run without --paper_mode for explicitly labeled post-hoc analysis."
             )
     if args.paper_mode and args.casa_mode != "learned":
         raise RuntimeError("paper_mode closed-loop evaluation requires --casa_mode learned with a trained CASA checkpoint")
@@ -67,7 +72,7 @@ def main() -> None:
     p.add_argument("--casa_checkpoint", default=None, help="Checkpoint produced by scripts.train_casa; required for a meaningful learned CASA run.")
     p.add_argument("--paper_mode", action="store_true", help="Fail if the run would use smoke/mock/proxy components.")
     p.add_argument("--nuplan_sim_config", default=None, help="Optional provenance path for the external nuPlan simulation configuration. This wrapper does not execute Hydra itself.")
-    p.add_argument("--allow_posthoc_episode_vehicle_metrics", action="store_true", help="Explicitly allow paper_mode to use imported episode-level nuPlan metrics as post-hoc vehicle evidence. This is not method-specific integrated closed-loop simulation.")
+    p.add_argument("--allow_posthoc_episode_vehicle_metrics", action="store_true", help="Deprecated compatibility flag. Post-hoc episode vehicle metrics are development-only and no longer override the paper_mode integrated-simulation guard.")
     p.add_argument("--vehicle_metrics", default=None, help="Optional output JSON path for vehicle-only metrics copied from aggregate metrics.")
     p.add_argument("--passenger_metrics", default=None, help="Optional output JSON path for passenger-complete metrics copied from aggregate metrics.")
     p.add_argument("--import_nuplan_metrics_from", default=None, help="Optional nuPlan metrics file/dir to import into dataset_dir/nuplan_vehicle_metrics.jsonl before evaluation.")
@@ -91,10 +96,18 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     dump_json(out_dir / "run_config.json", {**vars(args), "planner_config": cfg.__dict__})
     if args.vehicle_metrics:
-        vehicle_subset = {k: metrics.get(k) for k in ["CR", "RC", "TRV", "TT", "DR"] if k in metrics}
+        vehicle_keys = ["CR", "RC", "TRV", "TT", "DR"] + sorted(k for k in metrics if k.startswith("nuplan::"))
+        vehicle_subset = {k: metrics.get(k) for k in vehicle_keys if k in metrics}
         dump_json(args.vehicle_metrics, vehicle_subset)
     if args.passenger_metrics:
-        passenger_subset = {k: metrics.get(k) for k in ["PCR", "TSPIR", "PAR", "CVR", "FLF", "BAF", "MER", "MVR", "SBR", "IR", "DF", "SME", "CRsp", "ECA"] if k in metrics}
+        passenger_keys = [
+            "PCR", "TSPIR", "PAR", "CVR", "CVR_all_evaluated", "CSM", "FLF", "BAF",
+            "MER", "MVR", "SBR", "IR", "DF", "DF_phase_accuracy", "DF_resource_macro_f1",
+            "DF_source_macro_f1", "SME", "CRsp", "ECA", "ECA_evaluable_count",
+            "TSBS_expansions_mean", "TSBS_expansions_p95", "PlannerLatency_ms_mean", "PlannerLatency_ms_p95",
+        ]
+        passenger_keys += [k for k in metrics if k.startswith("CRsp_axis::")]
+        passenger_subset = {k: metrics.get(k) for k in passenger_keys if k in metrics}
         dump_json(args.passenger_metrics, passenger_subset)
     print(metrics)
 

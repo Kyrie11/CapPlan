@@ -63,8 +63,23 @@ class CapPlanPlanner:
     ) -> PlannerResult:
         trip_context = trip_context or {}
         compiled = self.compiler.compile(contract, trip_context=trip_context)
+        service_request = trip_context.get("service_request") if isinstance(trip_context.get("service_request"), dict) else {}
+        initial_anchor = str(
+            trip_context.get("origin_entrance_id")
+            or service_request.get("origin_entrance_id")
+            or "origin"
+        )
+        destination_anchor = str(
+            trip_context.get("destination_entrance_id")
+            or service_request.get("destination_entrance_id")
+            or "destination"
+        )
         if transitions is None:
-            transitions = self.generator.generate(episode_id, graph, pudo_anchors, vehicle, scene_context=trip_context)
+            transitions = self.generator.generate(
+                episode_id, graph, pudo_anchors, vehicle,
+                origin_anchor=initial_anchor, destination_anchor=destination_anchor,
+                scene_context=trip_context,
+            )
         casa_out = self.casa(CASAInput(
             service_graph={"episode_id": episode_id, "n_anchors": len(pudo_anchors)},
             active_capability_tokens=compiled.tokens,
@@ -72,7 +87,10 @@ class CapPlanPlanner:
             ego_agent_map_features=trip_context,
             transitions=transitions,
         ))
-        skeleton, cert, diag = self.searcher.search(episode_id, compiled, transitions, casa_out.transition_predictions)
+        skeleton, cert, diag = self.searcher.search(
+            episode_id, compiled, transitions, casa_out.transition_predictions,
+            initial_anchor=initial_anchor, initial_phase="origin",
+        )
         traj = refine_trajectory(skeleton, route_length_m=float(trip_context.get("route_length_m", trip_context.get("route_corridor", {}).get("length_m", 4000.0) if isinstance(trip_context.get("route_corridor"), dict) else 4000.0)), mode=self.config.trajectory_mode, scene_context=trip_context)
         phase_accepted = bool(skeleton and skeleton.accepted and self.automaton.accept("destination"))
         vehicle_safe = bool(traj.get("vehicle_evaluated", False) and not traj.get("collision", False) and traj.get("drivable_area", True) and traj.get("rule_compliance", not traj.get("rule_violation", False)))

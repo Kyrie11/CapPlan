@@ -27,7 +27,12 @@ def _flatten_metric_records(obj: Any, source: str) -> List[Dict[str, Any]]:
         return rows
     # Common direct row shapes.
     id_keys = {"episode_id", "scenario_token", "token", "scenario_id", "log_name"}
-    metric_keys = {"route_completion", "collision", "collisions", "drivable_area", "drivable_area_compliance", "traffic_rule_violation", "rule_violation", "travel_time_s", "distance_m", "score"}
+    metric_keys = {
+        "route_completion", "collision", "collisions", "drivable_area", "drivable_area_compliance",
+        "traffic_rule_violation", "rule_violation", "travel_time_s", "distance_m", "score",
+        "no_ego_at_fault_collisions", "ego_progress_along_expert_route", "time_to_collision_within_bound",
+        "speed_limit_compliance", "driving_direction_compliance", "ego_is_comfortable", "comfort",
+    }
     if any(k in obj for k in id_keys) and any(k in obj for k in metric_keys):
         r = dict(obj)
         r.setdefault("_metrics_source", source)
@@ -147,7 +152,7 @@ def normalize_vehicle_metric_row(row: Dict[str, Any], scene: Dict[str, Any]) -> 
         rule_violation = True
     distance = _as_float(row, "distance_m", "vehicle_distance_m", "driven_distance_m", default=float(scene.get("route_length_m", 0.0) or 0.0) * rc)
     tt = _as_float(row, "travel_time_s", "tt_s", "TT", "duration_s", "simulation_duration_s", default=max(1.0, distance / 8.0 if distance else 1.0))
-    return {
+    out = {
         "episode_id": scene.get("episode_id"),
         "scenario_token": scene.get("scenario_token"),
         "log_name": scene.get("log_name"),
@@ -158,9 +163,41 @@ def normalize_vehicle_metric_row(row: Dict[str, Any], scene: Dict[str, Any]) -> 
         "rule_violation": bool(rule_violation),
         "distance_m": float(distance),
         "travel_time_s": float(tt),
+        # Publication mode is fail-closed: only an external runner that actually
+        # simulated CapPlan's selected PUDO/service trajectory may set this flag.
+        "capplan_method_specific_closed_loop": _as_bool(row, "capplan_method_specific_closed_loop", default=False),
         "source": "nuplan_closed_loop_import",
         "raw_metric_source": row.get("_metrics_source"),
     }
+
+    # Preserve normalized standard nuPlan scenario metrics for paper reporting.
+    # Per-episode pass/fail booleans are mapped to [0,1] scores except the
+    # at-fault collision metric, which remains a failure rate (smaller is better).
+    if "at_fault_collision_rate" in row and row.get("at_fault_collision_rate") not in (None, ""):
+        out["at_fault_collision_rate"] = _score_as_fraction(_as_float(row, "at_fault_collision_rate"))
+    elif any(k in row for k in ["no_ego_at_fault_collisions", "collision", "at_fault_collision", "collisions", "num_collisions"]):
+        out["at_fault_collision_rate"] = 1.0 if collision else 0.0
+
+    score_aliases = {
+        "drivable_area_compliance": ("drivable_area_compliance_score", "drivable_area_compliance", "ego_is_in_drivable_area"),
+        "ego_progress_along_expert_route": ("ego_progress_along_expert_route_score", "ego_progress_along_expert_route", "route_completion"),
+        "time_to_collision_within_bound": ("time_to_collision_within_bound_score", "time_to_collision_within_bound"),
+        "speed_limit_compliance": ("speed_limit_compliance_score", "speed_limit_compliance"),
+        "driving_direction_compliance": ("driving_direction_compliance_score", "driving_direction_compliance"),
+        "comfort": ("comfort_score", "comfort", "ego_is_comfortable"),
+        "nuplan_score": ("nuplan_score", "overall_score", "score"),
+    }
+    for out_key, aliases in score_aliases.items():
+        for key in aliases:
+            if key not in row or row.get(key) in (None, ""):
+                continue
+            raw = row.get(key)
+            if isinstance(raw, bool) or str(raw).strip().lower() in {"true", "false", "yes", "no", "pass", "passed", "fail", "failed", "ok"}:
+                out[out_key] = 1.0 if _as_bool({key: raw}, key, default=False) else 0.0
+            else:
+                out[out_key] = _score_as_fraction(_as_float(row, key))
+            break
+    return out
 
 
 def import_metrics(dataset_dir: str | Path, metrics_source: str | Path, output_jsonl: str | Path | None = None, report_json: str | Path | None = None) -> Dict[str, Any]:
@@ -185,7 +222,14 @@ def import_metrics(dataset_dir: str | Path, metrics_source: str | Path, output_j
     expected = sorted({v.get("episode_id") for v in mapping.values() if v.get("episode_id")})
     got = sorted({r.get("episode_id") for r in normalized})
     missing = [x for x in expected if x not in set(got)]
-    report = {"metrics_source": str(metrics_source), "output_jsonl": str(output_jsonl), "raw_rows": len(raw_rows), "matched_episodes": len(got), "expected_episodes": len(expected), "unmatched_rows": unmatched, "missing_episodes": missing[:50], "coverage": len(got) / max(1, len(expected))}
+    integrated_count = sum(1 for r in normalized if bool(r.get("capplan_method_specific_closed_loop")))
+    report = {
+        "metrics_source": str(metrics_source), "output_jsonl": str(output_jsonl), "raw_rows": len(raw_rows),
+        "matched_episodes": len(got), "expected_episodes": len(expected), "unmatched_rows": unmatched,
+        "missing_episodes": missing[:50], "coverage": len(got) / max(1, len(expected)),
+        "method_specific_integrated_episodes": integrated_count,
+        "method_specific_integrated_coverage": integrated_count / max(1, len(expected)),
+    }
     if report_json:
         dump_json(report_json, report)
     else:
