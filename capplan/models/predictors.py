@@ -236,13 +236,17 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             ])
             edge_prob, value_prob, availability_prob, demand_pred, unc_pred = head
             typed_evidence = e.resource_evidence
-            if demand_pred and not self.no_learned_demand:
-                # Only numerical typed resources are regression targets.  Python
-                # bool is an int subclass, so the historical isinstance(...,
-                # (int,float,bool)) path silently overwrote categorical ramp/lift
-                # evidence with an unsupervised continuous head.  Keep categorical
-                # predicates authoritative and replace only finite numerical fields
-                # that actually participate in the demand loss.
+            if demand_pred:
+                # Demand mean and uncertainty are independent learned heads and must
+                # be independently ablatable.  reviewfix11 accidentally put both
+                # replacements behind ``not no_learned_demand``; consequently the
+                # historical ``no_learned_demand`` diagnostic disabled *both* the
+                # learned mean and learned sigma.  That made the strongest V1
+                # diagnostic attribution-confounded.  Repair each field separately.
+                #
+                # Only numerical typed resources are regression targets. Python bool
+                # is an int subclass, so categorical ramp/lift/step-free predicates
+                # stay authoritative and are never overwritten by continuous heads.
                 from dataclasses import replace as _replace
                 repaired = []
                 for ev in e.resource_evidence:
@@ -254,8 +258,16 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                         repaired.append(ev)
                         continue
                     try:
-                        pred_value = float(demand_pred.get(ev.resource_name, ev.value))
-                        pred_sigma = float(ev.sigma if self.no_learned_uncertainty else (unc_pred or {}).get(ev.resource_name, ev.sigma))
+                        pred_value = float(
+                            ev.value
+                            if self.no_learned_demand
+                            else demand_pred.get(ev.resource_name, ev.value)
+                        )
+                        pred_sigma = float(
+                            ev.sigma
+                            if self.no_learned_uncertainty
+                            else (unc_pred or {}).get(ev.resource_name, ev.sigma)
+                        )
                     except Exception:
                         repaired.append(ev)
                         continue

@@ -20,6 +20,10 @@ ABLATION_FLAGS = {
     # CASA heads while keeping the rest of the V1 planner unchanged.
     "no_learned_demand": {"no_learned_demand": True},
     "no_learned_uncertainty": {"no_learned_uncertainty": True},
+    # Factorial control: saved symbolic demand mean + saved symbolic sigma.  This
+    # is intentionally distinct from ``no_learned_demand`` after reviewfix12 so
+    # mean and uncertainty contributions can be identified without leakage.
+    "no_learned_demand_uncertainty": {"no_learned_demand": True, "no_learned_uncertainty": True},
     "no_learned_availability": {"no_learned_availability": True},
 }
 
@@ -37,6 +41,7 @@ MAIN_ABLATIONS = [
 DIAGNOSTIC_ABLATIONS = [
     "no_learned_demand",
     "no_learned_uncertainty",
+    "no_learned_demand_uncertainty",
     "no_learned_availability",
 ]
 

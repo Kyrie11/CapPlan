@@ -30,6 +30,7 @@ def main() -> None:
     casa = _json(root / "diagnostics" / f"casa_heads_seed{seed}.json") or {}
     main_ablation = _csv(root / "ablations" / f"seed{seed}" / "ablation_results.csv") or []
     head_isolation = _csv(root / "diagnostics" / f"head_isolation_seed{seed}" / "ablation_results.csv") or []
+    symbolic_core = _csv(root / "diagnostics" / f"symbolic_core_seed{seed}" / "ablation_results.csv") or []
 
     out = {
         "algorithm_version": "V1",
@@ -39,6 +40,7 @@ def main() -> None:
         "casa_head_metrics": casa,
         "main_ablations": main_ablation,
         "head_isolation": head_isolation,
+        "symbolic_core_attribution": symbolic_core,
         "attribution_ready": bool(semantics.get("algorithm_attribution_ready", False)),
         "attribution_warnings": list(semantics.get("algorithm_attribution_warnings") or []),
     }
@@ -50,6 +52,10 @@ def main() -> None:
         "PCR": full.get("PCR"),
         "PlanReturnRate": full.get("PlanReturnRate"),
         "TSBS_expansions_p95": full.get("TSBS_expansions_p95"),
+        "OraclePCR": full.get("OraclePCR"),
+        "PCDecisionPrecision": full.get("PCDecisionPrecision"),
+        "PCDecisionRecall": full.get("PCDecisionRecall"),
+        "CF_success_flip_precision": full.get("CF_success_flip_precision"),
         "CF_success_flip_recall": full.get("CF_success_flip_recall"),
         "edge_auprc": casa.get("edge_auprc"),
         "value_auprc": casa.get("value_auprc"),

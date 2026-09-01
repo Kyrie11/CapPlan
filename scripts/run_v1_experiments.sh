@@ -11,7 +11,12 @@ V1_ROOT="${V1_ROOT:-$CAP_HOME/outputs/eval/v1}"
 MODEL_DIR="$V1_ROOT/models/casa_relation_mlp_seed${SEED}"
 CKPT="${CHECKPOINT:-$MODEL_DIR/checkpoint.pt}"
 LOG_DIR="$V1_ROOT/logs"
-mkdir -p "$V1_ROOT/test/seed${SEED}" "$V1_ROOT/ablations/seed${SEED}" "$V1_ROOT/diagnostics/head_isolation_seed${SEED}" "$LOG_DIR"
+mkdir -p \
+  "$V1_ROOT/test/seed${SEED}" \
+  "$V1_ROOT/ablations/seed${SEED}" \
+  "$V1_ROOT/diagnostics/head_isolation_seed${SEED}" \
+  "$V1_ROOT/diagnostics/symbolic_core_seed${SEED}" \
+  "$LOG_DIR"
 cd "$CAP_HOME"
 
 if [[ ! -f "$CKPT" ]]; then
@@ -78,9 +83,27 @@ python scripts/run_ablations.py \
   --variants \
     no_learned_demand \
     no_learned_uncertainty \
+    no_learned_demand_uncertainty \
     no_learned_availability \
   --progress \
   2>&1 | tee "$LOG_DIR/head_isolation_seed${SEED}.log"
+
+echo "[V1] symbolic-core attribution with deterministic saved transition evidence"
+python scripts/run_ablations.py \
+  --dataset_dir "$HYBRID_TEST" \
+  --output_dir "$V1_ROOT/diagnostics/symbolic_core_seed${SEED}" \
+  --trajectory_mode mock_strict \
+  --casa_mode heuristic_oracle_baseline \
+  --variants \
+    full \
+    no_capability_compiler \
+    no_service_automaton \
+    no_typed_resource_ledger \
+    no_conservative_margins \
+    no_completion_value_guidance \
+    soft_only_capability \
+  --progress \
+  2>&1 | tee "$LOG_DIR/symbolic_core_seed${SEED}.log"
 
 python scripts/summarize_v1_results.py \
   --v1_root "$V1_ROOT" \

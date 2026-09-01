@@ -218,34 +218,98 @@ def plan_return_rate(episodes: List[Dict[str, Any]]) -> float:
     return _mean([1.0 if e.get("plan_returned", False) else 0.0 for e in episodes])
 
 
+def passenger_completion_decision_breakdown(episodes: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Verifier-referenced passenger-complete decision quality.
+
+    ``PCR`` alone is not sufficient for mechanism ablations: relaxing a hard
+    capability mechanism can increase returned-plan rate while accepting
+    requests that the exhaustive offline verifier marks infeasible.  These
+    metrics score the planner's *success decision* against the frozen oracle.
+    """
+    rows = [e for e in episodes if bool(e.get("oracle_label_available", False))]
+    if not rows:
+        return {
+            "tp": 0.0, "fp": 0.0, "fn": 0.0, "tn": 0.0,
+            "precision": 0.0, "recall": 0.0, "f1": 0.0,
+            "accuracy": 0.0, "balanced_accuracy": 0.0,
+            "false_accept_rate": 0.0, "false_reject_rate": 0.0,
+            "oracle_pcr": 0.0, "evaluable_count": 0.0,
+        }
+    tp = fp = fn = tn = 0
+    for e in rows:
+        pred = bool(e.get("passenger_complete", False))
+        truth = bool(e.get("oracle_passenger_complete", False))
+        if pred and truth:
+            tp += 1
+        elif pred and not truth:
+            fp += 1
+        elif not pred and truth:
+            fn += 1
+        else:
+            tn += 1
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2.0 * precision * recall / max(precision + recall, EPS)
+    tnr = tn / max(tn + fp, 1)
+    return {
+        "tp": float(tp), "fp": float(fp), "fn": float(fn), "tn": float(tn),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "accuracy": float((tp + tn) / max(len(rows), 1)),
+        "balanced_accuracy": float(0.5 * (recall + tnr)),
+        # False acceptance is normalized by oracle-infeasible requests; false
+        # rejection is normalized by oracle-feasible requests.
+        "false_accept_rate": float(fp / max(fp + tn, 1)),
+        "false_reject_rate": float(fn / max(fn + tp, 1)),
+        "oracle_pcr": float((tp + fn) / max(len(rows), 1)),
+        "evaluable_count": float(len(rows)),
+    }
+
+
 def counterfactual_breakdown(pairs: List[Dict[str, Any]]) -> Dict[str, float]:
     """Outcome-aware T4 diagnostics.
 
     Aggregate CRsp can look deceptively high when both the oracle and a collapsed
-    model fail on most pairs.  These terms expose whether the model reproduces
-    oracle success/failure outcomes and, in particular, the capability-induced
-    success flips that motivate passenger-conditioned planning.
+    model fail on most pairs.  Report changed/stable behavior plus precision and
+    recall of the central capability-induced weak-success -> strict-failure event.
     """
     if not pairs:
         return {
             "outcome_pair_accuracy": 0.0,
             "response_accuracy_oracle_changed": 0.0,
             "response_accuracy_oracle_stable": 0.0,
+            "success_flip_precision": 0.0,
             "success_flip_recall": 0.0,
             "oracle_changed_count": 0.0,
             "oracle_success_flip_count": 0.0,
+            "model_success_flip_count": 0.0,
+            "base_oracle_success_rate": 0.0,
+            "base_model_success_rate": 0.0,
         }
     outcome = [1.0 if p.get("outcomes_match_oracle", False) else 0.0 for p in pairs]
     changed = [p for p in pairs if p.get("oracle_changed", False)]
     stable = [p for p in pairs if not p.get("oracle_changed", False)]
-    flips = [p for p in pairs if bool(p.get("oracle_weak_success")) != bool(p.get("oracle_strict_success"))]
+    oracle_flips = [p for p in pairs if bool(p.get("oracle_weak_success")) and not bool(p.get("oracle_strict_success"))]
+    model_flips = [p for p in pairs if bool(p.get("model_weak_success")) and not bool(p.get("model_strict_success"))]
+    correct_flip_ids = {
+        (str(p.get("episode_id")), str(p.get("weak_passenger_id")), str(p.get("strict_passenger_id")))
+        for p in oracle_flips
+        if bool(p.get("model_weak_success")) and not bool(p.get("model_strict_success"))
+    }
+    precision = len(correct_flip_ids) / max(len(model_flips), 1)
+    recall = len(correct_flip_ids) / max(len(oracle_flips), 1)
     return {
         "outcome_pair_accuracy": _mean(outcome),
         "response_accuracy_oracle_changed": _mean([1.0 if p.get("response_correct", False) else 0.0 for p in changed]),
         "response_accuracy_oracle_stable": _mean([1.0 if p.get("response_correct", False) else 0.0 for p in stable]),
-        "success_flip_recall": _mean([1.0 if p.get("outcomes_match_oracle", False) else 0.0 for p in flips]),
+        "success_flip_precision": float(precision),
+        "success_flip_recall": float(recall),
         "oracle_changed_count": float(len(changed)),
-        "oracle_success_flip_count": float(len(flips)),
+        "oracle_success_flip_count": float(len(oracle_flips)),
+        "model_success_flip_count": float(len(model_flips)),
+        "base_oracle_success_rate": _mean([1.0 if p.get("oracle_weak_success", False) else 0.0 for p in pairs]),
+        "base_model_success_rate": _mean([1.0 if p.get("model_weak_success", False) else 0.0 for p in pairs]),
     }
 
 def capability_responsiveness(pairs: List[Dict[str, Any]]) -> float:
@@ -310,6 +374,7 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
     diag = diagnostic_breakdown(episodes)
     pairs = counterfactual_pairs or []
     cf = counterfactual_breakdown(pairs)
+    pc_decision = passenger_completion_decision_breakdown(episodes)
     metrics: Dict[str, float] = {
         "CR": collision_rate(episodes),
         "RC": route_completion(episodes),
@@ -317,6 +382,19 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "TT": travel_time(episodes),
         "DR": detour_ratio(episodes),
         "PCR": passenger_completion_rate(episodes),
+        "OraclePCR": pc_decision["oracle_pcr"],
+        "PCDecisionPrecision": pc_decision["precision"],
+        "PCDecisionRecall": pc_decision["recall"],
+        "PCDecisionF1": pc_decision["f1"],
+        "PCDecisionAccuracy": pc_decision["accuracy"],
+        "PCDecisionBalancedAccuracy": pc_decision["balanced_accuracy"],
+        "PCFalseAcceptRate": pc_decision["false_accept_rate"],
+        "PCFalseRejectRate": pc_decision["false_reject_rate"],
+        "PCDecisionTP": pc_decision["tp"],
+        "PCDecisionFP": pc_decision["fp"],
+        "PCDecisionFN": pc_decision["fn"],
+        "PCDecisionTN": pc_decision["tn"],
+        "PCDecisionEvaluableCount": pc_decision["evaluable_count"],
         "TSPIR": traffic_safe_passenger_incomplete_rate(episodes),
         "PAR": phase_acceptance_rate(episodes),
         "PlanReturnRate": plan_return_rate(episodes),
@@ -338,9 +416,13 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "CF_outcome_pair_accuracy": cf["outcome_pair_accuracy"],
         "CF_response_accuracy_oracle_changed": cf["response_accuracy_oracle_changed"],
         "CF_response_accuracy_oracle_stable": cf["response_accuracy_oracle_stable"],
+        "CF_success_flip_precision": cf["success_flip_precision"],
         "CF_success_flip_recall": cf["success_flip_recall"],
         "CF_oracle_changed_count": cf["oracle_changed_count"],
         "CF_oracle_success_flip_count": cf["oracle_success_flip_count"],
+        "CF_model_success_flip_count": cf["model_success_flip_count"],
+        "CF_base_oracle_success_rate": cf["base_oracle_success_rate"],
+        "CF_base_model_success_rate": cf["base_model_success_rate"],
         "ECA": efficiency_cost_of_accommodation(episodes),
         "ECA_evaluable_count": float(sum(1 for e in episodes if float(e.get("tt_std_s", 0.0) or 0.0) > 0.0)),
         "TSBS_expansions_mean": search_expansion_mean(episodes),
@@ -367,7 +449,10 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         subset = [p for p in pairs if str(p.get("counterfactual_axis") or p.get("axis")) == axis]
         metrics[f"CRsp_axis::{axis}"] = capability_responsiveness(subset)
         axis_cf = counterfactual_breakdown(subset)
+        metrics[f"CF_success_flip_precision_axis::{axis}"] = axis_cf["success_flip_precision"]
         metrics[f"CF_success_flip_recall_axis::{axis}"] = axis_cf["success_flip_recall"]
+        metrics[f"CF_success_flip_support_axis::{axis}"] = axis_cf["oracle_success_flip_count"]
+        metrics[f"CF_model_success_flip_support_axis::{axis}"] = axis_cf["model_success_flip_count"]
         metrics[f"CF_response_changed_axis::{axis}"] = axis_cf["response_accuracy_oracle_changed"]
     return metrics
 

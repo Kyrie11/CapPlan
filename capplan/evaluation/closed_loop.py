@@ -20,7 +20,11 @@ def _cert_key(c: Dict[str, Any]) -> Tuple[str, str]:
     return c.get("episode_id"), c.get("passenger_id")
 
 
-def result_to_episode_metrics(result, metadata: Dict[str, Any], contract, oracle_certificate: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def result_to_episode_metrics(
+    result, metadata: Dict[str, Any], contract,
+    oracle_certificate: Dict[str, Any] | None = None,
+    oracle_skeleton: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     skeleton = result.skeleton
     traj = result.diagnostics.get("trajectory", {})
     # Planner already computes capability satisfaction/margins for this exact
@@ -43,6 +47,12 @@ def result_to_episode_metrics(result, metadata: Dict[str, Any], contract, oracle
     traffic_safe = bool(not traj.get("collision", False) and traj.get("drivable_area", True) and traj.get("rule_compliance", not traj.get("rule_violation", False)))
     route_completion_value = float(traj.get("route_completion", traj.get("route_completion_baseline", 0.0)))
     passenger_complete = bool(phase_accepted and traffic_safe and capability_satisfied)
+    # The frozen benchmark guarantees skeleton XOR certificate.  Store the
+    # verifier outcome explicitly so every algorithm/ablation can be judged by
+    # the same passenger-complete decision semantics.  This prevents a relaxed
+    # ablation from looking better merely because it returns more unsafe plans.
+    oracle_label_available = bool(oracle_skeleton) ^ bool(oracle_certificate)
+    oracle_passenger_complete = bool(oracle_skeleton) if oracle_label_available else None
     route_length = float(metadata.get("route_length_m", 1.0))
     motion_budget = next((float(c.threshold) for c in contract.clauses if c.resource_name == "motion_exposure"), 1.0)
     motion_exposure = float((skeleton.final_ledger if skeleton else {}).get("motion_exposure", traj.get("motion_exposure", 0.0)) or 0.0)
@@ -90,6 +100,8 @@ def result_to_episode_metrics(result, metadata: Dict[str, Any], contract, oracle
             or str((cert or {}).get("reason") or "") in ["missing_evidence", "low_confidence", "inconclusive_low_confidence"],
         "certificate": cert,
         "oracle_certificate": oracle_certificate,
+        "oracle_passenger_complete": oracle_passenger_complete,
+        "oracle_label_available": oracle_label_available,
         "tt_cap_s": float(traj.get("travel_time_s", 0.0)),
         # ECA requires a measured/evaluated standard-planner baseline.  Do not
         # synthesize it from route_length/speed because that makes publication
@@ -203,7 +215,10 @@ class ClosedLoopRunner:
                 result = self.planner.plan(eid, contract, graph, pudo, vehicle, transitions=transitions, trip_context=trip_context)
                 planning_latency_ms = (time.perf_counter() - plan_t0) * 1000.0
                 oracle_cert = data["oracle_certs"].get((eid, contract.passenger_id))
-                row = result_to_episode_metrics(result, trip_context, contract, oracle_cert)
+                oracle_skeleton = data["skeletons"].get((eid, contract.passenger_id))
+                row = result_to_episode_metrics(
+                    result, trip_context, contract, oracle_cert, oracle_skeleton
+                )
                 row["planning_latency_ms"] = float(planning_latency_ms)
                 metrics_rows.append(row)
                 result_lookup[(eid, contract.passenger_id)] = row
@@ -250,10 +265,22 @@ class ClosedLoopRunner:
             attribution_warnings.append("TSBS returned no service skeletons; search-level ablations are bottleneck-confounded.")
         if aggregate.get("TSBS_expansions_p95", 0.0) <= 1.0:
             attribution_warnings.append("TSBS p95 expansions <= 1; most requests terminate at the initial frontier.")
+        internal_margin_comparable = not any([
+            bool(self.config.no_capability_compiler),
+            bool(self.config.soft_only_capability),
+            bool(self.config.no_typed_resource_ledger),
+        ])
         eval_semantics = {
             "vehicle_metric_semantics": vehicle_semantics,
             "publication_integrated_vehicle_closed_loop_ready": integrated_ready,
             "passenger_service_metrics_available": bool(metrics_rows),
+            "oracle_referenced_passenger_completion_metrics_available": aggregate.get("PCDecisionEvaluableCount", 0.0) > 0.0,
+            "planner_internal_margin_metrics_cross_ablation_comparable": internal_margin_comparable,
+            "planner_internal_margin_metric_note": (
+                "CVR/CSM/FLF/BAF are computed from the planner's active/internal capability margins. "
+                "When compiler/typed-ledger semantics are ablated they are not cross-ablation verifier metrics; "
+                "use OraclePCR and PCDecision* for common success-decision comparison."
+            ),
             "algorithm_attribution_ready": not attribution_warnings,
             "algorithm_attribution_warnings": attribution_warnings,
             "note": (

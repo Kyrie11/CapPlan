@@ -44,6 +44,29 @@ A V1 run is considered suitable for component attribution only when all of the f
 
 The reviewfix10 seed-13 run cannot distinguish algorithmic causes because every request fails before an accepting skeleton is found.  After reviewfix11, the head-isolation diagnostics should determine whether the remaining dominant bottleneck is learned typed demand, learned uncertainty/conservative margins, learned availability, or the limited V1 relation-MLP representation.  Only after that rerun should a V2 algorithm be designed.
 
+### reviewfix12 — V1 attribution closure (engineering/evaluation only; algorithm version remains V1)
+
+The uploaded post-reviewfix11 seed-13 run still **fails the preregistered V1 attribution gate**: full learned V1 has `PCR=0`, `PlanReturnRate=0`, and `TSBS_expansions_p95=1`.  Therefore this revision deliberately does **not** define V2.
+
+The repaired run nevertheless localizes the V1 failure much more sharply:
+
+- the historical `no_learned_demand` diagnostic returns exactly the verifier-feasible set (`506/7976` successes), but code audit shows that reviewfix11 accidentally disabled both learned demand mean **and** learned uncertainty in that branch;
+- `no_learned_uncertainty` lets search traverse much deeper but still returns zero passenger-complete plans, showing that learned demand mean alone remains incompatible with the typed feasibility boundary;
+- `no_learned_availability` is identical to full, so availability is not the current dominant bottleneck;
+- removing conservative margins recovers many oracle-feasible requests but also creates many oracle-infeasible accepts, so margin removal is not a valid algorithmic solution.
+
+reviewfix12 closes the remaining attribution leakage and strengthens evaluation:
+
+1. `no_learned_demand` now replaces **only** the learned point estimate with saved symbolic evidence while retaining the learned uncertainty head.
+2. `no_learned_uncertainty` retains the learned point estimate while restoring saved symbolic sigma.
+3. `no_learned_demand_uncertainty` is added as the explicit fully-symbolic factorial control.  The four mean/sigma combinations can therefore be compared without hidden coupling.
+4. Passenger-complete decisions are now scored against the frozen exhaustive verifier with `OraclePCR`, `PCDecisionPrecision`, `PCDecisionRecall`, `PCDecisionF1`, `PCFalseAcceptRate`, `PCFalseRejectRate`, and confusion counts.  This prevents relaxed ablations from appearing superior merely because they return more plans.
+5. T4 now reports capability-induced success-flip **precision** as well as recall, plus per-axis flip support.
+6. `run_v1_experiments.sh` adds a deterministic-evidence symbolic-core attribution suite so capability compiler / service automaton / typed ledger can be tested independently of the collapsed learned evidence layer.
+7. The same V1 experiment script remains the single entry point; use a new `V1_ROOT` (for example `outputs/eval/v1_attr12`) rather than creating additional scripts or package lineages.
+
+**Decision:** reviewfix12 is an attribution/evaluation repair, not a new planning mechanism.  Formal CCF-A V2 design remains blocked until the corrected 2x2 demand/uncertainty factorial and deterministic-evidence symbolic-core suite are complete.
+
 ## V2 — reserved
 
 V2 is intentionally **not defined yet**.  The next algorithm version should be chosen from attribution-valid V1 evidence, with the goal of a CCF-A-level contribution rather than incremental tuning.  Candidate directions (true heterogeneous service-graph reasoning, constrained probabilistic resource inference, or another mechanism) must be justified by the repaired V1 bottleneck evidence.
