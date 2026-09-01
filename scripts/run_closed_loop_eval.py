@@ -70,6 +70,9 @@ def main() -> None:
     p.add_argument("--trajectory_mode", choices=["mock_strict", "nuplan_closed_loop"], default="mock_strict")
     p.add_argument("--casa_mode", choices=["heuristic_oracle_baseline", "learned"], default="heuristic_oracle_baseline")
     p.add_argument("--casa_checkpoint", default=None, help="Checkpoint produced by scripts.train_casa; required for a meaningful learned CASA run.")
+    p.add_argument("--casa_device", default="auto", help="Device for learned CASA inference, e.g. cuda:0. Heuristic mode ignores this.")
+    p.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Show TQDM request-level evaluation progress and live PCR/latency.")
+    p.add_argument("--progress_update_interval", type=int, default=25)
     p.add_argument("--paper_mode", action="store_true", help="Fail if the run would use smoke/mock/proxy components.")
     p.add_argument("--nuplan_sim_config", default=None, help="Optional provenance path for the external nuPlan simulation configuration. This wrapper does not execute Hydra itself.")
     p.add_argument("--allow_posthoc_episode_vehicle_metrics", action="store_true", help="Deprecated compatibility flag. Post-hoc episode vehicle metrics are development-only and no longer override the paper_mode integrated-simulation guard.")
@@ -86,12 +89,17 @@ def main() -> None:
 
     cfg: PlannerConfig
     if args.ablation == "full":
-        cfg = PlannerConfig(trajectory_mode=args.trajectory_mode, casa_mode=args.casa_mode, casa_checkpoint=args.casa_checkpoint)
+        cfg = PlannerConfig(trajectory_mode=args.trajectory_mode, casa_mode=args.casa_mode, casa_checkpoint=args.casa_checkpoint, casa_device=args.casa_device)
     else:
         cfg = ablation_config(args.ablation, trajectory_mode=args.trajectory_mode)
         cfg.casa_mode = args.casa_mode
         cfg.casa_checkpoint = args.casa_checkpoint
-    res = ClosedLoopRunner(cfg).run_dataset(dataset_dir, args.output_dir)
+        cfg.casa_device = args.casa_device
+    print(f"[CAPPLAN_EVAL] dataset={dataset_dir} mode={args.trajectory_mode} casa={args.casa_mode} casa_device={args.casa_device}")
+    res = ClosedLoopRunner(cfg).run_dataset(
+        dataset_dir, args.output_dir, show_progress=args.progress,
+        progress_update_interval=args.progress_update_interval, progress_desc="CapPlan test",
+    )
     metrics = res["metrics"]
     out_dir = Path(args.output_dir)
     dump_json(out_dir / "run_config.json", {**vars(args), "planner_config": cfg.__dict__})
@@ -109,6 +117,15 @@ def main() -> None:
         passenger_keys += [k for k in metrics if k.startswith("CRsp_axis::")]
         passenger_subset = {k: metrics.get(k) for k in passenger_keys if k in metrics}
         dump_json(args.passenger_metrics, passenger_subset)
+    print("[CAPPLAN_EVAL] completed")
+    for key in [
+        "PCR", "TSPIR", "PAR", "CVR", "FLF", "BAF", "MVR", "IR",
+        "DF_phase_accuracy", "DF_resource_macro_f1", "DF_source_macro_f1", "SME",
+        "CRsp", "TSBS_expansions_mean", "TSBS_expansions_p95",
+        "PlannerLatency_ms_mean", "PlannerLatency_ms_p95", "CR", "RC", "TRV",
+    ]:
+        if key in metrics:
+            print(f"[CAPPLAN_EVAL] {key}={metrics[key]}")
     print(metrics)
 
 

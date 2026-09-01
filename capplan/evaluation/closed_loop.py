@@ -23,12 +23,21 @@ def _cert_key(c: Dict[str, Any]) -> Tuple[str, str]:
 def result_to_episode_metrics(result, metadata: Dict[str, Any], contract, oracle_certificate: Dict[str, Any] | None = None) -> Dict[str, Any]:
     skeleton = result.skeleton
     traj = result.diagnostics.get("trajectory", {})
-    compiled = CapabilityCompiler().compile(contract, trip_context=metadata)
-    margins = {}
-    capability_satisfied = False
-    failed = []
-    if skeleton:
-        capability_satisfied, margins, failed = satisfy_all(skeleton.final_ledger, [] if compiled.soft_only else compiled.clauses, [] if compiled.soft_only else compiled.groups)
+    # Planner already computes capability satisfaction/margins for this exact
+    # contract and skeleton. Reusing them avoids compiling/evaluating the same
+    # contract a second time for every test request. Keep the old path as a
+    # compatibility fallback for externally constructed PlannerResult objects.
+    diag = result.diagnostics or {}
+    margins = dict(diag.get("capability_margins") or {})
+    capability_satisfied = bool(diag.get("capability_satisfied", False))
+    failed = list(diag.get("failed_resources") or [])
+    if skeleton and "capability_satisfied" not in diag:
+        compiled = CapabilityCompiler().compile(contract, trip_context=metadata)
+        capability_satisfied, margins, failed = satisfy_all(
+            skeleton.final_ledger,
+            [] if compiled.soft_only else compiled.clauses,
+            [] if compiled.soft_only else compiled.groups,
+        )
     cert = to_dict(result.certificate) if result.certificate else None
     phase_accepted = bool(skeleton and skeleton.accepted)
     traffic_safe = bool(not traj.get("collision", False) and traj.get("drivable_area", True) and traj.get("rule_compliance", not traj.get("rule_violation", False)))
@@ -144,7 +153,15 @@ class ClosedLoopRunner:
                     vehicle_metrics_by_episode[str(eid)] = row
         return {"scenes": scenes, "episodes": episodes, "entrances": entrances, "pudos": pudos_by_episode, "vehicles": vehicles_by_episode, "contracts": contracts_by_episode, "transitions": transitions_by_episode, "oracle_certs": oracle_certs, "skeletons": skeletons, "counterfactual_pairs": counterfactual_pairs, "service_requests": requests_by_episode, "vehicle_metrics": vehicle_metrics_by_episode}
 
-    def run_dataset(self, dataset_dir: str | Path, output_dir: str | Path) -> Dict[str, Any]:
+    def run_dataset(
+        self,
+        dataset_dir: str | Path,
+        output_dir: str | Path,
+        *,
+        show_progress: bool = False,
+        progress_update_interval: int = 25,
+        progress_desc: str = "CapPlan eval",
+    ) -> Dict[str, Any]:
         dataset_dir = Path(dataset_dir)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -152,6 +169,15 @@ class ClosedLoopRunner:
         metrics_rows: List[Dict[str, Any]] = []
         plans: List[Dict[str, Any]] = []
         result_lookup: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        from tqdm.auto import tqdm
+        total_requests = sum(len(data["contracts"].get(str(meta.get("episode_id")), [])) for meta in data["episodes"])
+        progress = tqdm(
+            total=total_requests, desc=progress_desc, unit="request",
+            dynamic_ncols=True, disable=not show_progress,
+        )
+        completed_requests = 0
+        completed_pc = 0
+        latency_sum = 0.0
         for meta in data["episodes"]:
             eid = meta["episode_id"]
             graph = load_accessibility_graph(dataset_dir, eid)
@@ -181,6 +207,17 @@ class ClosedLoopRunner:
                 metrics_rows.append(row)
                 result_lookup[(eid, contract.passenger_id)] = row
                 plans.append({"episode_id": eid, "passenger_id": contract.passenger_id, "success": result.success, "skeleton": to_dict(result.skeleton) if result.skeleton else None, "certificate": to_dict(result.certificate) if result.certificate else None})
+                completed_requests += 1
+                completed_pc += int(bool(row.get("passenger_complete")))
+                latency_sum += float(planning_latency_ms)
+                progress.update(1)
+                if show_progress and (completed_requests == 1 or completed_requests % max(1, progress_update_interval) == 0 or completed_requests == total_requests):
+                    progress.set_postfix({
+                        "PCR": f"{completed_pc/max(completed_requests,1):.4f}",
+                        "lat_ms": f"{latency_sum/max(completed_requests,1):.1f}",
+                        "episode": str(eid)[-18:],
+                    }, refresh=False)
+        progress.close()
         pair_rows = self._evaluate_counterfactual_pairs(
             data["counterfactual_pairs"], result_lookup, data["skeletons"], data["oracle_certs"]
         )

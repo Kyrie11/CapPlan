@@ -9,10 +9,10 @@ import numpy as np
 
 from capplan.data.capability_contracts import contract_episode_id
 from capplan.data.schemas import contract_from_dict, transition_from_dict
-from capplan.models.casa_features import FeatureVocab, encode_transition_with_capability
+from capplan.models.casa_features import FeatureVocab, encode_transition, encode_capability_tokens, encode_transition_with_capability
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY
 from capplan.semantics.capability_compiler import CapabilityCompiler
-from capplan.utils.serialization import read_jsonl
+from capplan.utils.serialization import iter_jsonl, read_jsonl
 
 
 # Resource-specific normalizers used by the paper-facing typed-demand loss.
@@ -89,24 +89,83 @@ class CASADataset:
         *,
         value_target: str = "skeleton",
         feature_policy: str = "legacy",
+        show_progress: bool = False,
     ) -> None:
+        """Load passenger-conditioned CASA samples for one split.
+
+        reviewfix10 keeps the sample semantics identical while removing the
+        dominant preprocessing duplication: each passenger contract is compiled
+        once per split (rather than once per transition), and transition-level
+        structural features / demand targets are computed once and reused across
+        the eight same-scene passenger contracts. Large JSONL inputs are streamed
+        and passenger labels are retained only for transitions in the requested
+        split.
+        """
+        from tqdm.auto import tqdm
+
         self.dataset_dir = Path(dataset_dir)
         self.vocab = vocab or FeatureVocab()
         self.compiler = CapabilityCompiler()
         self.value_target = value_target
         self.feature_policy = feature_policy
+        self.show_progress = bool(show_progress)
         if value_target not in {"skeleton", "offline_tsbs", "rollout", "legacy"}:
             raise ValueError(f"unknown CASA completion-value target: {value_target}")
         if feature_policy not in {"legacy", "paper_safe", "paper_safe_v2"}:
             raise ValueError(f"unknown CASA feature policy: {feature_policy}")
         self.split_file = self.dataset_dir / "splits" / f"{split}_episodes.txt"
         split_ids = self._read_split(split)
-        transition_labels = {d["transition_id"]: d for d in read_jsonl(self.dataset_dir / "transition_labels.jsonl")}
+
+        def _bar(rows, desc: str, unit: str = "row"):
+            return tqdm(rows, desc=desc, unit=unit, dynamic_ncols=True, disable=not self.show_progress)
+
+        # Contracts are the passenger-specific part of CASA features. Compile
+        # them exactly once, then reuse tokens/beta/features for every transition.
+        contracts_by_episode: Dict[str, List] = {}
+        contract_cache: Dict[str, Tuple[List[Dict], List[float], List[float]]] = {}
+        contracts_path = self.dataset_dir / "capability_contracts.jsonl"
+        if contracts_path.exists():
+            for d in _bar(iter_jsonl(contracts_path), f"CASA {split}: contracts"):
+                c = contract_from_dict(d)
+                eid = contract_episode_id(c)
+                if split_ids and eid not in split_ids:
+                    continue
+                contracts_by_episode.setdefault(eid, []).append(c)
+                compiled = self.compiler.compile(c, trip_context=c.metadata.get("trip_modifiers", {}))
+                contract_cache[c.passenger_id] = (
+                    compiled.tokens,
+                    self._uncertainty_beta(compiled.tokens),
+                    encode_capability_tokens(compiled.tokens, self.vocab),
+                )
+
+        # Materialize only transitions belonging to the requested split. This is
+        # much smaller than repeatedly materializing the full merged transition file.
+        transitions = []
+        transition_ids: set[str] = set()
+        transition_path = self.dataset_dir / "candidate_transitions.jsonl"
+        for d in _bar(iter_jsonl(transition_path), f"CASA {split}: transitions"):
+            t = transition_from_dict(d)
+            if split_ids and t.episode_id not in split_ids:
+                continue
+            transitions.append(t)
+            transition_ids.add(t.transition_id)
+
+        transition_labels: Dict[str, Dict] = {}
+        transition_label_path = self.dataset_dir / "transition_labels.jsonl"
+        if transition_label_path.exists():
+            for d in iter_jsonl(transition_label_path):
+                tid = str(d.get("transition_id") or "")
+                if tid in transition_ids:
+                    transition_labels[tid] = d
+
         passenger_path = self.dataset_dir / "passenger_edge_labels.jsonl"
         passenger_labels: Dict[Tuple[str, str], Dict] = {}
         if passenger_path.exists():
-            for row in read_jsonl(passenger_path):
-                key = (str(row.get("transition_id") or ""), str(row.get("passenger_id") or ""))
+            for row in _bar(iter_jsonl(passenger_path), f"CASA {split}: passenger labels"):
+                tid = str(row.get("transition_id") or "")
+                if tid not in transition_ids:
+                    continue
+                key = (tid, str(row.get("passenger_id") or ""))
                 if not all(key):
                     raise RuntimeError(f"invalid passenger edge label row in {passenger_path}: transition_id and passenger_id are required")
                 if key in passenger_labels:
@@ -114,34 +173,31 @@ class CASADataset:
                 passenger_labels[key] = row
         elif self.feature_policy in {"paper_safe", "paper_safe_v2"}:
             raise RuntimeError(f"paper_safe CASA loading requires passenger-specific labels: {passenger_path}")
-        contracts_by_episode: Dict[str, List] = {}
-        contracts_path = self.dataset_dir / "capability_contracts.jsonl"
-        if contracts_path.exists():
-            for d in read_jsonl(contracts_path):
-                c = contract_from_dict(d)
-                eid = contract_episode_id(c)
-                if split_ids and eid not in split_ids:
-                    continue
-                contracts_by_episode.setdefault(eid, []).append(c)
+
         skeleton_edges: Dict[Tuple[str, str], set[str]] = {}
         skeleton_path = self.dataset_dir / "skeleton_labels.jsonl"
         if skeleton_path.exists():
-            for row in read_jsonl(skeleton_path):
-                skeleton_edges[(row.get("episode_id"), row.get("passenger_id"))] = set(row.get("transitions") or [])
+            for row in iter_jsonl(skeleton_path):
+                eid = str(row.get("episode_id") or "")
+                if split_ids and eid not in split_ids:
+                    continue
+                skeleton_edges[(eid, row.get("passenger_id"))] = set(row.get("transitions") or [])
         explicit_value_targets = self._read_explicit_value_targets(value_target)
+
         self.samples: List[CASASample] = []
-        for d in read_jsonl(self.dataset_dir / "candidate_transitions.jsonl"):
-            t = transition_from_dict(d)
-            if split_ids and t.episode_id not in split_ids:
-                continue
+        for t in _bar(transitions, f"CASA {split}: build samples", unit="transition"):
             contracts = contracts_by_episode.get(t.episode_id, [])
+            # These fields depend only on the candidate transition, not passenger.
+            transition_x = encode_transition(t, self.vocab, feature_policy=self.feature_policy)
+            yd, ym = self._demand_target(t)
+            y_phase = self.vocab.phases.index(t.to_phase) if t.to_phase in self.vocab.phases else 0
+            availability = max(0.0, min(1.0, float(t.availability)))
             if not contracts:
                 if self.feature_policy in {"paper_safe", "paper_safe_v2"}:
                     raise RuntimeError(
                         f"paper_safe CASA loading found transition {t.transition_id} in episode {t.episode_id} "
                         "without any passenger capability contract"
                     )
-                # Backward-compatible fallback for legacy transition-only data.
                 lab = transition_labels.get(t.transition_id, {})
                 y_edge = 1.0 if lab.get("z_e", t.tests.z_e) else 0.0
                 if value_target == "legacy":
@@ -153,13 +209,12 @@ class CASADataset:
                     if key not in explicit_value_targets:
                         raise RuntimeError(f"missing {value_target} completion-value label for transition-only sample {key}")
                     y_value = explicit_value_targets[key]
-                y_phase = self.vocab.phases.index(t.to_phase) if t.to_phase in self.vocab.phases else 0
-                yd, ym = self._demand_target(t)
                 ub = [1.0 for _ in self.vocab.resources]
-                self.samples.append(CASASample(t.transition_id, t.episode_id, "__transition_only__", encode_transition_with_capability(t, [], self.vocab, feature_policy=self.feature_policy), y_edge, y_value, y_phase, yd, ym, ub, max(0.0, min(1.0, float(t.availability)))))
+                self.samples.append(CASASample(t.transition_id, t.episode_id, "__transition_only__", transition_x + encode_capability_tokens([], self.vocab), y_edge, y_value, y_phase, yd, ym, ub, availability))
                 continue
+
             for contract in contracts:
-                compiled = self.compiler.compile(contract, trip_context=contract.metadata.get("trip_modifiers", {}))
+                tokens, ub, capability_x = contract_cache[contract.passenger_id]
                 plab = passenger_labels.get((t.transition_id, contract.passenger_id))
                 if plab is not None:
                     y_edge = 1.0 if plab.get("y_e_p") else 0.0
@@ -173,9 +228,6 @@ class CASADataset:
                     y_edge = 1.0 if lab.get("z_e", t.tests.z_e) else 0.0
                 in_skeleton = t.transition_id in skeleton_edges.get((t.episode_id, contract.passenger_id), set())
                 if value_target == "skeleton":
-                    # Paper Eq. L_value explicitly allows expert/audited skeleton
-                    # supervision.  Use a pure binary target; do not blend in the
-                    # transition's hand-authored completion_value prior.
                     y_value = 1.0 if in_skeleton else 0.0
                 elif value_target == "legacy":
                     if in_skeleton:
@@ -189,11 +241,15 @@ class CASADataset:
                     if key not in explicit_value_targets:
                         raise RuntimeError(f"missing {value_target} completion-value label for {key}")
                     y_value = explicit_value_targets[key]
-                y_phase = self.vocab.phases.index(t.to_phase) if t.to_phase in self.vocab.phases else 0
-                yd, ym = self._demand_target(t)
-                ub = self._uncertainty_beta(compiled.tokens)
-                self.samples.append(CASASample(t.transition_id, t.episode_id, contract.passenger_id, encode_transition_with_capability(t, compiled.tokens, self.vocab, feature_policy=self.feature_policy), y_edge, y_value, y_phase, yd, ym, ub, max(0.0, min(1.0, float(t.availability)))))
+                self.samples.append(CASASample(
+                    t.transition_id, t.episode_id, contract.passenger_id,
+                    transition_x + capability_x, y_edge, y_value, y_phase,
+                    yd, ym, ub, availability,
+                ))
 
+        # The raw split transition list and large label dictionaries are not
+        # needed after samples are materialized. Release them before training.
+        del transitions, transition_ids, passenger_labels, transition_labels, skeleton_edges
     def _read_split(self, split: str) -> set[str]:
         p = self.dataset_dir / "splits" / f"{split}_episodes.txt"
         if not p.exists():

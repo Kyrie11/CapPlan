@@ -32,7 +32,7 @@ class CASAOutput:
 
 
 class CASANet:
-    def __init__(self, mode: str = "heuristic_oracle_baseline", disabled: bool = False, checkpoint: Dict[str, Any] | str | Path | None = None) -> None:
+    def __init__(self, mode: str = "heuristic_oracle_baseline", disabled: bool = False, checkpoint: Dict[str, Any] | str | Path | None = None, device: str = "auto") -> None:
         if mode not in {"heuristic_oracle_baseline", "learned", "heuristic"}:
             raise ValueError(f"unsupported CASA mode {mode}")
         self.mode = "heuristic_oracle_baseline" if mode == "heuristic" else mode
@@ -41,7 +41,7 @@ class CASANet:
         self.predictor = (
             HeuristicTransitionPredictor()
             if self.mode == "heuristic_oracle_baseline"
-            else LearnedLinearTransitionPredictor(checkpoint=loaded_checkpoint)
+            else LearnedLinearTransitionPredictor(checkpoint=loaded_checkpoint, device=device)
         )
 
     @staticmethod

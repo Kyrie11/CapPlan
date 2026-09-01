@@ -6,8 +6,12 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 import argparse
+import contextlib
+import gc
 import json
+import math
 import random
+import time
 from pathlib import Path
 from typing import Any, Dict
 
@@ -17,6 +21,8 @@ from capplan.models.casa_dataset import CASADataset, demand_scale_vector
 from capplan.models.casa_features import FeatureVocab
 from capplan.models.losses import casa_loss
 from capplan.utils.serialization import dump_json, write_jsonl
+
+CASA_TRAINING_RUNTIME_VERSION = "capplan_casa_cuda_perf_v1_20260901"
 
 
 def _sigmoid(x):
@@ -250,104 +256,266 @@ def _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_ava
     return metrics_rows, val_metrics, checkpoint
 
 
-def _torch_predict_batched(model, x_np: np.ndarray, *, batch_size: int, device: str):
-    """Memory-bounded inference for validation/evaluation arrays."""
+def _autocast_context(torch, device: str, amp_mode: str):
+    if not str(device).startswith("cuda") or amp_mode == "off":
+        return contextlib.nullcontext()
+    dtype = torch.bfloat16 if amp_mode == "bf16" else torch.float16
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def _torch_predict_batched(
+    model,
+    x_np: np.ndarray,
+    *,
+    batch_size: int,
+    device: str,
+    amp_mode: str = "off",
+    show_progress: bool = True,
+    desc: str = "CASA validation",
+    preload_max_mb: int = 2048,
+):
+    """Memory-bounded, progress-aware inference for validation arrays.
+
+    On CUDA, validation features are preloaded once when they fit the configured
+    budget, avoiding one host->device allocation/copy for every validation batch.
+    If preload fails (e.g. GPU memory pressure), the function falls back to
+    chunked transfers without changing prediction semantics.
+    """
     import torch
+    from tqdm.auto import tqdm
+
     outputs: Dict[str, list[np.ndarray]] = {
         "edge_logits": [], "value": [], "availability": [], "phase_logits": [],
         "typed_demand": [], "uncertainty": [],
     }
     bs = max(1, int(batch_size))
+    was_training = bool(model.training)
     model.eval()
-    with torch.no_grad():
-        for start in range(0, len(x_np), bs):
-            xb = torch.tensor(x_np[start:start + bs], dtype=torch.float32, device=device)
-            pred = model(xb)
+    x_contig = np.ascontiguousarray(x_np, dtype=np.float32)
+    preload = None
+    if str(device).startswith("cuda") and x_contig.nbytes <= max(0, int(preload_max_mb)) * 1024 * 1024:
+        try:
+            preload = torch.from_numpy(x_contig).to(device=device, non_blocking=False)
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                preload = None
+            else:
+                raise
+
+    starts = range(0, len(x_contig), bs)
+    bar = tqdm(
+        starts, total=math.ceil(len(x_contig) / bs) if len(x_contig) else 0,
+        desc=desc, unit="batch", dynamic_ncols=True, disable=not show_progress,
+    )
+    with torch.inference_mode():
+        for start in bar:
+            if preload is not None:
+                xb = preload[start:start + bs]
+            else:
+                xb = torch.from_numpy(x_contig[start:start + bs]).to(device=device, non_blocking=False)
+            with _autocast_context(torch, device, amp_mode):
+                pred = model(xb)
             for key in outputs:
-                outputs[key].append(pred[key].detach().cpu().numpy())
-    model.train()
+                outputs[key].append(pred[key].detach().float().cpu().numpy())
+    del preload
+    if str(device).startswith("cuda"):
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+    if was_training:
+        model.train()
     return {key: np.concatenate(chunks, axis=0) if chunks else np.empty((0,), dtype=np.float32) for key, chunks in outputs.items()}
+
+
+def _resolve_fused_adamw(torch, device: str, mode: str) -> bool:
+    if mode == "off" or not str(device).startswith("cuda"):
+        return False
+    if mode == "on":
+        return True
+    # auto: use fused AdamW only when the installed torch exposes it.
+    try:
+        import inspect
+        return "fused" in inspect.signature(torch.optim.AdamW).parameters
+    except Exception:
+        return False
 
 
 def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, uncertainty_beta, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, v_uncertainty_beta, edge_pos_weight, vocab, out, device, sample_probs=None):
     import torch
     import torch.nn.functional as F
+    from tqdm.auto import tqdm
     from capplan.models.casa_torch import CASAHetGraphNet
+
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
+
     input_dim = x.shape[1]
     mean, std = _normalization_stats(x)
-    xn = (x - mean) / std; xvn = (xv - mean) / std
-    model = CASAHetGraphNet(input_dim, len(vocab.phases), len(vocab.resources), model_type=args.model_type).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    X = torch.tensor(xn, dtype=torch.float32, device=device)
-    Ye = torch.tensor(y_edge, dtype=torch.float32, device=device)
-    Yv = torch.tensor(y_value, dtype=torch.float32, device=device)
-    Yp = torch.tensor(y_phase, dtype=torch.long, device=device)
-    Yd = torch.tensor(y_demand, dtype=torch.float32, device=device)
-    M = torch.tensor(demand_mask, dtype=torch.float32, device=device)
-    Ya = torch.tensor(y_availability, dtype=torch.float32, device=device)
-    B = torch.tensor(uncertainty_beta, dtype=torch.float32, device=device)
+    xn = np.ascontiguousarray((x - mean) / std, dtype=np.float32)
+    xvn = np.ascontiguousarray((xv - mean) / std, dtype=np.float32)
+
+    if str(device).startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA requested via --device {device}, but torch.cuda.is_available() is False")
+        if ":" in str(device):
+            torch.cuda.set_device(int(str(device).split(":", 1)[1]))
+        torch.backends.cuda.matmul.allow_tf32 = bool(args.tf32)
+        try:
+            torch.set_float32_matmul_precision(args.matmul_precision)
+        except Exception:
+            pass
+        props = torch.cuda.get_device_properties(torch.device(device))
+        print(
+            f"[CAPPLAN_CUDA] device={device} name={props.name} memory_gb={props.total_memory/1024**3:.1f} "
+            f"amp={args.amp} tf32={bool(args.tf32)} matmul_precision={args.matmul_precision}"
+        )
+
+    base_model = CASAHetGraphNet(input_dim, len(vocab.phases), len(vocab.resources), model_type=args.model_type).to(device)
+    model = base_model
+    if args.torch_compile:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("--torch_compile requires torch.compile support (PyTorch >= 2.0)")
+        try:
+            model = torch.compile(base_model, mode=args.compile_mode)
+            print(f"[CAPPLAN_CUDA] torch.compile enabled mode={args.compile_mode}")
+        except Exception as exc:
+            print(f"[CAPPLAN_CUDA] WARNING torch.compile failed; falling back to eager mode: {exc}")
+            model = base_model
+
+    fused = _resolve_fused_adamw(torch, device, args.fused_adamw)
+    try:
+        opt = torch.optim.AdamW(base_model.parameters(), lr=args.lr, fused=fused)
+    except TypeError:
+        fused = False
+        opt = torch.optim.AdamW(base_model.parameters(), lr=args.lr)
+    print(f"[CAPPLAN_CUDA] AdamW fused={fused}")
+
+    # The current four-city benchmark comfortably fits on one A30. Keeping the
+    # training tensors resident on one GPU avoids DataLoader/process/PCIe overhead
+    # and is faster for this small relation-MLP than DDP.
+    X = torch.from_numpy(xn).to(device=device)
+    Ye = torch.from_numpy(np.asarray(y_edge, dtype=np.float32)).to(device=device)
+    Yv = torch.from_numpy(np.asarray(y_value, dtype=np.float32)).to(device=device)
+    Yp = torch.from_numpy(np.asarray(y_phase, dtype=np.int64)).to(device=device)
+    Yd = torch.from_numpy(np.asarray(y_demand, dtype=np.float32)).to(device=device)
+    M = torch.from_numpy(np.asarray(demand_mask, dtype=np.float32)).to(device=device)
+    Ya = torch.from_numpy(np.asarray(y_availability, dtype=np.float32)).to(device=device)
+    B = torch.from_numpy(np.asarray(uncertainty_beta, dtype=np.float32)).to(device=device)
     demand_scale_np = np.asarray(demand_scale_vector(vocab.resources), dtype=np.float32)
-    demand_scale = torch.tensor(demand_scale_np, dtype=torch.float32, device=device).view(1, -1)
+    demand_scale = torch.from_numpy(demand_scale_np).to(device=device).view(1, -1)
     metrics_rows = []
     pos_weight = torch.tensor(float(edge_pos_weight), dtype=torch.float32, device=device)
-    sampling_probs = torch.tensor(sample_probs, dtype=torch.float32, device=device) if sample_probs is not None else None
+    sampling_probs = torch.from_numpy(np.asarray(sample_probs, dtype=np.float32)).to(device=device) if sample_probs is not None else None
+    scaler = torch.amp.GradScaler("cuda", enabled=(str(device).startswith("cuda") and args.amp == "fp16"))
+
+    loss_names = ["L_edge", "L_value", "L_phase", "L_demand", "L_cal", "L_availability", "L_total"]
+    bs = max(1, int(args.batch_size))
+    num_steps = math.ceil(X.shape[0] / bs)
+    training_t0 = time.perf_counter()
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         if sampling_probs is None:
             idx = torch.randperm(X.shape[0], device=device)
         else:
             idx = torch.multinomial(sampling_probs, X.shape[0], replacement=True)
-        epoch_sum = {k: 0.0 for k in ["L_edge", "L_value", "L_phase", "L_demand", "L_cal", "L_availability", "L_total"]}
+        # Keep loss accounting on GPU; the reviewfix9 implementation copied seven
+        # scalars to CPU on every batch, forcing repeated CUDA synchronizations.
+        epoch_sum = torch.zeros(len(loss_names), dtype=torch.float64, device=device)
         epoch_weight = 0.0
-        for start in range(0, len(idx), max(1, args.batch_size)):
-            b = idx[start:start + max(1, args.batch_size)]
-            outp = model(X[b])
-            edge_loss = F.binary_cross_entropy_with_logits(outp["edge_logits"], Ye[b], pos_weight=pos_weight)
-            # Completion value is a binary audited-skeleton target in the current
-            # dataset, so optimize BCE rather than regression MSE.
-            value_loss = F.binary_cross_entropy(outp["value"], Yv[b])
-            zero = outp["edge_logits"].sum() * 0.0
-            phase_loss = F.cross_entropy(outp["phase_logits"], Yp[b]) if args.phase_supervision else zero
-            if args.predict_typed_demand:
-                norm_pred = outp["typed_demand"] / demand_scale
-                norm_target = Yd[b] / demand_scale
-                per_resource_huber = F.smooth_l1_loss(norm_pred, norm_target, reduction="none")
-                demand_loss = (per_resource_huber * M[b]).sum() / torch.clamp(M[b].sum(), min=1.0)
-            else:
-                demand_loss = zero
-            availability_loss = F.mse_loss(outp["availability"], Ya[b]) if args.predict_availability else zero
-            sigma = outp["uncertainty"]
-            observed = M[b]
-            denom_cal = torch.clamp(observed.sum(), min=1.0)
-            residual_norm = torch.abs(outp["typed_demand"] - Yd[b]) / demand_scale
-            sigma_norm = sigma / demand_scale
-            if args.predict_uncertainty and args.predict_typed_demand:
-                cal_loss = (torch.relu(residual_norm - B[b] * sigma_norm) * observed).sum() / denom_cal
-                cal_loss = cal_loss + 0.001 * (sigma_norm * observed).sum() / denom_cal
-            else:
-                cal_loss = zero
-            loss = edge_loss + value_loss + phase_loss + demand_loss + cal_loss + availability_loss
-            opt.zero_grad(); loss.backward(); opt.step()
+        epoch_t0 = time.perf_counter()
+        starts = range(0, len(idx), bs)
+        bar = tqdm(
+            starts, total=num_steps, desc=f"CASA train {epoch}/{args.epochs}",
+            unit="batch", dynamic_ncols=True, disable=not args.progress,
+        )
+        for step, start in enumerate(bar, start=1):
+            b = idx[start:start + bs]
+            with _autocast_context(torch, device, args.amp):
+                outp = model(X[b])
+                edge_loss = F.binary_cross_entropy_with_logits(outp["edge_logits"], Ye[b], pos_weight=pos_weight)
+                value_loss = F.binary_cross_entropy(outp["value"], Yv[b])
+                zero = outp["edge_logits"].sum() * 0.0
+                phase_loss = F.cross_entropy(outp["phase_logits"], Yp[b]) if args.phase_supervision else zero
+                if args.predict_typed_demand:
+                    norm_pred = outp["typed_demand"] / demand_scale
+                    norm_target = Yd[b] / demand_scale
+                    per_resource_huber = F.smooth_l1_loss(norm_pred, norm_target, reduction="none")
+                    demand_loss = (per_resource_huber * M[b]).sum() / torch.clamp(M[b].sum(), min=1.0)
+                else:
+                    demand_loss = zero
+                availability_loss = F.mse_loss(outp["availability"], Ya[b]) if args.predict_availability else zero
+                sigma = outp["uncertainty"]
+                observed = M[b]
+                denom_cal = torch.clamp(observed.sum(), min=1.0)
+                residual_norm = torch.abs(outp["typed_demand"] - Yd[b]) / demand_scale
+                sigma_norm = sigma / demand_scale
+                if args.predict_uncertainty and args.predict_typed_demand:
+                    cal_loss = (torch.relu(residual_norm - B[b] * sigma_norm) * observed).sum() / denom_cal
+                    cal_loss = cal_loss + 0.001 * (sigma_norm * observed).sum() / denom_cal
+                else:
+                    cal_loss = zero
+                loss = edge_loss + value_loss + phase_loss + demand_loss + cal_loss + availability_loss
 
-            w = float(len(b))
+            opt.zero_grad(set_to_none=True)
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
+
+            w = float(b.numel())
             epoch_weight += w
-            vals = {
-                "L_edge": edge_loss, "L_value": value_loss, "L_phase": phase_loss,
-                "L_demand": demand_loss, "L_cal": cal_loss, "L_availability": availability_loss,
-                "L_total": loss,
-            }
-            for key, value in vals.items():
-                epoch_sum[key] += float(value.detach().cpu()) * w
-        epoch_losses = {key: value / max(epoch_weight, 1.0) for key, value in epoch_sum.items()}
-        metrics_rows.append({"epoch": epoch, **epoch_losses})
-        print(
+            loss_vec = torch.stack([
+                edge_loss, value_loss, phase_loss, demand_loss, cal_loss, availability_loss, loss
+            ]).detach().to(dtype=torch.float64)
+            epoch_sum += loss_vec * w
+
+            if args.progress and (step == 1 or step % max(1, args.progress_update_interval) == 0 or step == num_steps):
+                # One synchronization per display update, rather than seven per batch.
+                lv = loss_vec.float().cpu().tolist()
+                samples_done = min(start + bs, len(idx))
+                elapsed = max(time.perf_counter() - epoch_t0, 1e-9)
+                postfix = {
+                    "loss": f"{lv[-1]:.4f}",
+                    "edge": f"{lv[0]:.4f}",
+                    "value": f"{lv[1]:.4f}",
+                    "demand": f"{lv[3]:.4f}",
+                    "samples/s": f"{samples_done/elapsed:,.0f}",
+                }
+                if str(device).startswith("cuda"):
+                    postfix["memGB"] = f"{torch.cuda.memory_allocated(device)/1024**3:.2f}"
+                bar.set_postfix(postfix, refresh=False)
+
+        epoch_vals = (epoch_sum / max(epoch_weight, 1.0)).float().cpu().tolist()
+        epoch_losses = dict(zip(loss_names, map(float, epoch_vals)))
+        epoch_seconds = time.perf_counter() - epoch_t0
+        metrics_rows.append({
+            "epoch": epoch, **epoch_losses,
+            "epoch_seconds": float(epoch_seconds),
+            "samples_per_second": float(len(idx) / max(epoch_seconds, 1e-9)),
+        })
+        tqdm.write(
             f"[CAPPLAN_CASA_TRAIN] epoch={epoch}/{args.epochs} "
             f"L_edge={epoch_losses['L_edge']:.6f} L_value={epoch_losses['L_value']:.6f} "
             f"L_demand={epoch_losses['L_demand']:.6f} L_cal={epoch_losses['L_cal']:.6f} "
-            f"L_total={epoch_losses['L_total']:.6f}"
+            f"L_total={epoch_losses['L_total']:.6f} time={epoch_seconds:.1f}s "
+            f"throughput={len(idx)/max(epoch_seconds,1e-9):,.0f} samples/s"
         )
 
-    predv = _torch_predict_batched(model, xvn, batch_size=args.eval_batch_size, device=device)
+    print(f"[CAPPLAN_CASA_TRAIN] optimization_done seconds={time.perf_counter()-training_t0:.1f}; starting validation")
+    predv = _torch_predict_batched(
+        model, xvn, batch_size=args.eval_batch_size, device=device, amp_mode=args.amp,
+        show_progress=args.progress, desc="CASA validation", preload_max_mb=args.eval_preload_max_mb,
+    )
     val_edge = _sigmoid(predv["edge_logits"])
     val_value = predv["value"]
     val_phase = _softmax(predv["phase_logits"])
@@ -357,16 +525,16 @@ def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_ava
     val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv), uncertainty_pred=val_uncertainty, uncertainty_beta=v_uncertainty_beta, availability_pred=val_availability, availability_target=yv_availability, demand_scale=demand_scale_np, resource_names=vocab.resources)
     checkpoint = {
         "mode": args.casa_mode,
+        "training_runtime_version": CASA_TRAINING_RUNTIME_VERSION,
         "model_type": f"casa_{args.model_type}_multihead",
         "architecture_semantics": "relation_aware_transition_mlp_surrogate",
         "true_heterogeneous_message_passing": False,
-        "torch_state_dict": model.state_dict(),
+        "torch_state_dict": base_model.state_dict(),
         "weights": {"mean": mean.tolist(), "std": std.tolist()},
-        "input_dim": int(input_dim), "num_phases": len(vocab.phases), "num_resources": len(vocab.resources), "vocab": vocab.to_dict(), "demand_normalizers": {name: float(scale) for name, scale in zip(vocab.resources, demand_scale_np)}, "config": {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight)},
+        "input_dim": int(input_dim), "num_phases": len(vocab.phases), "num_resources": len(vocab.resources), "vocab": vocab.to_dict(), "demand_normalizers": {name: float(scale) for name, scale in zip(vocab.resources, demand_scale_np)}, "config": {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight), "fused_adamw_resolved": bool(fused)},
     }
     _save_checkpoint(out / "checkpoint.pt", checkpoint)
     return metrics_rows, val_metrics, checkpoint
-
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Train CASA-Net learned edge/value/demand/phase predictors.")
@@ -375,9 +543,18 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=1024)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--eval_batch_size", type=int, default=8192, help="Chunk size for validation inference; avoids an extra full-dataset GPU forward pass.")
+    p.add_argument("--eval_batch_size", type=int, default=8192, help="Chunk size for validation inference.")
     p.add_argument("--seed", type=int, default=13)
-    p.add_argument("--device", default="auto")
+    p.add_argument("--device", default="auto", help="Training device, e.g. cuda:0. For the current small relation_mlp, one GPU per seed is preferred over DDP.")
+    p.add_argument("--amp", choices=["off", "bf16", "fp16"], default="off", help="Optional CUDA autocast. off preserves the FP32 baseline; bf16 is the recommended A30 speed mode after confirming metric parity.")
+    p.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=False, help="Allow TF32 matmul on CUDA. Disabled by default for closest FP32 reproducibility.")
+    p.add_argument("--matmul_precision", choices=["highest", "high", "medium"], default="highest")
+    p.add_argument("--fused_adamw", choices=["auto", "on", "off"], default="auto", help="Use fused CUDA AdamW when supported; auto enables it on CUDA.")
+    p.add_argument("--torch_compile", action="store_true", help="Optionally compile the tiny CASA surrogate with torch.compile; eager remains the compatibility default.")
+    p.add_argument("--compile_mode", choices=["default", "reduce-overhead", "max-autotune"], default="reduce-overhead")
+    p.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Show TQDM data/training/validation progress.")
+    p.add_argument("--progress_update_interval", type=int, default=20, help="Refresh loss/throughput postfix every N training batches.")
+    p.add_argument("--eval_preload_max_mb", type=int, default=2048, help="Preload validation features to CUDA when they fit this budget; otherwise stream batches.")
     p.add_argument("--casa_mode", choices=["learned", "heuristic_oracle_baseline"], default="learned")
     p.add_argument("--model_type", choices=["relation_mlp", "hgt", "rgcn", "linear_smoke"], default="linear_smoke")
     p.add_argument("--paper_mode", action="store_true")
@@ -429,8 +606,10 @@ def main() -> None:
     args.feature_policy = feature_policy
     if args.phase_supervision and feature_policy == "paper_safe_v2":
         print("WARNING: current relation_mlp phase head reconstructs a candidate-transition phase and is an auxiliary head, not the runtime service-phase belief model described by the paper.")
-    train = CASADataset(args.dataset_dir, "train", vocab, value_target=args.value_target, feature_policy=feature_policy)
-    val = CASADataset(args.dataset_dir, "val", vocab, value_target=args.value_target, feature_policy=feature_policy)
+    print("[CAPPLAN_CASA_DATA] loading train split")
+    train = CASADataset(args.dataset_dir, "train", vocab, value_target=args.value_target, feature_policy=feature_policy, show_progress=args.progress)
+    print("[CAPPLAN_CASA_DATA] loading val split")
+    val = CASADataset(args.dataset_dir, "val", vocab, value_target=args.value_target, feature_policy=feature_policy, show_progress=args.progress)
     if not train.samples:
         raise RuntimeError(f"no CASA training samples found in {args.dataset_dir}")
     if args.paper_mode and not train.split_file.exists():
@@ -440,14 +619,21 @@ def main() -> None:
             "paper_mode requires a non-empty, disjoint validation split in the same canonical dataset directory; "
             "merge abilitybench_av_train + abilitybench_av_val (+ test) before training instead of silently validating on train"
         )
-    x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, uncertainty_beta = train.arrays_for_training()
-    xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, v_uncertainty_beta = val.arrays_for_training() if val.samples else train.arrays_for_training()
-    device = _device_auto(args.device)
-    pos = float(np.sum(y_edge >= 0.5)); neg = float(len(y_edge) - pos)
-    edge_pos_weight = (neg / max(pos, 1.0)) if str(args.edge_pos_weight).lower() == "auto" else max(0.0, float(args.edge_pos_weight))
     sample_probs, sampler_report = _balanced_sampling_probabilities(
         train.samples, profile_balanced=args.profile_balanced_sampler, action_balanced=args.action_balanced_sampler
     )
+    num_train_samples = len(train.samples)
+    num_val_samples = len(val.samples)
+    x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, uncertainty_beta = train.arrays_for_training()
+    xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, v_uncertainty_beta = val.arrays_for_training() if val.samples else train.arrays_for_training()
+    # CASASample objects are very memory-heavy at ~1.6M train pairs. Once dense
+    # arrays and sampler probabilities exist, release them before CUDA training.
+    del train, val
+    gc.collect()
+    device = _device_auto(args.device)
+    pos = float(np.sum(y_edge >= 0.5)); neg = float(len(y_edge) - pos)
+    edge_pos_weight = (neg / max(pos, 1.0)) if str(args.edge_pos_weight).lower() == "auto" else max(0.0, float(args.edge_pos_weight))
+    print(f"[CAPPLAN_CASA_DATA] train_samples={num_train_samples:,} val_samples={num_val_samples:,} input_dim={x.shape[1]} edge_positive_rate={pos/max(len(y_edge),1):.6f}")
     if args.model_type == "linear_smoke":
         metrics_rows, val_metrics, checkpoint = _train_numpy(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_availability, uncertainty_beta, xv, yv_edge, yv_value, yv_phase, yv_demand, vmask, yv_availability, v_uncertainty_beta, edge_pos_weight, vocab, out, device, sample_probs=sample_probs)
     else:
@@ -455,7 +641,7 @@ def main() -> None:
     if args.paper_mode and (val_metrics.get("L_phase", 0.0) <= 0.0 or val_metrics.get("L_demand", 0.0) <= 0.0):
         raise RuntimeError(f"paper_mode requires non-zero L_phase and L_demand; got L_phase={val_metrics.get('L_phase')} L_demand={val_metrics.get('L_demand')}")
     dump_json(out / "vocab.json", vocab.to_dict())
-    dump_json(out / "config.json", {**vars(args), "edge_pos_weight_resolved": float(edge_pos_weight), "mode": args.casa_mode, "device_resolved": device, "input_dim": int(x.shape[1]), "feature_policy": feature_policy, "num_train_samples": len(train.samples), "edge_train_positive_rate": float(np.mean(y_edge >= 0.5)), "model_type": checkpoint.get("model_type"), "architecture_semantics": checkpoint.get("architecture_semantics", "linear_smoke"), "true_heterogeneous_message_passing": bool(checkpoint.get("true_heterogeneous_message_passing", False)), "sampler_report": sampler_report, "relation_categorical_slots_unnormalized": 3, "phase_head_semantics": "candidate_transition_phase_auxiliary_not_runtime_phase_belief"})
+    dump_json(out / "config.json", {"training_runtime_version": CASA_TRAINING_RUNTIME_VERSION, **vars(args), "edge_pos_weight_resolved": float(edge_pos_weight), "mode": args.casa_mode, "device_resolved": device, "input_dim": int(x.shape[1]), "feature_policy": feature_policy, "num_train_samples": int(num_train_samples), "num_val_samples": int(num_val_samples), "edge_train_positive_rate": float(np.mean(y_edge >= 0.5)), "model_type": checkpoint.get("model_type"), "architecture_semantics": checkpoint.get("architecture_semantics", "linear_smoke"), "true_heterogeneous_message_passing": bool(checkpoint.get("true_heterogeneous_message_passing", False)), "sampler_report": sampler_report, "relation_categorical_slots_unnormalized": 3, "phase_head_semantics": "candidate_transition_phase_auxiliary_not_runtime_phase_belief"})
     write_jsonl(out / "train_metrics.jsonl", metrics_rows)
     dump_json(out / "val_metrics.json", val_metrics)
     if args.save_calibration_report:

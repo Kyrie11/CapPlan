@@ -29,6 +29,7 @@ class PlannerConfig:
     trajectory_mode: str = "mock_strict"
     casa_mode: str = "heuristic_oracle_baseline"
     casa_checkpoint: str | Path | Dict[str, Any] | None = None
+    casa_device: str = "auto"
 
 
 class CapPlanPlanner:
@@ -37,7 +38,7 @@ class CapPlanPlanner:
         self.registry = registry
         self.compiler = CapabilityCompiler(registry, disabled=self.config.no_capability_compiler, soft_only=self.config.soft_only_capability)
         self.automaton = ServiceAutomaton(disabled=self.config.no_service_automaton)
-        self.casa = CASANet(mode=self.config.casa_mode, disabled=self.config.no_casa_net_transitions, checkpoint=self.config.casa_checkpoint)
+        self.casa = CASANet(mode=self.config.casa_mode, disabled=self.config.no_casa_net_transitions, checkpoint=self.config.casa_checkpoint, device=self.config.casa_device)
         self.generator = TransitionGenerator()
         self.searcher = TypedSafeBudgetSearch(
             self.automaton,
@@ -114,6 +115,7 @@ class CapPlanPlanner:
             "vehicle_safe": vehicle_safe,
             "capability_satisfied": capability_satisfied,
             "capability_margins": margins,
+            "failed_resources": failed,
             "passenger_complete_semantics": "PC=Accept(sigma) AND Safe(tau_v) AND Sat(sigma,tau_v,Psi_p)",
         })
         return PlannerResult(success=passenger_complete, skeleton=skeleton, certificate=cert, diagnostics=diag)

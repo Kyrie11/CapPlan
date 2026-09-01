@@ -52,6 +52,9 @@ def main() -> None:
     p.add_argument("--variants", nargs="*", choices=list(ABLATION_FLAGS.keys()), default=None)
     p.add_argument("--casa_mode", choices=["heuristic_oracle_baseline", "learned"], default="heuristic_oracle_baseline")
     p.add_argument("--casa_checkpoint", default=None)
+    p.add_argument("--casa_device", default="auto", help="Device for learned CASA inference, e.g. cuda:0.")
+    p.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--progress_update_interval", type=int, default=25)
     p.add_argument("--paper_mode", action="store_true")
     p.add_argument("--nuplan_sim_config", default=None, help="Optional provenance path for the external nuPlan simulation config; this wrapper does not execute Hydra.")
     p.add_argument("--allow_posthoc_episode_vehicle_metrics", action="store_true")
@@ -61,12 +64,20 @@ def main() -> None:
     if args.paper_mode:
         _validate_paper(dataset_dir, args.trajectory_mode, args.casa_mode, args.casa_checkpoint, args.nuplan_sim_config, args.allow_posthoc_episode_vehicle_metrics)
     variants = args.variants or list(ABLATION_FLAGS.keys())
+    from tqdm.auto import tqdm
     rows = {}
-    for name in variants:
+    variant_bar = tqdm(variants, desc="CapPlan ablations", unit="variant", dynamic_ncols=True, disable=not args.progress)
+    for name in variant_bar:
+        variant_bar.set_postfix({"variant": name}, refresh=False)
         cfg = ablation_config(name, trajectory_mode=args.trajectory_mode)
         cfg.casa_mode = args.casa_mode
         cfg.casa_checkpoint = args.casa_checkpoint
-        res = ClosedLoopRunner(cfg).run_dataset(dataset_dir, output_dir / "ablations" / name)
+        cfg.casa_device = args.casa_device
+        res = ClosedLoopRunner(cfg).run_dataset(
+            dataset_dir, output_dir / "ablations" / name,
+            show_progress=args.progress, progress_update_interval=args.progress_update_interval,
+            progress_desc=f"Ablation {name}",
+        )
         rows[name] = res["metrics"]
     write_csv(output_dir / "ablation_results.csv", rows)
     for k, v in rows.items():

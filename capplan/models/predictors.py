@@ -55,7 +55,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
     enforced by the planner.
     """
 
-    def __init__(self, checkpoint: Dict[str, Any] | None = None) -> None:
+    def __init__(self, checkpoint: Dict[str, Any] | None = None, device: str = "auto") -> None:
         self.checkpoint = checkpoint or {}
         vocab_payload = self.checkpoint.get("vocab", {}) if isinstance(self.checkpoint, dict) else {}
         self.vocab = FeatureVocab(**vocab_payload) if isinstance(vocab_payload, dict) and vocab_payload else FeatureVocab()
@@ -66,6 +66,8 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
         if self.feature_policy not in {"legacy", "paper_safe", "paper_safe_v2"}:
             self.feature_policy = "legacy"
         self._torch_model = None
+        self._torch_device = "cpu"
+        self.requested_device = str(device or "auto")
         if isinstance(self.checkpoint, dict) and self.checkpoint.get("torch_state_dict") is not None:
             self._init_torch_model()
 
@@ -79,10 +81,20 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             model_type = str(self.checkpoint.get("config", {}).get("model_type", "relation_mlp"))
             model = CASAHetGraphNet(input_dim, num_phases, num_resources, model_type=model_type)
             model.load_state_dict(self.checkpoint["torch_state_dict"], strict=False)
+            if self.requested_device == "auto":
+                resolved = "cuda" if torch.cuda.is_available() else "cpu"
+            else:
+                resolved = self.requested_device
+            if resolved.startswith("cuda") and not torch.cuda.is_available():
+                raise RuntimeError(f"CASA inference requested {resolved} but CUDA is unavailable")
+            model.to(resolved)
             model.eval()
+            self._torch_device = resolved
             self._torch_model = model
         except Exception:
             self._torch_model = None
+            if self.requested_device != "auto":
+                raise
 
     @staticmethod
     def _sigmoid(x: float) -> float:
@@ -119,7 +131,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             try:  # pragma: no cover - depends on torch
                 import torch
                 with torch.no_grad():
-                    pred = self._torch_model(torch.tensor([x], dtype=torch.float32))
+                    pred = self._torch_model(torch.tensor([x], dtype=torch.float32, device=self._torch_device))
                     edge_prob = float(torch.sigmoid(pred["edge_logits"])[0].cpu())
                     value_prob = float(pred["value"][0].cpu())
                     availability_prob = float(pred.get("availability", torch.ones_like(pred["value"]))[0].cpu())
@@ -142,9 +154,62 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
         availability_prob = self._sigmoid(availability_logit) if availability_logit is not None else None
         return edge_prob, value_prob, availability_prob, None, None
 
+    def _predict_heads_batch(self, transitions: List[CandidateTransition], context: Dict[str, Any] | None = None):
+        """Predict all transitions for one passenger in one model call.
+
+        reviewfix9 executed batch=1 inference once per transition and kept the
+        checkpoint on CPU. Batching preserves per-transition semantics for the
+        current feed-forward model while eliminating thousands of tiny model
+        calls during evaluation.
+        """
+        if not transitions:
+            return []
+        xs = [self._normalized_features(e, context) for e in transitions]
+        if self._torch_model is not None:
+            try:  # pragma: no cover - depends on torch
+                import torch
+                x = torch.tensor(xs, dtype=torch.float32, device=self._torch_device)
+                with torch.inference_mode():
+                    pred = self._torch_model(x)
+                    edge = torch.sigmoid(pred["edge_logits"]).float().cpu().numpy()
+                    value = pred["value"].float().cpu().numpy()
+                    avail = pred.get("availability", torch.ones_like(pred["value"])).float().cpu().numpy()
+                    demand = pred["typed_demand"].float().cpu().numpy()
+                    unc = pred["uncertainty"].float().cpu().numpy()
+                return [
+                    (
+                        float(edge[i]), float(value[i]), max(0.0, min(1.0, float(avail[i]))),
+                        {r: float(demand[i, j]) for j, r in enumerate(self.vocab.resources[: demand.shape[1]])},
+                        {r: float(unc[i, j]) for j, r in enumerate(self.vocab.resources[: unc.shape[1]])},
+                    )
+                    for i in range(len(transitions))
+                ]
+            except Exception:
+                pass
+        # Backward-compatible linear/numpy fallback.
+        rows = []
+        for x in xs:
+            edge_logit = self._dot(self.weights.get("W_edge"), x)
+            value_logit = self._dot(self.weights.get("W_value"), x)
+            availability_logit = self._dot(self.weights.get("W_availability"), x)
+            if edge_logit is not None:
+                edge_logit += float(self.weights.get("b_edge", 0.0))
+            if value_logit is not None:
+                value_logit += float(self.weights.get("b_value", 0.0))
+            if availability_logit is not None:
+                availability_logit += float(self.weights.get("b_availability", 0.0))
+            rows.append((
+                self._sigmoid(edge_logit) if edge_logit is not None else None,
+                self._sigmoid(value_logit) if value_logit is not None else None,
+                self._sigmoid(availability_logit) if availability_logit is not None else None,
+                None, None,
+            ))
+        return rows
+
     def predict(self, transitions: List[CandidateTransition], context: Dict[str, Any] | None = None) -> Dict[str, TransitionPrediction]:
         out: Dict[str, TransitionPrediction] = {}
-        for e in transitions:
+        head_rows = self._predict_heads_batch(transitions, context)
+        for e, head in zip(transitions, head_rows):
             uncert = {ev.resource_name: max(ev.sigma, 0.01) for ev in e.resource_evidence}
             # Conservative learned-mode prior: use explicit transition tests and
             # saved availability as inputs, but do not invent symbolic validity.
@@ -156,7 +221,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                 e.tests.interface_valid,
                 e.tests.dynamically_available,
             ])
-            edge_prob, value_prob, availability_prob, demand_pred, unc_pred = self._predict_heads(e, context)
+            edge_prob, value_prob, availability_prob, demand_pred, unc_pred = head
             typed_evidence = e.resource_evidence
             if demand_pred:
                 # Replace numeric evidence values with learned demand predictions
