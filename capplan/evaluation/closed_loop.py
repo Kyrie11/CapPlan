@@ -165,6 +165,7 @@ class ClosedLoopRunner:
         dataset_dir = Path(dataset_dir)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        dump_json(output_dir / "planner_config.json", asdict(self.config))
         data = self._load_dataset(dataset_dir)
         metrics_rows: List[Dict[str, Any]] = []
         plans: List[Dict[str, Any]] = []
@@ -242,10 +243,19 @@ class ClosedLoopRunner:
         dump_json(output_dir / "metrics.json", aggregate)
         vehicle_semantics = sorted({str(r.get("vehicle_metric_semantics") or "unknown") for r in metrics_rows})
         integrated_ready = bool(metrics_rows) and all(bool(r.get("method_specific_closed_loop")) for r in metrics_rows)
+        attribution_warnings = []
+        if aggregate.get("PCR", 0.0) <= 0.0:
+            attribution_warnings.append("PCR is zero; component ablations cannot support positive passenger-completion attribution.")
+        if aggregate.get("PlanReturnRate", 0.0) <= 0.0:
+            attribution_warnings.append("TSBS returned no service skeletons; search-level ablations are bottleneck-confounded.")
+        if aggregate.get("TSBS_expansions_p95", 0.0) <= 1.0:
+            attribution_warnings.append("TSBS p95 expansions <= 1; most requests terminate at the initial frontier.")
         eval_semantics = {
             "vehicle_metric_semantics": vehicle_semantics,
             "publication_integrated_vehicle_closed_loop_ready": integrated_ready,
             "passenger_service_metrics_available": bool(metrics_rows),
+            "algorithm_attribution_ready": not attribution_warnings,
+            "algorithm_attribution_warnings": attribution_warnings,
             "note": (
                 "Passenger/service metrics can be used for offline/service evaluation. Final vehicle closed-loop claims require "
                 "method-specific nuPlan simulation of CapPlan-selected service decisions; post-hoc episode metrics and mock_strict are not sufficient."

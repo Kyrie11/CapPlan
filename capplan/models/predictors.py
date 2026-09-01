@@ -7,6 +7,7 @@ import math
 
 from capplan.data.schemas import CandidateTransition, ResourceEvidence
 from capplan.models.casa_features import FeatureVocab, encode_transition_with_capability
+from capplan.semantics.resource_registry import DEFAULT_REGISTRY
 
 
 @dataclass
@@ -17,6 +18,10 @@ class TransitionPrediction:
     dynamic_availability: float
     completion_value: float
     phase_belief: Dict[str, float]
+    # Learned passenger-independent transition-validity prior.  This is a
+    # search-ordering signal, not dynamic availability and never overrides the
+    # symbolic transition tests.
+    edge_validity: float = 1.0
 
 
 class BaseTransitionPredictor:
@@ -39,6 +44,7 @@ class HeuristicTransitionPredictor(BaseTransitionPredictor):
                 dynamic_availability=e.availability,
                 completion_value=max(1e-4, min(1.0, e.completion_value)),
                 phase_belief=belief,
+                edge_validity=1.0 if e.tests.z_e else 0.0,
             )
         return out
 
@@ -55,7 +61,11 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
     enforced by the planner.
     """
 
-    def __init__(self, checkpoint: Dict[str, Any] | None = None, device: str = "auto") -> None:
+    def __init__(
+        self, checkpoint: Dict[str, Any] | None = None, device: str = "auto",
+        *, no_learned_demand: bool = False, no_learned_uncertainty: bool = False,
+        no_learned_availability: bool = False,
+    ) -> None:
         self.checkpoint = checkpoint or {}
         vocab_payload = self.checkpoint.get("vocab", {}) if isinstance(self.checkpoint, dict) else {}
         self.vocab = FeatureVocab(**vocab_payload) if isinstance(vocab_payload, dict) and vocab_payload else FeatureVocab()
@@ -68,6 +78,9 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
         self._torch_model = None
         self._torch_device = "cpu"
         self.requested_device = str(device or "auto")
+        self.no_learned_demand = bool(no_learned_demand)
+        self.no_learned_uncertainty = bool(no_learned_uncertainty)
+        self.no_learned_availability = bool(no_learned_availability)
         if isinstance(self.checkpoint, dict) and self.checkpoint.get("torch_state_dict") is not None:
             self._init_torch_model()
 
@@ -223,28 +236,57 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             ])
             edge_prob, value_prob, availability_prob, demand_pred, unc_pred = head
             typed_evidence = e.resource_evidence
-            if demand_pred:
-                # Replace numeric evidence values with learned demand predictions
-                # only for already-observed resources; missing evidence remains missing.
+            if demand_pred and not self.no_learned_demand:
+                # Only numerical typed resources are regression targets.  Python
+                # bool is an int subclass, so the historical isinstance(...,
+                # (int,float,bool)) path silently overwrote categorical ramp/lift
+                # evidence with an unsupervised continuous head.  Keep categorical
+                # predicates authoritative and replace only finite numerical fields
+                # that actually participate in the demand loss.
                 from dataclasses import replace as _replace
-                typed_evidence = [_replace(ev, value=demand_pred.get(ev.resource_name, ev.value), sigma=(unc_pred or {}).get(ev.resource_name, ev.sigma)) if (not ev.missing and isinstance(ev.value, (int, float, bool))) else ev for ev in e.resource_evidence]
+                repaired = []
+                for ev in e.resource_evidence:
+                    if ev.missing or ev.value is None or not DEFAULT_REGISTRY.has(ev.resource_name):
+                        repaired.append(ev)
+                        continue
+                    rt = DEFAULT_REGISTRY.get(ev.resource_name)
+                    if rt.kind == "categorical" or isinstance(ev.value, bool):
+                        repaired.append(ev)
+                        continue
+                    try:
+                        pred_value = float(demand_pred.get(ev.resource_name, ev.value))
+                        pred_sigma = float(ev.sigma if self.no_learned_uncertainty else (unc_pred or {}).get(ev.resource_name, ev.sigma))
+                    except Exception:
+                        repaired.append(ev)
+                        continue
+                    if not (math.isfinite(pred_value) and math.isfinite(pred_sigma)):
+                        repaired.append(ev)
+                        continue
+                    repaired.append(_replace(ev, value=pred_value, sigma=max(0.0, pred_sigma)))
+                typed_evidence = repaired
             if edge_prob is None:
                 edge_prob = 1.0 if test_ok else 0.05
             if value_prob is None:
                 value_prob = e.completion_value
             if availability_prob is None:
                 availability_prob = 1.0
-            # Learned edge validity and learned dynamic availability are both
-            # soft priors. Symbolic tests remain hard gates in the searcher, so
-            # a checkpoint cannot make an invalid edge valid, but it can
-            # deprioritize low-probability or currently unavailable transitions.
-            soft_prior = min(max(0.0, min(1.0, float(edge_prob))), max(0.0, min(1.0, float(availability_prob))))
-            availability = e.availability * soft_prior if test_ok else min(e.availability, 0.1)
+            # ``z_e``/edge validity and dynamic availability are distinct CASA
+            # heads.  The old code took min(edge_prob, availability_prob) and fed
+            # that result into the hard availability gate, so a classification
+            # error was misinterpreted as a dynamic blockage.  Keep edge validity
+            # as a soft ordering prior and use only the availability head for the
+            # availability estimate; symbolic tests remain authoritative.
+            edge_validity = max(1e-4, min(1.0, float(edge_prob)))
+            availability = (
+                e.availability
+                if self.no_learned_availability
+                else e.availability * max(0.0, min(1.0, float(availability_prob)))
+            )
             value = max(1e-4, min(1.0, float(value_prob)))
             out[e.transition_id] = TransitionPrediction(
                 transition_id=e.transition_id,
                 typed_evidence=typed_evidence,
-                uncertainty=unc_pred or uncert,
+                uncertainty=uncert if self.no_learned_uncertainty else (unc_pred or uncert),
                 dynamic_availability=availability,
                 completion_value=value,
                 # The current relation-MLP checkpoint does not implement the
@@ -252,5 +294,6 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                 # transition prior rather than mislabeling the auxiliary phase
                 # head as a global phase belief.
                 phase_belief={e.from_phase: 0.4, e.to_phase: 0.6},
+                edge_validity=edge_validity,
             )
         return out

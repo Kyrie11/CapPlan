@@ -18,6 +18,7 @@ from capplan.semantics.typed_resource_algebra import satisfy_all
 
 @dataclass
 class PlannerConfig:
+    algorithm_version: str = "V1"
     no_capability_compiler: bool = False
     no_service_automaton: bool = False
     no_casa_net_transitions: bool = False
@@ -25,6 +26,12 @@ class PlannerConfig:
     no_conservative_margins: bool = False
     no_completion_value_guidance: bool = False
     soft_only_capability: bool = False
+    # Diagnostic head-isolation flags. These do not change dataset labels; they
+    # selectively replace one learned CASA head with saved symbolic evidence to
+    # localize a collapsed runtime pipeline before proposing a new algorithm.
+    no_learned_demand: bool = False
+    no_learned_uncertainty: bool = False
+    no_learned_availability: bool = False
     beta: float = 1.0
     trajectory_mode: str = "mock_strict"
     casa_mode: str = "heuristic_oracle_baseline"
@@ -38,7 +45,13 @@ class CapPlanPlanner:
         self.registry = registry
         self.compiler = CapabilityCompiler(registry, disabled=self.config.no_capability_compiler, soft_only=self.config.soft_only_capability)
         self.automaton = ServiceAutomaton(disabled=self.config.no_service_automaton)
-        self.casa = CASANet(mode=self.config.casa_mode, disabled=self.config.no_casa_net_transitions, checkpoint=self.config.casa_checkpoint, device=self.config.casa_device)
+        self.casa = CASANet(
+            mode=self.config.casa_mode, disabled=self.config.no_casa_net_transitions,
+            checkpoint=self.config.casa_checkpoint, device=self.config.casa_device,
+            no_learned_demand=self.config.no_learned_demand,
+            no_learned_uncertainty=self.config.no_learned_uncertainty,
+            no_learned_availability=self.config.no_learned_availability,
+        )
         self.generator = TransitionGenerator()
         self.searcher = TypedSafeBudgetSearch(
             self.automaton,

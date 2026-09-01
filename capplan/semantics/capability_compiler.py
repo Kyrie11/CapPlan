@@ -127,8 +127,12 @@ class CapabilityCompiler:
                 passenger_id=contract.passenger_id,
                 clauses=[] if not self.soft_only else list(contract.clauses),
                 groups=[] if not self.soft_only else list(contract.groups),
-                tokens=[self._token(c) for c in contract.clauses],
-                metadata={**contract.metadata, "compiler_disabled": True, "trip_context": trip_context},
+                # Preserve only untyped passenger burden information.  The old
+                # ablation still emitted resource/kind/operator/phase typed tokens,
+                # so learned CASA received almost the full semantic compiler even
+                # when ``no_capability_compiler`` was enabled.
+                tokens=[self._untyped_token(c) for c in contract.clauses],
+                metadata={**contract.metadata, "compiler_disabled": True, "untyped_capability_tokens": True, "trip_context": trip_context},
                 soft_only=self.soft_only,
             )
 
@@ -211,6 +215,16 @@ class CapabilityCompiler:
         if mods.get("temporary_assistance_required") and not has_resource("assistance"):
             out.append(CapabilityClause("assistance", ["wait", "board", "alight"], "requires", True, "categorical", source="trip_modifier", clause_id=f"{passenger_id}:c{next_idx:02d}:assistance", missing_policy="fail_closed"))
         return out, group_out
+
+    @classmethod
+    def _untyped_token(cls, c: CapabilityClause) -> Dict[str, Any]:
+        tok = dict(cls._token(c))
+        tok["resource_id"] = -1
+        tok["kind_id"] = -1
+        tok["operator_id"] = -1
+        tok["categorical_value"] = "<untyped>"
+        tok["phase_mask"] = [1 for _ in PHASE_VOCAB]
+        return tok
 
     @staticmethod
     def _token(c: CapabilityClause) -> Dict[str, Any]:

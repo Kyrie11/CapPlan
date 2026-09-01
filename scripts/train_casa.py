@@ -525,6 +525,7 @@ def _train_torch(args, x, y_edge, y_value, y_phase, y_demand, demand_mask, y_ava
     val_metrics = _metrics_from_predictions(val_edge, yv_edge, val_value, yv_value, val_phase, yv_phase, val_demand, yv_demand, vmask, edge_pos_weight, args.casa_mode, device, len(xv), uncertainty_pred=val_uncertainty, uncertainty_beta=v_uncertainty_beta, availability_pred=val_availability, availability_target=yv_availability, demand_scale=demand_scale_np, resource_names=vocab.resources)
     checkpoint = {
         "mode": args.casa_mode,
+        "algorithm_version": "V1",
         "training_runtime_version": CASA_TRAINING_RUNTIME_VERSION,
         "model_type": f"casa_{args.model_type}_multihead",
         "architecture_semantics": "relation_aware_transition_mlp_surrogate",

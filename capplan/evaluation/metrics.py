@@ -211,6 +211,43 @@ def signed_margin_error(episodes: List[Dict[str, Any]]) -> float:
     return _mean(vals)
 
 
+
+
+def plan_return_rate(episodes: List[Dict[str, Any]]) -> float:
+    """Fraction of requests for which TSBS returns any service skeleton."""
+    return _mean([1.0 if e.get("plan_returned", False) else 0.0 for e in episodes])
+
+
+def counterfactual_breakdown(pairs: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Outcome-aware T4 diagnostics.
+
+    Aggregate CRsp can look deceptively high when both the oracle and a collapsed
+    model fail on most pairs.  These terms expose whether the model reproduces
+    oracle success/failure outcomes and, in particular, the capability-induced
+    success flips that motivate passenger-conditioned planning.
+    """
+    if not pairs:
+        return {
+            "outcome_pair_accuracy": 0.0,
+            "response_accuracy_oracle_changed": 0.0,
+            "response_accuracy_oracle_stable": 0.0,
+            "success_flip_recall": 0.0,
+            "oracle_changed_count": 0.0,
+            "oracle_success_flip_count": 0.0,
+        }
+    outcome = [1.0 if p.get("outcomes_match_oracle", False) else 0.0 for p in pairs]
+    changed = [p for p in pairs if p.get("oracle_changed", False)]
+    stable = [p for p in pairs if not p.get("oracle_changed", False)]
+    flips = [p for p in pairs if bool(p.get("oracle_weak_success")) != bool(p.get("oracle_strict_success"))]
+    return {
+        "outcome_pair_accuracy": _mean(outcome),
+        "response_accuracy_oracle_changed": _mean([1.0 if p.get("response_correct", False) else 0.0 for p in changed]),
+        "response_accuracy_oracle_stable": _mean([1.0 if p.get("response_correct", False) else 0.0 for p in stable]),
+        "success_flip_recall": _mean([1.0 if p.get("outcomes_match_oracle", False) else 0.0 for p in flips]),
+        "oracle_changed_count": float(len(changed)),
+        "oracle_success_flip_count": float(len(flips)),
+    }
+
 def capability_responsiveness(pairs: List[Dict[str, Any]]) -> float:
     """CRsp = agreement with verifier-approved counterfactual response behavior."""
     vals = []
@@ -272,6 +309,7 @@ def _mean_present_numeric(episodes: List[Dict[str, Any]], key: str) -> float:
 def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: List[Dict[str, Any]] | None = None) -> Dict[str, float]:
     diag = diagnostic_breakdown(episodes)
     pairs = counterfactual_pairs or []
+    cf = counterfactual_breakdown(pairs)
     metrics: Dict[str, float] = {
         "CR": collision_rate(episodes),
         "RC": route_completion(episodes),
@@ -281,6 +319,7 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "PCR": passenger_completion_rate(episodes),
         "TSPIR": traffic_safe_passenger_incomplete_rate(episodes),
         "PAR": phase_acceptance_rate(episodes),
+        "PlanReturnRate": plan_return_rate(episodes),
         "CVR": capability_violation_rate(episodes, accepted_only=True),
         "CVR_all_evaluated": capability_violation_rate(episodes, accepted_only=False),
         "CSM": capability_safety_margin(episodes),
@@ -296,6 +335,12 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "DF_source_macro_f1": diag["source_macro_f1"],
         "SME": signed_margin_error(episodes),
         "CRsp": capability_responsiveness(pairs),
+        "CF_outcome_pair_accuracy": cf["outcome_pair_accuracy"],
+        "CF_response_accuracy_oracle_changed": cf["response_accuracy_oracle_changed"],
+        "CF_response_accuracy_oracle_stable": cf["response_accuracy_oracle_stable"],
+        "CF_success_flip_recall": cf["success_flip_recall"],
+        "CF_oracle_changed_count": cf["oracle_changed_count"],
+        "CF_oracle_success_flip_count": cf["oracle_success_flip_count"],
         "ECA": efficiency_cost_of_accommodation(episodes),
         "ECA_evaluable_count": float(sum(1 for e in episodes if float(e.get("tt_std_s", 0.0) or 0.0) > 0.0)),
         "TSBS_expansions_mean": search_expansion_mean(episodes),
@@ -321,5 +366,8 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
     for axis in axes:
         subset = [p for p in pairs if str(p.get("counterfactual_axis") or p.get("axis")) == axis]
         metrics[f"CRsp_axis::{axis}"] = capability_responsiveness(subset)
+        axis_cf = counterfactual_breakdown(subset)
+        metrics[f"CF_success_flip_recall_axis::{axis}"] = axis_cf["success_flip_recall"]
+        metrics[f"CF_response_changed_axis::{axis}"] = axis_cf["response_accuracy_oracle_changed"]
     return metrics
 

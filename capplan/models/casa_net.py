@@ -32,16 +32,31 @@ class CASAOutput:
 
 
 class CASANet:
-    def __init__(self, mode: str = "heuristic_oracle_baseline", disabled: bool = False, checkpoint: Dict[str, Any] | str | Path | None = None, device: str = "auto") -> None:
+    def __init__(
+        self, mode: str = "heuristic_oracle_baseline", disabled: bool = False,
+        checkpoint: Dict[str, Any] | str | Path | None = None, device: str = "auto",
+        *, no_learned_demand: bool = False, no_learned_uncertainty: bool = False,
+        no_learned_availability: bool = False,
+    ) -> None:
         if mode not in {"heuristic_oracle_baseline", "learned", "heuristic"}:
             raise ValueError(f"unsupported CASA mode {mode}")
         self.mode = "heuristic_oracle_baseline" if mode == "heuristic" else mode
         self.disabled = disabled
         loaded_checkpoint = self._load_checkpoint(checkpoint)
+        # ``no_casa_net_transitions`` is an algorithmic ablation: it must
+        # replace learned CASA transition/demand/uncertainty/availability outputs
+        # with deterministic geometric/service evidence.  Historically the flag
+        # kept the learned predictor and only set completion_value=0.5, making the
+        # ablation nearly identical to ``no_completion_value_guidance``.
         self.predictor = (
             HeuristicTransitionPredictor()
-            if self.mode == "heuristic_oracle_baseline"
-            else LearnedLinearTransitionPredictor(checkpoint=loaded_checkpoint, device=device)
+            if (self.disabled or self.mode == "heuristic_oracle_baseline")
+            else LearnedLinearTransitionPredictor(
+                checkpoint=loaded_checkpoint, device=device,
+                no_learned_demand=no_learned_demand,
+                no_learned_uncertainty=no_learned_uncertainty,
+                no_learned_availability=no_learned_availability,
+            )
         )
 
     @staticmethod
@@ -67,14 +82,20 @@ class CASANet:
             "features": inputs.ego_agent_map_features,
         })
         if self.disabled:
-            # Ablation: deterministic geometric evidence is kept but transition
-            # value guidance is removed and availability is not learned.
+            # Deterministic ablation.  Retain the transition generator's geometric
+            # phase heuristic but remove learned completion guidance so this branch
+            # cannot accidentally benefit from the learned value head.
             for p in preds.values():
                 p.completion_value = 0.5
         return CASAOutput(
             phase_belief=inputs.phase_belief or {"origin": 1.0},
             transition_predictions=preds,
-            audit_history=[{"mode": self.mode, "disabled": self.disabled, "n_transitions": len(inputs.transitions)}],
+            audit_history=[{
+                "mode": self.mode,
+                "disabled": self.disabled,
+                "predictor": self.predictor.__class__.__name__,
+                "n_transitions": len(inputs.transitions),
+            }],
         )
 
     __call__ = forward

@@ -33,7 +33,12 @@ from capplan.semantics.typed_resource_algebra import (
 class SearchConfig:
     beta: float = 1.0
     lambda_value: float = 0.5
+    lambda_edge_validity: float = 0.25
     min_availability: float = 0.05
+    # Untyped-ledger ablation: one unit of normalized budget per canonical
+    # service transition.  Individual resource kinds may trade off because their
+    # distinct sum/max/min/predicate algebras are deliberately removed.
+    scalar_budget_limit: float = 7.0
     max_expansions: int = 10000
     no_typed_resource_ledger: bool = False
     no_conservative_margins: bool = False
@@ -102,7 +107,7 @@ class TypedSafeBudgetSearch:
         counter = itertools.count()
         labels: List[SearchLabel] = []
         for anchor, phase in start_states:
-            ledger = init_ledger(init_resources, self.registry)
+            ledger = ({"scalar_budget": 0.0} if self.config.no_typed_resource_ledger else init_ledger(init_resources, self.registry))
             start = SearchLabel(anchor, phase, ledger, 0.0, [], [])
             labels.append(start)
             heapq.heappush(pq, (0.0, next(counter), start))
@@ -112,7 +117,10 @@ class TypedSafeBudgetSearch:
         while pq and expansions < self.config.max_expansions:
             _, _, label = heapq.heappop(pq)
             expansions += 1
-            ok_final, _, _ = satisfy_all(label.resource_ledger, clauses, groups, self.registry)
+            if self.config.no_typed_resource_ledger:
+                ok_final = float(label.resource_ledger.get("scalar_budget", 0.0)) <= float(self.config.scalar_budget_limit)
+            else:
+                ok_final, _, _ = satisfy_all(label.resource_ledger, clauses, groups, self.registry)
             if self.automaton.accept(label.phase) and ok_final:
                 return PassengerCompleteSkeleton(
                     episode_id=episode_id,
@@ -124,13 +132,16 @@ class TypedSafeBudgetSearch:
                     cost=label.cost,
                 ), None, {"expansions": expansions, "violations": len(violations), "initial_states": start_states, "initial_state_source": initial_state_source}
 
-            candidates = list(outgoing.get((label.anchor, label.phase), []))
-            if not candidates:
-                # Phase-only fallback is intentionally restricted to the disabled
-                # automaton ablation and to transitions whose source anchor is a
-                # real current anchor or a replan edge.
-                if self.automaton.disabled:
-                    candidates = [e for e in transitions if e.from_phase == label.phase]
+            if self.automaton.disabled:
+                # ``w/o service automaton`` must actually remove lifecycle-state
+                # coupling. Candidate transitions are therefore connected by the
+                # current *spatial anchor* only and their recorded source phase is
+                # ignored for reachability. The historical implementation used the
+                # normal (anchor, phase) adjacency whenever it was non-empty, so the
+                # ablation followed the exact same lifecycle as full CapPlan.
+                candidates = [e for e in transitions if e.from_anchor == label.anchor]
+            else:
+                candidates = list(outgoing.get((label.anchor, label.phase), []))
             for e in candidates:
                 ok, new_ledger, step, vios = self._try_expand(label, e, compiled, clauses, groups, predictions.get(e.transition_id))
                 if not ok:
@@ -169,15 +180,17 @@ class TypedSafeBudgetSearch:
             return False, label.resource_ledger, None, [ViolationRecord(e.to_phase, e.transition_id, "availability", margin, "prediction", e.map_confidence, "dynamic_unavailable")]
 
         if self.config.no_typed_resource_ledger:
-            burden = float(label.resource_ledger.get("scalar_budget", 0.0))
-            for ev in (pred.typed_evidence if pred else e.resource_evidence):
-                if ev.kind != "categorical" and ev.value is not None:
-                    try:
-                        burden += abs(float(ev.value))
-                    except Exception:
-                        pass
+            evidence_list = pred.typed_evidence if pred else e.resource_evidence
+            active = active_clauses(clauses, [e.from_phase, e.to_phase])
+            active_groups_for_edge = active_groups(groups, [e.from_phase, e.to_phase])
+            edge_burden = self._scalarized_edge_burden(active, active_groups_for_edge, evidence_list, compiled, e.to_phase)
+            burden = float(label.resource_ledger.get("scalar_budget", 0.0)) + float(edge_burden)
             new_ledger = {"scalar_budget": burden}
-            step = LedgerStep(e.transition_id, e.to_phase, e.action, new_ledger, {}, [ev.__dict__ for ev in e.resource_evidence])
+            margins = {"scalar_budget": (float(self.config.scalar_budget_limit) - burden) / max(float(self.config.scalar_budget_limit), 1e-9)}
+            step = LedgerStep(e.transition_id, e.to_phase, e.action, new_ledger, margins, [ev.__dict__ for ev in e.resource_evidence])
+            # Unlike the historical implementation, this branch can reach an
+            # accepting state. Feasibility is decided by the single global scalar
+            # budget at acceptance rather than by a missing typed ledger.
             return True, new_ledger, step, []
 
         # 5. Resource update using conservative evidence and per-resource beta.
@@ -249,6 +262,59 @@ class TypedSafeBudgetSearch:
         step = LedgerStep(e.transition_id, e.to_phase, e.action, dict(new_ledger), margins, [ev.__dict__ for ev in e.resource_evidence])
         return True, new_ledger, step, []
 
+    def _scalarized_clause_utilization(self, clause, ev: ResourceEvidence | None, compiled: CompiledContract, phase: str) -> float:
+        """Map one typed clause to a dimensionless scalar utilization.
+
+        This is used only by the ``no_typed_resource_ledger`` ablation.  A value
+        of 1 is approximately the clause threshold; categorical mismatch and
+        missing evidence cost 2 units.  The construction intentionally permits
+        trade-offs across resource kinds, unlike the full typed ledger.
+        """
+        if ev is None or ev.missing or ev.value is None:
+            return 2.0
+        rt = self.registry.get(clause.resource_name)
+        if rt.kind == "categorical":
+            state = {clause.resource_name: update_value(None, ev.value, rt, evidence=ev, clause=clause)}
+            return 0.0 if satisfy(state, clause, self.registry) else 2.0
+        try:
+            beta = self._beta_for(compiled, clause.resource_name)
+            x = conservative_value(ev.value, ev.sigma, rt, beta=float(beta))
+            if is_missing(x):
+                return 2.0
+            val = float(x)
+            th = float(clause.risk_tolerance if (rt.kind == "probabilistic" and clause.risk_tolerance is not None) else clause.threshold)
+        except Exception:
+            return 2.0
+        if rt.feasibility_order == "larger":
+            return max(0.0, th) / max(val, 1e-6)
+        return max(0.0, val) / max(abs(th), 1e-6)
+
+    def _scalarized_edge_burden(self, active, groups, evidence_list, compiled: CompiledContract, phase: str) -> float:
+        by_resource: Dict[str, ResourceEvidence] = {}
+        for ev in evidence_list:
+            by_resource.setdefault(ev.resource_name, ev)
+        clause_by_id = {c.id: c for c in active}
+        grouped_ids = {cid for g in groups for cid in g.clause_ids}
+        utils: List[float] = []
+        for c in active:
+            if c.id in grouped_ids:
+                continue
+            utils.append(self._scalarized_clause_utilization(c, by_resource.get(c.resource_name), compiled, phase))
+        for g in groups:
+            vals = [
+                self._scalarized_clause_utilization(c, by_resource.get(c.resource_name), compiled, phase)
+                for cid in g.clause_ids if (c := clause_by_id.get(cid)) is not None
+            ]
+            if not vals:
+                continue
+            if g.logic == "any_of":
+                utils.append(min(vals))
+            elif g.logic == "not":
+                utils.append(0.0 if all(v > 1.0 for v in vals) else 2.0)
+            else:
+                utils.append(sum(vals) / len(vals))
+        return float(sum(utils) / len(utils)) if utils else 0.0
+
     def _beta_for(self, compiled: CompiledContract, resource_name: str) -> float:
         if self.config.no_conservative_margins:
             return 0.0
@@ -258,9 +324,14 @@ class TypedSafeBudgetSearch:
     def _priority(self, label: SearchLabel, pred: Optional[TransitionPrediction]) -> float:
         value = pred.completion_value if pred else 0.5
         value_term = 0.0 if self.config.no_completion_value_guidance else -self.config.lambda_value * math.log(max(value, 1e-6))
+        # Passenger-independent edge validity is a learned *ordering* prior.  It
+        # must not be folded into dynamic availability or used to override the
+        # symbolic transition tests.
+        edge_prior = pred.edge_validity if pred else 1.0
+        edge_term = -self.config.lambda_edge_validity * math.log(max(float(edge_prior), 1e-6))
         service_remaining = max(0, 7 - len(label.history))
         budget_heuristic = 0.0
         for v in label.resource_ledger.values():
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
                 budget_heuristic += 0.001 * abs(float(v))
-        return label.cost + service_remaining + budget_heuristic + value_term
+        return label.cost + service_remaining + budget_heuristic + value_term + edge_term

@@ -16,7 +16,29 @@ ABLATION_FLAGS = {
     "no_conservative_margins": {"no_conservative_margins": True},
     "no_completion_value_guidance": {"no_completion_value_guidance": True},
     "soft_only_capability": {"soft_only_capability": True},
+    # Engineering diagnostics (not paper main-table ablations): isolate learned
+    # CASA heads while keeping the rest of the V1 planner unchanged.
+    "no_learned_demand": {"no_learned_demand": True},
+    "no_learned_uncertainty": {"no_learned_uncertainty": True},
+    "no_learned_availability": {"no_learned_availability": True},
 }
+
+MAIN_ABLATIONS = [
+    "full",
+    "no_capability_compiler",
+    "no_service_automaton",
+    "no_casa_net_transitions",
+    "no_typed_resource_ledger",
+    "no_conservative_margins",
+    "no_completion_value_guidance",
+    "soft_only_capability",
+]
+
+DIAGNOSTIC_ABLATIONS = [
+    "no_learned_demand",
+    "no_learned_uncertainty",
+    "no_learned_availability",
+]
 
 
 def ablation_config(name: str, trajectory_mode: str = "mock_strict") -> PlannerConfig:
@@ -27,7 +49,7 @@ def ablation_config(name: str, trajectory_mode: str = "mock_strict") -> PlannerC
 
 def run_ablations(dataset_dir: str | Path, output_dir: str | Path, variants: List[str] | None = None, trajectory_mode: str = "mock_strict") -> Dict[str, Dict]:
     output_dir = Path(output_dir)
-    variants = variants or list(ABLATION_FLAGS.keys())
+    variants = variants or list(MAIN_ABLATIONS)
     results = {}
     for name in variants:
         cfg = ablation_config(name, trajectory_mode=trajectory_mode)

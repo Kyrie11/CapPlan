@@ -8,7 +8,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 import argparse
 from pathlib import Path
 
-from capplan.evaluation.ablations import ABLATION_FLAGS, ablation_config
+from capplan.evaluation.ablations import ABLATION_FLAGS, MAIN_ABLATIONS, ablation_config
 from capplan.evaluation.experiment_runner import write_csv
 from capplan.evaluation.closed_loop import ClosedLoopRunner
 from capplan.utils.serialization import load_json
@@ -63,7 +63,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     if args.paper_mode:
         _validate_paper(dataset_dir, args.trajectory_mode, args.casa_mode, args.casa_checkpoint, args.nuplan_sim_config, args.allow_posthoc_episode_vehicle_metrics)
-    variants = args.variants or list(ABLATION_FLAGS.keys())
+    variants = args.variants or list(MAIN_ABLATIONS)
     from tqdm.auto import tqdm
     rows = {}
     variant_bar = tqdm(variants, desc="CapPlan ablations", unit="variant", dynamic_ncols=True, disable=not args.progress)
@@ -74,7 +74,7 @@ def main() -> None:
         cfg.casa_checkpoint = args.casa_checkpoint
         cfg.casa_device = args.casa_device
         res = ClosedLoopRunner(cfg).run_dataset(
-            dataset_dir, output_dir / "ablations" / name,
+            dataset_dir, output_dir / name,
             show_progress=args.progress, progress_update_interval=args.progress_update_interval,
             progress_desc=f"Ablation {name}",
         )
