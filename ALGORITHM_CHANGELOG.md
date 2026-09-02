@@ -67,6 +67,35 @@ reviewfix12 closes the remaining attribution leakage and strengthens evaluation:
 
 **Decision:** reviewfix12 is an attribution/evaluation repair, not a new planning mechanism.  Formal CCF-A V2 design remains blocked until the corrected 2x2 demand/uncertainty factorial and deterministic-evidence symbolic-core suite are complete.
 
-## V2 — reserved
+## V2 — Evidence-Grounded CASA with dual-channel typed feasibility
 
-V2 is intentionally **not defined yet**.  The next algorithm version should be chosen from attribution-valid V1 evidence, with the goal of a CCF-A-level contribution rather than incremental tuning.  Candidate directions (true heterogeneous service-graph reasoning, constrained probabilistic resource inference, or another mechanism) must be justified by the repaired V1 bottleneck evidence.
+**Status:** first algorithmic V2.  reviewfix12 closes the diagnostic attribution needed to justify this change.  The V1 *main* full-model attribution gate remains failed (full V1 still has zero PCR), so V2 does not claim that every symbolic component has already received a publication-quality gain attribution.  What is attribution-valid is the CASA/TSBS interface diagnosis: the corrected 2x2 mean/sigma factorial shows that learned demand and learned uncertainty independently corrupt hard feasibility, while restoring explicit saved evidence for both exactly recovers the verifier-feasible set on the frozen test benchmark.
+
+### V2 motivation
+
+CapPlan's core claim is retained: complete-trip functional requirements are compiled into executable passenger-complete acceptance semantics.  A neural estimator must therefore not be allowed to silently redefine an observed/derived physical fact before the symbolic contract is evaluated.  V1 violated this separation by overwriting numerical transition evidence with learned demand means and sigmas.
+
+### V2 mechanism
+
+1. **Hard evidence channel (new):** non-missing typed transition evidence and its evidence uncertainty are the authoritative inputs to the typed resource ledger. Missing hard evidence remains missing and therefore fail-closed according to the compiled contract. Neural imputation cannot convert missing evidence into feasible truth.
+2. **Learned guidance channel (new):** CASA still predicts edge validity, dynamic availability, completion value, typed demand, and uncertainty. Learned demand/uncertainty are retained as audit/guidance outputs rather than overwriting hard evidence.
+3. **Typed learned-feasibility prior (new):** numeric CASA demand/sigma predictions are compared with active capability-token thresholds to produce a soft per-transition feasibility prior. This prior affects queue ordering only; it is never a hard gate.
+4. **Passenger Capability Compiler, service automaton, typed resource algebra, TSBS, and failure certificates are retained.** These are the executable acceptance semantics that implement the passenger-complete motivation.
+5. **Evaluation fast path (engineering, not algorithmic):** when a frozen dataset already contains candidate transitions, evaluation no longer parses the full accessibility graph for every episode/variant because the planner does not consume that graph in this path. This changes wall time only, not planning semantics.
+6. **T5 metric repair (evaluation):** retain phase accuracy for continuity, but add phase macro-F1 and whole-certificate exact match (phase + resource + source). The aggregate `DF` now uses phase macro-F1 rather than majority-sensitive phase accuracy.
+
+### Why V2 does not simply feed physical targets back into a regressor
+
+The frozen benchmark already stores processed path/interface evidence such as access distance, slope, path width, and clearance in `CandidateTransition.resource_evidence`. Feeding those exact values as neural inputs while training the same values as demand targets would create target-equivalent leakage and an artificially easy regression task. V2 therefore treats explicit evidence as evidence, not as a target to be re-guessed. A future raw-perception/heterogeneous-graph CASA can learn these quantities only when lower-level sensor/map primitives are exposed separately from the verifier resource targets.
+
+### V2 preregistered experiments
+
+- `full V2` versus `no_evidence_grounding`: tests whether the new hard/learned channel separation removes V1 collapse.
+- `no_learned_feasibility_guidance`: tests whether the learned typed prior improves search efficiency without changing hard feasibility.
+- `no_completion_value_guidance`: separates the new typed feasibility prior from the historical completion-value prior.
+- `no_conservative_margins`: must be interpreted with oracle-referenced false-accept metrics, not PCR alone.
+- symbolic compiler/automaton/ledger ablations remain useful, but the current scalar-ledger ablation should not be over-interpreted as a calibrated alternative until its scalar budget baseline is independently tuned.
+
+### Fast-iteration policy
+
+`run_v2_fast_experiments.sh` evaluates a deterministic 256-episode subset and runs independent variant groups concurrently on two GPUs. `run_v2_full_experiments.sh` performs the confirmatory full test only after the fast gate passes. Neither script invokes the other, and neither runs nuPlan closed-loop simulation during algorithm iteration.

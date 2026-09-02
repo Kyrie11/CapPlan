@@ -22,6 +22,12 @@ class TransitionPrediction:
     # search-ordering signal, not dynamic availability and never overrides the
     # symbolic transition tests.
     edge_validity: float = 1.0
+    # V2 keeps neural demand/uncertainty in a guidance/audit channel instead of
+    # allowing them to overwrite hard feasibility evidence.
+    learned_typed_demand: Dict[str, float] | None = None
+    learned_uncertainty: Dict[str, float] | None = None
+    evidence_policy: str = "learned_overwrite_v1"
+    learned_feasibility_prior: float = 1.0
 
 
 class BaseTransitionPredictor:
@@ -64,7 +70,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
     def __init__(
         self, checkpoint: Dict[str, Any] | None = None, device: str = "auto",
         *, no_learned_demand: bool = False, no_learned_uncertainty: bool = False,
-        no_learned_availability: bool = False,
+        no_learned_availability: bool = False, evidence_grounded_runtime: bool = False,
     ) -> None:
         self.checkpoint = checkpoint or {}
         vocab_payload = self.checkpoint.get("vocab", {}) if isinstance(self.checkpoint, dict) else {}
@@ -81,6 +87,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
         self.no_learned_demand = bool(no_learned_demand)
         self.no_learned_uncertainty = bool(no_learned_uncertainty)
         self.no_learned_availability = bool(no_learned_availability)
+        self.evidence_grounded_runtime = bool(evidence_grounded_runtime)
         if isinstance(self.checkpoint, dict) and self.checkpoint.get("torch_state_dict") is not None:
             self._init_torch_model()
 
@@ -219,6 +226,52 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             ))
         return rows
 
+    def _typed_feasibility_prior(self, e: CandidateTransition, demand: Dict[str, float] | None, sigma: Dict[str, float] | None, context: Dict[str, Any] | None) -> float:
+        """Soft V2 guidance from learned typed demand; never a hard gate.
+
+        The prior compares numeric learned demand against active capability token
+        thresholds. It is intentionally approximate (single-edge, pre-ledger) and
+        therefore affects queue ordering only. Hard feasibility remains entirely in
+        the evidence-grounded typed ledger.
+        """
+        if not demand:
+            return 1.0
+        toks = list((context or {}).get("tokens") or [])
+        if not toks:
+            return 1.0
+        phase_ids = {i for i, q in enumerate(self.vocab.phases) if q in {e.from_phase, e.to_phase}}
+        margins = []
+        for tok in toks:
+            try:
+                if not int(tok.get("threshold_mask", 0)) or not int(tok.get("hard", 1)):
+                    continue
+                rid = int(tok.get("resource_id", -1)); kid = int(tok.get("kind_id", -1))
+                mask = list(tok.get("phase_mask") or [])
+                if phase_ids and mask and not any(i < len(mask) and int(mask[i]) for i in phase_ids):
+                    continue
+                if not (0 <= rid < len(self.vocab.resources)):
+                    continue
+                name = self.vocab.resources[rid]
+                if name not in demand or kid == 3:  # categorical remains symbolic
+                    continue
+                d = float(demand[name]); sg = max(0.0, float((sigma or {}).get(name, 0.0)))
+                th = float(tok.get("threshold_value", 0.0)); beta = max(0.0, float(tok.get("beta_tau", 1.0)))
+                scale = max(abs(th), 1e-3)
+                if kid in {0, 1, 4}:  # cumulative / upper / probabilistic: smaller is better
+                    m = (th - (d + beta * sg)) / scale
+                elif kid == 2:  # lower: larger is better
+                    m = ((d - beta * sg) - th) / scale
+                else:
+                    continue
+                if math.isfinite(m):
+                    margins.append(max(-8.0, min(8.0, m)))
+            except Exception:
+                continue
+        if not margins:
+            return 1.0
+        worst = min(margins)
+        return max(1e-4, min(1.0, self._sigmoid(3.0 * worst)))
+
     def predict(self, transitions: List[CandidateTransition], context: Dict[str, Any] | None = None) -> Dict[str, TransitionPrediction]:
         out: Dict[str, TransitionPrediction] = {}
         head_rows = self._predict_heads_batch(transitions, context)
@@ -236,7 +289,13 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
             ])
             edge_prob, value_prob, availability_prob, demand_pred, unc_pred = head
             typed_evidence = e.resource_evidence
-            if demand_pred:
+            # V2 dual-channel semantics: explicit transition evidence is the hard
+            # safety channel. Neural typed-demand and sigma predictions remain
+            # available for guidance/diagnostics but cannot rewrite an observed or
+            # derived physical quantity before TSBS evaluates the compiled contract.
+            # Missing hard evidence also remains missing (fail-closed); a learned
+            # imputation never silently turns it into feasible truth.
+            if demand_pred and not self.evidence_grounded_runtime:
                 # Demand mean and uncertainty are independent learned heads and must
                 # be independently ablatable.  reviewfix11 accidentally put both
                 # replacements behind ``not no_learned_demand``; consequently the
@@ -295,6 +354,7 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                 else e.availability * max(0.0, min(1.0, float(availability_prob)))
             )
             value = max(1e-4, min(1.0, float(value_prob)))
+            feasibility_prior = self._typed_feasibility_prior(e, demand_pred, unc_pred, context)
             out[e.transition_id] = TransitionPrediction(
                 transition_id=e.transition_id,
                 typed_evidence=typed_evidence,
@@ -307,5 +367,9 @@ class LearnedLinearTransitionPredictor(BaseTransitionPredictor):
                 # head as a global phase belief.
                 phase_belief={e.from_phase: 0.4, e.to_phase: 0.6},
                 edge_validity=edge_validity,
+                learned_typed_demand=dict(demand_pred or {}),
+                learned_uncertainty=dict(unc_pred or {}),
+                evidence_policy=("evidence_grounded_v2" if self.evidence_grounded_runtime else "learned_overwrite_v1"),
+                learned_feasibility_prior=feasibility_prior,
             )
         return out

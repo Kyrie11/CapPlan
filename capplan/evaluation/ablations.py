@@ -25,6 +25,9 @@ ABLATION_FLAGS = {
     # mean and uncertainty contributions can be identified without leakage.
     "no_learned_demand_uncertainty": {"no_learned_demand": True, "no_learned_uncertainty": True},
     "no_learned_availability": {"no_learned_availability": True},
+    # V2 mechanism ablations.
+    "no_evidence_grounding": {"evidence_grounded_runtime": False},
+    "no_learned_feasibility_guidance": {"no_learned_feasibility_guidance": True},
 }
 
 MAIN_ABLATIONS = [

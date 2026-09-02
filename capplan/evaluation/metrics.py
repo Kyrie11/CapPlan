@@ -185,11 +185,27 @@ def diagnostic_breakdown(episodes: List[Dict[str, Any]]) -> Dict[str, float]:
         source_true.append(str(o.get("evidence_source", "<missing>")))
         source_pred.append(str(c.get("evidence_source", "<missing>")))
     if not phase_true:
-        return {"phase_accuracy": 1.0, "resource_macro_f1": 1.0, "source_macro_f1": 1.0, "n": 0.0}
+        return {
+            "phase_accuracy": 1.0, "phase_macro_f1": 1.0,
+            "resource_macro_f1": 1.0, "source_macro_f1": 1.0,
+            "exact_match": 1.0, "n": 0.0,
+        }
+    exact = [
+        1.0 if (pt == pp and rt == rp and st == sp) else 0.0
+        for pt, pp, rt, rp, st, sp in zip(
+            phase_true, phase_pred, resource_true, resource_pred, source_true, source_pred
+        )
+    ]
     return {
         "phase_accuracy": _mean([1.0 if a == b else 0.0 for a, b in zip(phase_true, phase_pred)]),
+        # Phase accuracy is majority-sensitive (the frozen benchmark is access-heavy).
+        # Macro-F1 is the publication-facing complement for T5 diversity/fidelity.
+        "phase_macro_f1": _macro_f1(phase_true, phase_pred),
         "resource_macro_f1": _macro_f1(resource_true, resource_pred),
         "source_macro_f1": _macro_f1(source_true, source_pred),
+        # Strong certificate metric: all three categorical fields must agree with
+        # the independent verifier on the same failed request.
+        "exact_match": _mean(exact),
         "n": float(len(phase_true)),
     }
 
@@ -197,7 +213,7 @@ def diagnostic_breakdown(episodes: List[Dict[str, Any]]) -> Dict[str, float]:
 def diagnostic_fidelity(episodes: List[Dict[str, Any]]) -> float:
     """DF = mean of T5 phase accuracy, resource macro-F1, and source macro-F1."""
     d = diagnostic_breakdown(episodes)
-    return _mean([d["phase_accuracy"], d["resource_macro_f1"], d["source_macro_f1"]])
+    return _mean([d["phase_macro_f1"], d["resource_macro_f1"], d["source_macro_f1"]])
 
 
 def signed_margin_error(episodes: List[Dict[str, Any]]) -> float:
@@ -409,8 +425,10 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "IR": inconclusive_rate(episodes),
         "DF": diagnostic_fidelity(episodes),
         "DF_phase_accuracy": diag["phase_accuracy"],
+        "DF_phase_macro_f1": diag["phase_macro_f1"],
         "DF_resource_macro_f1": diag["resource_macro_f1"],
         "DF_source_macro_f1": diag["source_macro_f1"],
+        "DF_certificate_exact_match": diag["exact_match"],
         "SME": signed_margin_error(episodes),
         "CRsp": capability_responsiveness(pairs),
         "CF_outcome_pair_accuracy": cf["outcome_pair_accuracy"],

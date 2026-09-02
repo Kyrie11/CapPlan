@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import time
+import random
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from capplan.data.accessibility_layer import load_accessibility_graph
 from capplan.data.capability_contracts import contract_episode_id
-from capplan.data.schemas import contract_from_dict, pudo_from_dict, transition_from_dict, vehicle_from_dict, to_dict
+from capplan.data.schemas import AccessibilityGraph, contract_from_dict, pudo_from_dict, transition_from_dict, vehicle_from_dict, to_dict
 from capplan.evaluation.metrics import compute_all_metrics
 from capplan.planning.planner import CapPlanPlanner, PlannerConfig
 from capplan.semantics.capability_compiler import CapabilityCompiler
@@ -129,41 +130,58 @@ class ClosedLoopRunner:
         self.planner = CapPlanPlanner(cfg)
         self.config = cfg
 
-    def _load_dataset(self, dataset_dir: Path) -> Dict[str, Any]:
-        scenes = {s["episode_id"]: s for s in read_jsonl(dataset_dir / "scenes.jsonl")}
-        episodes = read_jsonl(dataset_dir / "episodes.jsonl")
-        entrances = read_jsonl(dataset_dir / "entrances.jsonl")
+    def _load_dataset(self, dataset_dir: Path, *, episode_limit: int | None = None, episode_seed: int = 13) -> Dict[str, Any]:
+        all_episodes = read_jsonl(dataset_dir / "episodes.jsonl")
+        if episode_limit is not None and int(episode_limit) > 0 and int(episode_limit) < len(all_episodes):
+            rng = random.Random(int(episode_seed))
+            picked = set(rng.sample([str(e["episode_id"]) for e in all_episodes], int(episode_limit)))
+            episodes = [e for e in all_episodes if str(e["episode_id"]) in picked]
+        else:
+            episodes = all_episodes
+        selected = {str(e["episode_id"]) for e in episodes}
+        scenes = {s["episode_id"]: s for s in read_jsonl(dataset_dir / "scenes.jsonl") if str(s.get("episode_id")) in selected}
+        entrances = [e for e in read_jsonl(dataset_dir / "entrances.jsonl") if str(e.get("episode_id")) in selected]
         pudos_by_episode: Dict[str, List[Any]] = {}
         for d in read_jsonl(dataset_dir / "pudo_anchors.jsonl"):
-            p = pudo_from_dict(d)
-            pudos_by_episode.setdefault(p.episode_id, []).append(p)
+            if str(d.get("episode_id")) not in selected:
+                continue
+            p = pudo_from_dict(d); pudos_by_episode.setdefault(p.episode_id, []).append(p)
         vehicles_by_episode: Dict[str, List[Any]] = {}
         for d in read_jsonl(dataset_dir / "vehicle_interfaces.jsonl"):
-            v = vehicle_from_dict(d)
-            vehicles_by_episode.setdefault(v.episode_id, []).append(v)
+            if str(d.get("episode_id")) not in selected:
+                continue
+            v = vehicle_from_dict(d); vehicles_by_episode.setdefault(v.episode_id, []).append(v)
         contracts_by_episode: Dict[str, List[Any]] = {}
         for d in read_jsonl(dataset_dir / "capability_contracts.jsonl"):
-            c = contract_from_dict(d)
-            contracts_by_episode.setdefault(contract_episode_id(c), []).append(c)
+            c = contract_from_dict(d); eid = contract_episode_id(c)
+            if eid in selected:
+                contracts_by_episode.setdefault(eid, []).append(c)
         transitions_by_episode: Dict[str, List[Any]] = {}
         for d in read_jsonl(dataset_dir / "candidate_transitions.jsonl"):
-            t = transition_from_dict(d)
-            transitions_by_episode.setdefault(t.episode_id, []).append(t)
-        oracle_certs = {_cert_key(c): c for c in read_jsonl(dataset_dir / "certificate_labels.jsonl")}
-        skeletons = {(s.get("episode_id"), s.get("passenger_id")): s for s in read_jsonl(dataset_dir / "skeleton_labels.jsonl")}
-        counterfactual_pairs = read_jsonl(dataset_dir / "counterfactual_pairs.jsonl")
-        service_requests = read_jsonl(dataset_dir / "service_requests.jsonl")
-        requests_by_episode = {}
+            if str(d.get("episode_id")) not in selected:
+                continue
+            t = transition_from_dict(d); transitions_by_episode.setdefault(t.episode_id, []).append(t)
+        oracle_certs = {_cert_key(c): c for c in read_jsonl(dataset_dir / "certificate_labels.jsonl") if str(c.get("episode_id")) in selected}
+        skeletons = {(x.get("episode_id"), x.get("passenger_id")): x for x in read_jsonl(dataset_dir / "skeleton_labels.jsonl") if str(x.get("episode_id")) in selected}
+        counterfactual_pairs = [x for x in read_jsonl(dataset_dir / "counterfactual_pairs.jsonl") if str(x.get("episode_id")) in selected]
+        service_requests = [x for x in read_jsonl(dataset_dir / "service_requests.jsonl") if str(x.get("episode_id")) in selected]
+        requests_by_episode: Dict[str, List[Dict[str, Any]]] = {}
         for r in service_requests:
             requests_by_episode.setdefault(r.get("episode_id"), []).append(r)
         vehicle_metrics_path = dataset_dir / "nuplan_vehicle_metrics.jsonl"
         vehicle_metrics_by_episode = {}
         if vehicle_metrics_path.exists():
             for row in read_jsonl(vehicle_metrics_path):
-                eid = row.get("episode_id") or row.get("scenario_id")
-                if eid:
-                    vehicle_metrics_by_episode[str(eid)] = row
+                eid = str(row.get("episode_id") or row.get("scenario_id") or "")
+                if eid in selected:
+                    vehicle_metrics_by_episode[eid] = row
         return {"scenes": scenes, "episodes": episodes, "entrances": entrances, "pudos": pudos_by_episode, "vehicles": vehicles_by_episode, "contracts": contracts_by_episode, "transitions": transitions_by_episode, "oracle_certs": oracle_certs, "skeletons": skeletons, "counterfactual_pairs": counterfactual_pairs, "service_requests": requests_by_episode, "vehicle_metrics": vehicle_metrics_by_episode}
+
+    @staticmethod
+    def _graph_for_episode(dataset_dir: Path, episode_id: str, transitions: List[Any]) -> AccessibilityGraph:
+        if transitions:
+            return AccessibilityGraph(episode_id, [], [], {"evaluation_fast_path": "saved_transitions"})
+        return load_accessibility_graph(dataset_dir, episode_id)
 
     def run_dataset(
         self,
@@ -173,12 +191,15 @@ class ClosedLoopRunner:
         show_progress: bool = False,
         progress_update_interval: int = 25,
         progress_desc: str = "CapPlan eval",
+        episode_limit: int | None = None,
+        episode_seed: int = 13,
+        preloaded_data: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         dataset_dir = Path(dataset_dir)
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         dump_json(output_dir / "planner_config.json", asdict(self.config))
-        data = self._load_dataset(dataset_dir)
+        data = preloaded_data if preloaded_data is not None else self._load_dataset(dataset_dir, episode_limit=episode_limit, episode_seed=episode_seed)
         metrics_rows: List[Dict[str, Any]] = []
         plans: List[Dict[str, Any]] = []
         result_lookup: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -193,12 +214,17 @@ class ClosedLoopRunner:
         latency_sum = 0.0
         for meta in data["episodes"]:
             eid = meta["episode_id"]
-            graph = load_accessibility_graph(dataset_dir, eid)
+            transitions = data["transitions"].get(eid, [])
+            # Saved candidate transitions already contain all path/interface typed
+            # evidence consumed by the current planner. Loading and JSON-parsing the
+            # full accessibility graph here was pure overhead whenever transitions
+            # were present (about 90% of V1 wall time). Only materialize the graph
+            # when transitions must be generated on the fly.
+            graph = self._graph_for_episode(dataset_dir, eid, transitions)
             pudo = data["pudos"].get(eid, [])
             vehicles = data["vehicles"].get(eid, [])
             if not vehicles:
                 raise RuntimeError(f"dataset has no saved vehicle interface for {eid}")
-            transitions = data["transitions"].get(eid, [])
             scene = data["scenes"].get(eid, {})
             requests = data.get("service_requests", {}).get(eid, [])
             request_by_profile = {str(r.get("passenger_profile_id")): r for r in requests}
@@ -271,6 +297,9 @@ class ClosedLoopRunner:
             bool(self.config.no_typed_resource_ledger),
         ])
         eval_semantics = {
+            "algorithm_version": str(self.config.algorithm_version),
+            "evidence_grounded_runtime": bool(self.config.evidence_grounded_runtime),
+            "hard_feasibility_evidence_policy": ("explicit_typed_evidence_v2" if self.config.evidence_grounded_runtime else "learned_overwrite_v1"),
             "vehicle_metric_semantics": vehicle_semantics,
             "publication_integrated_vehicle_closed_loop_ready": integrated_ready,
             "passenger_service_metrics_available": bool(metrics_rows),

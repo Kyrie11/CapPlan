@@ -36,7 +36,7 @@ class CASANet:
         self, mode: str = "heuristic_oracle_baseline", disabled: bool = False,
         checkpoint: Dict[str, Any] | str | Path | None = None, device: str = "auto",
         *, no_learned_demand: bool = False, no_learned_uncertainty: bool = False,
-        no_learned_availability: bool = False,
+        no_learned_availability: bool = False, evidence_grounded_runtime: bool = False,
     ) -> None:
         if mode not in {"heuristic_oracle_baseline", "learned", "heuristic"}:
             raise ValueError(f"unsupported CASA mode {mode}")
@@ -56,6 +56,7 @@ class CASANet:
                 no_learned_demand=no_learned_demand,
                 no_learned_uncertainty=no_learned_uncertainty,
                 no_learned_availability=no_learned_availability,
+                evidence_grounded_runtime=evidence_grounded_runtime,
             )
         )
 
@@ -95,6 +96,7 @@ class CASANet:
                 "disabled": self.disabled,
                 "predictor": self.predictor.__class__.__name__,
                 "n_transitions": len(inputs.transitions),
+                "evidence_policy": ("evidence_grounded_v2" if getattr(self.predictor, "evidence_grounded_runtime", False) else "learned_overwrite_v1"),
             }],
         )
 

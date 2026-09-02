@@ -32,6 +32,10 @@ class PlannerConfig:
     no_learned_demand: bool = False
     no_learned_uncertainty: bool = False
     no_learned_availability: bool = False
+    # V2: learned demand/uncertainty are guidance signals; explicit typed evidence
+    # remains authoritative for hard feasibility.
+    evidence_grounded_runtime: bool = False
+    no_learned_feasibility_guidance: bool = False
     beta: float = 1.0
     trajectory_mode: str = "mock_strict"
     casa_mode: str = "heuristic_oracle_baseline"
@@ -51,6 +55,7 @@ class CapPlanPlanner:
             no_learned_demand=self.config.no_learned_demand,
             no_learned_uncertainty=self.config.no_learned_uncertainty,
             no_learned_availability=self.config.no_learned_availability,
+            evidence_grounded_runtime=self.config.evidence_grounded_runtime,
         )
         self.generator = TransitionGenerator()
         self.searcher = TypedSafeBudgetSearch(
@@ -62,6 +67,7 @@ class CapPlanPlanner:
                 no_conservative_margins=self.config.no_conservative_margins,
                 no_completion_value_guidance=self.config.no_completion_value_guidance,
                 soft_only_capability=self.config.soft_only_capability,
+                lambda_learned_feasibility=(0.0 if self.config.no_learned_feasibility_guidance else 0.20),
             ),
         )
 

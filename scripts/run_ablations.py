@@ -53,6 +53,10 @@ def main() -> None:
     p.add_argument("--casa_mode", choices=["heuristic_oracle_baseline", "learned"], default="heuristic_oracle_baseline")
     p.add_argument("--casa_checkpoint", default=None)
     p.add_argument("--casa_device", default="auto", help="Device for learned CASA inference, e.g. cuda:0.")
+    p.add_argument("--algorithm_version", default="V1")
+    p.add_argument("--evidence_grounded_runtime", action="store_true", help="V2 dual-channel hard-evidence semantics.")
+    p.add_argument("--episode_limit", type=int, default=None)
+    p.add_argument("--episode_seed", type=int, default=13)
     p.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--progress_update_interval", type=int, default=25)
     p.add_argument("--paper_mode", action="store_true")
@@ -66,6 +70,7 @@ def main() -> None:
     variants = args.variants or list(MAIN_ABLATIONS)
     from tqdm.auto import tqdm
     rows = {}
+    shared_data = None
     variant_bar = tqdm(variants, desc="CapPlan ablations", unit="variant", dynamic_ncols=True, disable=not args.progress)
     for name in variant_bar:
         variant_bar.set_postfix({"variant": name}, refresh=False)
@@ -73,10 +78,17 @@ def main() -> None:
         cfg.casa_mode = args.casa_mode
         cfg.casa_checkpoint = args.casa_checkpoint
         cfg.casa_device = args.casa_device
-        res = ClosedLoopRunner(cfg).run_dataset(
+        cfg.algorithm_version = args.algorithm_version
+        if name != "no_evidence_grounding":
+            cfg.evidence_grounded_runtime = bool(args.evidence_grounded_runtime)
+        runner = ClosedLoopRunner(cfg)
+        if shared_data is None:
+            shared_data = runner._load_dataset(dataset_dir, episode_limit=args.episode_limit, episode_seed=args.episode_seed)
+        res = runner.run_dataset(
             dataset_dir, output_dir / name,
             show_progress=args.progress, progress_update_interval=args.progress_update_interval,
             progress_desc=f"Ablation {name}",
+            episode_limit=args.episode_limit, episode_seed=args.episode_seed, preloaded_data=shared_data,
         )
         rows[name] = res["metrics"]
     write_csv(output_dir / "ablation_results.csv", rows)

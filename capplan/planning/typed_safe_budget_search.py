@@ -34,6 +34,7 @@ class SearchConfig:
     beta: float = 1.0
     lambda_value: float = 0.5
     lambda_edge_validity: float = 0.25
+    lambda_learned_feasibility: float = 0.20
     min_availability: float = 0.05
     # Untyped-ledger ablation: one unit of normalized budget per canonical
     # service transition.  Individual resource kinds may trade off because their
@@ -329,9 +330,11 @@ class TypedSafeBudgetSearch:
         # symbolic transition tests.
         edge_prior = pred.edge_validity if pred else 1.0
         edge_term = -self.config.lambda_edge_validity * math.log(max(float(edge_prior), 1e-6))
+        learned_feasibility = pred.learned_feasibility_prior if pred else 1.0
+        feasibility_term = -self.config.lambda_learned_feasibility * math.log(max(float(learned_feasibility), 1e-6))
         service_remaining = max(0, 7 - len(label.history))
         budget_heuristic = 0.0
         for v in label.resource_ledger.values():
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
                 budget_heuristic += 0.001 * abs(float(v))
-        return label.cost + service_remaining + budget_heuristic + value_term + edge_term
+        return label.cost + service_remaining + budget_heuristic + value_term + edge_term + feasibility_term
