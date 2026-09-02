@@ -159,3 +159,92 @@ Mechanism gates:
 ### Scope and novelty boundary
 
 Pairwise search ranking and learned heuristics are established ideas in automated planning; V3 does **not** claim ranking itself as novel.  The intended contribution is the passenger-complete, capability-compiled search state: a learned ranker operates on typed residual/future-requirement frontiers only after executable hard semantics admit a successor, so learning can accelerate complete-trip planning without becoming the authority that defines service feasibility.
+
+## V3 full seed13 decision — hard semantics PASS; ECF ranker NO-GO against V2
+
+The full frozen-test run (`997` episodes / `7976` passenger requests) is attribution-valid for the top-level V3 mechanism comparison.  All paired variants use the same frozen requests, evidence-grounded hard semantics, and CASA checkpoint; the V3 ranker changes only queue ordering after one-step symbolic feasibility.  The full method retains exact verifier decisions (`PCDecisionF1=1.0`, `PCFalseAcceptRate=0`, `PCFalseRejectRate=0`, capability success-flip precision/recall `=1.0`).  The expected failure controls also behave coherently: removing evidence grounding reproduces total false rejection, while removing conservative margins creates false accepts.
+
+The preregistered efficiency gate, however, fails:
+
+- V3 full vs no-frontier: `18.5903` vs `19.0181` mean expansions, a modest `2.25%` reduction; episode-clustered paired delta (reference minus V3) is about `+0.428`, 95% CI `[+0.319,+0.549]`.
+- V3 full vs V2 reference: `18.5903` vs `17.9919` mean expansions.  V3 is **3.33% worse**; paired delta (V2 minus V3) is about `-0.598`, 95% CI `[-0.775,-0.438]`.
+- V3 also adds substantial runtime overhead in the current Python implementation: roughly `+14.3 ms/request` relative to V2 on the full paired run.
+
+The degradation is continuation-depth dependent.  Relative to V2, V3 adds only about `0.15` expansions on access-failure requests, but about `+2.90` on alight failures and `+4.58` on egress failures; on the `506` oracle-success requests it adds about `+2.26` expansions on average.  Therefore the dominant V3 bottleneck is not hard feasibility or dataset construction.  It is insufficient *suffix/continuation reasoning* in the learned ordering rule.
+
+Code audit explains the mismatch between the V3 name and its operational information.  `future_requirement` is largely a binary indicator that a resource is active in a later phase; the ranker receives no explicit lower bound on the typed burden/affordance still required to reach destination.  Training is also trace-imitation biased: only oracle-success contracts generate frontier pairs, the recorded oracle successor is the single positive, and all other one-step feasible siblings are negatives even when they may admit another valid passenger-complete continuation.  This under-supervises the majority infeasible requests and makes the objective closer to imitating one verifier trace than minimizing TSBS work over the executable feasible set.
+
+**Decision:** per the V3 preregistration, the V3 frontier ranker is not retained as the default merely for novelty.  Its result remains a useful negative result demonstrating that local feasible-frontier ranking is insufficient without a faithful continuation representation.
+
+## V4 — Capability Continuation Envelope (CCE) + Continuation-Aware TSBS
+
+**Status:** next algorithm candidate.  V4 is a major mechanism change justified by the full V3 NO-GO result; it requires no new neural training for the first attribution round.
+
+### V4 motivation
+
+Passenger-complete planning is a typed *prefix + suffix* feasibility problem.  The forward TSBS ledger answers what capability budget has already been consumed, but V3 only approximates what remains through a learned binary future-requirement representation.  V4 compiles the same passenger contract into a second executable object: an optimistic typed continuation envelope from every service state to an accepting destination.
+
+The intended paper-level structure becomes:
+
+`Passenger-complete semantics → capability compilation → evidence-grounded typed feasibility → forward typed ledger + backward typed continuation envelope → continuation-aware TSBS → executable acceptance / diagnostic rejection`.
+
+This keeps learning subordinate to executable semantics and strengthens the algorithm around the paper's core rather than around a neural backbone.
+
+### V4 mechanism
+
+1. **Validated hard authority is unchanged.**  V2 evidence grounding, the Passenger Capability Compiler, service automaton, conservative typed resource algebra, dynamic-availability gate, and final symbolic acceptance remain authoritative.
+2. **Capability Continuation Envelope (new).**  For one compiled passenger contract and the saved candidate-transition graph, V4 computes from every `(anchor, phase)`:
+   - exact structural reachability to an accepting `destination` under lifecycle/static/dynamic hard transition gates;
+   - minimum remaining service-transition cost;
+   - an optimistic suffix value for each non-group hard numeric typed resource.
+3. **Type-specific backward composition (new).**  The suffix uses the same resource-extension algebra as forward TSBS: sum for cumulative resources, max for upper bottlenecks, min for lower affordances, and independent-risk composition for probabilistic resources.  Each resource is relaxed independently over its own best suffix path.  The resulting vector need not correspond to one common path; this is intentional because it is an optimistic relaxation.
+4. **Sound impossibility pruning (new).**  For a forward label with ledger `R`, V4 composes `R` with the optimistic suffix bound.  If even this independently optimistic relaxation violates an ungrouped hard numeric capability clause, no concrete common suffix can satisfy that clause; the successor can therefore be pruned without changing returned-plan soundness.  Categorical and `any_of/not` requirement-group members are deliberately excluded from independent-resource pruning to avoid turning disjunctions into unsafe conjunctions.
+5. **Continuation-aware priority (new).**  Non-pruned labels receive a soft ordering term from minimum remaining service cost and optimistic capability headroom.  This term never changes `Allow` or final `Sat`.
+6. **V2 static learned typed-feasibility prior is restored as a secondary ordering signal.**  Full V3 shows that replacing it with the local ECF ranker is harmful.  V4 initially combines the empirically useful V2 per-transition prior with the symbolic CCE; ablation decides whether that learned prior remains necessary after CCE.
+7. **V3 pairwise ranker and global completion-value head are absent from the V4 default.**  No V4 retraining is required for the first fast experiment.
+
+### V4 soundness boundary
+
+V4 does **not** claim novelty for generic bidirectional search, resource-constrained A*, or admissible lower bounds.  Those are established search ideas.  The intended contribution is the capability-compiled *heterogeneous typed continuation relaxation* coupled to the passenger lifecycle: forward consumption and optimistic suffix obligations are represented in the same non-substitutable resource algebra used by executable passenger-complete acceptance.
+
+For every independently relaxed numeric hard clause, the suffix value is chosen optimistically.  Therefore an actual common continuation cannot be better than the relaxed value on that dimension.  If the optimistic composition already violates the clause, pruning is sound.  The current implementation intentionally does not use this argument for grouped categorical predicates.
+
+### V4 preregistered fast experiment
+
+Use the same deterministic `256`-episode / roughly `2048`-request test subset before any full confirmation.  No training is run.
+
+Required variants:
+
+- `v4_full`: CCE pruning + CCE priority + V2 static learned feasibility;
+- `v4_no_cce`: identical V4 runtime without the continuation envelope;
+- `v2_reference`: exact V2 ordering control;
+- `v4_priority_only`: CCE priority, no CCE pruning;
+- `v4_pruning_only`: CCE pruning, no CCE priority;
+- `v4_no_static_guidance`: CCE with the V2 learned static prior removed.
+
+Safety gate:
+
+- `PCDecisionF1 >= 0.99`;
+- `PCFalseAcceptRate = 0` and `PCFalseRejectRate = 0`;
+- capability success-flip precision/recall must not materially regress;
+- T5 phase/resource/source macro-F1 and certificate exact match must not materially regress versus the V2 reference (use a 0.01 absolute drop as the fast-review trigger, not as an automatic paper claim).
+
+Primary algorithm gate:
+
+- paired `V4 full` vs `V2 reference` TSBS expansion saving must be `> 0`;
+- the episode-cluster bootstrap 95% CI lower bound for `(V2 expansions - V4 expansions)` must be `> 0`.
+
+Mechanism interpretation:
+
+- if full beats priority-only, sound continuation pruning contributes beyond ordering;
+- if full beats pruning-only, continuation headroom/cost ordering contributes beyond pruning;
+- if `v4_no_static_guidance` is statistically indistinguishable from full, remove the legacy learned static prior and simplify the final method;
+- if CCE preserves decisions but cannot beat V2, do not proceed to the full split.  The next branch should then expose lower-level raw spatial/dynamic graph primitives and build a genuine heterogeneous encoder rather than adding another local ranking loss.
+
+### Fast/full execution policy
+
+- `scripts/run_v4_fast_experiments.sh`: deterministic 256-episode subset, two-GPU parallel variant groups, no training and no real nuPlan closed loop.
+- `scripts/run_v4_full_experiments.sh`: 997-episode frozen test confirmation, only after the fast gate passes.
+- `scripts/compare_search_efficiency.py`: request-paired comparison with episode-cluster bootstrap.
+
+Real nuPlan method-specific closed-loop simulation remains deferred until passenger/service algorithm selection is stable; `mock_strict` remains development-only and cannot support the final vehicle-planning SOTA claim.

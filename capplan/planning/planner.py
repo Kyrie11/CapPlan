@@ -46,6 +46,14 @@ class PlannerConfig:
     # Mechanism-control ablation: recover the exact V2 static learned-feasibility
     # + completion-value ordering while keeping V3 code/evaluation infrastructure.
     v2_reference_runtime: bool = False
+    # V4 Capability Continuation Envelope (CCE).  The envelope uses explicit
+    # typed evidence to summarize an optimistic suffix-to-destination and can
+    # provide sound impossibility pruning plus continuation-aware ordering.
+    no_continuation_envelope: bool = False
+    no_continuation_pruning: bool = False
+    no_continuation_priority: bool = False
+    continuation_cost_weight: float = 0.20
+    continuation_margin_weight: float = 0.35
     beta: float = 1.0
     trajectory_mode: str = "mock_strict"
     casa_mode: str = "heuristic_oracle_baseline"
@@ -68,17 +76,24 @@ class CapPlanPlanner:
             evidence_grounded_runtime=self.config.evidence_grounded_runtime,
         )
         self.generator = TransitionGenerator()
-        is_v3 = str(self.config.algorithm_version).upper().startswith("V3")
-        # V3 removes the empirically redundant completion-value head from the
-        # default search rule and replaces V2's transition-static learned demand
-        # prior with a state-dependent frontier ranker.  ``v2_reference_runtime``
-        # restores the exact V2 ordering terms for paired mechanism comparison.
-        use_v2_reference = bool(is_v3 and self.config.v2_reference_runtime)
+        version = str(self.config.algorithm_version).upper()
+        is_v3 = version.startswith("V3")
+        is_v4 = version.startswith("V4")
+        # V3 removes the empirically redundant completion-value head and replaces
+        # V2's transition-static typed-feasibility prior with a learned local
+        # frontier ranker.  V4 is intentionally different: it retires the V3
+        # ranker after the full-test NO-GO result, restores the useful V2 static
+        # prior, and adds a symbolic typed continuation envelope.
+        use_v2_reference = bool((is_v3 or is_v4) and self.config.v2_reference_runtime)
         frontier_ranker = None
         if is_v3 and (not use_v2_reference) and (not self.config.no_frontier_ranker) and self.config.frontier_ranker_checkpoint:
             frontier_ranker = FrontierRanker(self.config.frontier_ranker_checkpoint, device=self.config.frontier_ranker_device)
-        no_value = self.config.no_completion_value_guidance or (is_v3 and not use_v2_reference)
-        lambda_static = 0.0 if (is_v3 and not use_v2_reference) else (0.0 if self.config.no_learned_feasibility_guidance else 0.20)
+        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4) and not use_v2_reference)
+        if is_v3 and not use_v2_reference:
+            lambda_static = 0.0
+        else:
+            lambda_static = 0.0 if self.config.no_learned_feasibility_guidance else 0.20
+        use_continuation = bool(is_v4 and (not use_v2_reference) and (not self.config.no_continuation_envelope))
         self.searcher = TypedSafeBudgetSearch(
             self.automaton,
             registry,
@@ -90,6 +105,10 @@ class CapPlanPlanner:
                 soft_only_capability=self.config.soft_only_capability,
                 lambda_learned_feasibility=lambda_static,
                 lambda_frontier_ranker=(0.0 if (frontier_ranker is None or self.config.no_frontier_ranker) else float(self.config.frontier_ranker_weight)),
+                use_continuation_envelope=use_continuation,
+                continuation_pruning=bool(use_continuation and (not self.config.no_continuation_pruning)),
+                lambda_continuation_cost=(0.0 if (not use_continuation or self.config.no_continuation_priority) else float(self.config.continuation_cost_weight)),
+                lambda_continuation_margin=(0.0 if (not use_continuation or self.config.no_continuation_priority) else float(self.config.continuation_margin_weight)),
             ),
             frontier_ranker=frontier_ranker,
         )

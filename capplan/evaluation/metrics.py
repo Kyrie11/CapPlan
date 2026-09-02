@@ -365,6 +365,14 @@ def search_expansion_p95(episodes: List[Dict[str, Any]]) -> float:
     return _percentile([float(e.get("search_expansions", 0.0)) for e in episodes if e.get("search_expansions") is not None], 0.95)
 
 
+def continuation_pruned_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("continuation_pruned", 0.0)) for e in episodes if e.get("continuation_pruned") is not None])
+
+
+def continuation_pruned_p95(episodes: List[Dict[str, Any]]) -> float:
+    return _percentile([float(e.get("continuation_pruned", 0.0)) for e in episodes if e.get("continuation_pruned") is not None], 0.95)
+
+
 def planning_latency_mean_ms(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("planning_latency_ms", 0.0)) for e in episodes if e.get("planning_latency_ms") is not None])
 
@@ -445,6 +453,8 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "ECA_evaluable_count": float(sum(1 for e in episodes if float(e.get("tt_std_s", 0.0) or 0.0) > 0.0)),
         "TSBS_expansions_mean": search_expansion_mean(episodes),
         "TSBS_expansions_p95": search_expansion_p95(episodes),
+        "CCE_pruned_mean": continuation_pruned_mean(episodes),
+        "CCE_pruned_p95": continuation_pruned_p95(episodes),
         "PlannerLatency_ms_mean": planning_latency_mean_ms(episodes),
         "PlannerLatency_ms_p95": planning_latency_p95_ms(episodes),
     }

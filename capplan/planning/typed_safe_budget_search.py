@@ -9,6 +9,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from capplan.data.schemas import CandidateTransition, LedgerStep, PassengerCompleteSkeleton, ResourceEvidence, ViolationRecord
 from capplan.models.predictors import TransitionPrediction
+from capplan.planning.capability_continuation_envelope import (
+    EnvelopeDecision,
+    build_continuation_envelope,
+    evaluate_continuation,
+)
 from capplan.planning.certificates import select_certificate
 from capplan.semantics.capability_compiler import CompiledContract, UncertaintySpec
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
@@ -37,6 +42,13 @@ class SearchConfig:
     lambda_learned_feasibility: float = 0.20
     # V3: state-dependent ranker over the already hard-feasible successor frontier.
     lambda_frontier_ranker: float = 0.35
+    # V4: contract-conditioned optimistic suffix envelope.  It may prune a
+    # state only when even the independently optimistic typed continuation
+    # violates a hard numeric clause; otherwise it contributes ordering terms.
+    use_continuation_envelope: bool = False
+    continuation_pruning: bool = True
+    lambda_continuation_cost: float = 0.20
+    lambda_continuation_margin: float = 0.35
     min_availability: float = 0.05
     # Untyped-ledger ablation: one unit of normalized budget per canonical
     # service transition.  Individual resource kinds may trade off because their
@@ -89,6 +101,14 @@ class TypedSafeBudgetSearch:
         for e in transitions:
             outgoing.setdefault((e.from_anchor, e.from_phase), []).append(e)
 
+        continuation_envelope = None
+        if self.config.use_continuation_envelope and not self.automaton.disabled and not self.config.no_typed_resource_ledger:
+            continuation_envelope = build_continuation_envelope(
+                compiled, transitions, predictions, self.automaton, self.registry,
+                min_availability=self.config.min_availability,
+                no_conservative_margins=self.config.no_conservative_margins,
+            )
+
         # The dataset uses concrete entrance IDs, not the literal string
         # ``origin``.  The offline oracle already derives these states from the
         # access transitions; runtime TSBS must do the same or it can falsely
@@ -121,6 +141,8 @@ class TypedSafeBudgetSearch:
         violations: List[ViolationRecord] = []
 
         expansions = 0
+        continuation_pruned = 0
+        continuation_scored = 0
         while pq and expansions < self.config.max_expansions:
             _, _, label = heapq.heappop(pq)
             expansions += 1
@@ -137,7 +159,20 @@ class TypedSafeBudgetSearch:
                     steps=label.steps,
                     final_ledger=label.resource_ledger,
                     cost=label.cost,
-                ), None, {"expansions": expansions, "violations": len(violations), "initial_states": start_states, "initial_state_source": initial_state_source}
+                ), None, {
+                    "expansions": expansions,
+                    "violations": len(violations),
+                    "initial_states": start_states,
+                    "initial_state_source": initial_state_source,
+                    "continuation_pruned": continuation_pruned,
+                    "continuation_scored": continuation_scored,
+                    "continuation_envelope": ({
+                        "n_states": continuation_envelope.n_states,
+                        "n_edges": continuation_envelope.n_edges,
+                        "resources": continuation_envelope.resources,
+                        "iterations": continuation_envelope.iterations,
+                    } if continuation_envelope is not None else None),
+                }
 
             if self.automaton.disabled:
                 # ``w/o service automaton`` must actually remove lifecycle-state
@@ -156,12 +191,36 @@ class TypedSafeBudgetSearch:
                     violations.extend(vios)
                     continue
                 new_label = SearchLabel(e.to_anchor, e.to_phase, new_ledger, label.cost + e.cost, label.history + [e], label.steps + [step])
+                continuation: EnvelopeDecision | None = None
+                if continuation_envelope is not None:
+                    continuation = evaluate_continuation(
+                        (new_label.anchor, new_label.phase),
+                        new_label.resource_ledger,
+                        compiled,
+                        continuation_envelope,
+                        self.registry,
+                    )
+                    continuation_scored += 1
+                    if self.config.continuation_pruning and continuation.impossible:
+                        continuation_pruned += 1
+                        failed_names = list(continuation.failed_resources) or ["continuation"]
+                        for name in failed_names:
+                            violations.append(ViolationRecord(
+                                new_label.phase,
+                                e.transition_id,
+                                name,
+                                float(continuation.optimistic_margins.get(name, continuation.min_margin)),
+                                "capability_continuation_envelope",
+                                1.0,
+                                "no_relaxed_typed_continuation",
+                            ))
+                        continue
                 d_new = new_label.as_dominance_dict()
                 if any(dominates(existing.as_dominance_dict(), d_new, self.registry) for existing in labels):
                     continue
                 labels = [l for l in labels if not dominates(d_new, l.as_dominance_dict(), self.registry)]
                 labels.append(new_label)
-                pushable.append((new_label, e, predictions.get(e.transition_id)))
+                pushable.append((new_label, e, predictions.get(e.transition_id), continuation))
 
             # V3 scores the sibling frontier in one batch. The raw pairwise ranker
             # score is converted to a within-frontier softmax prior; a single feasible
@@ -169,21 +228,35 @@ class TypedSafeBudgetSearch:
             frontier_priors = [1.0 for _ in pushable]
             if self.frontier_ranker is not None and pushable:
                 raw_scores = self.frontier_ranker.score_successors(
-                    [(nl, edge) for nl, edge, _ in pushable], compiled, self.registry
+                    [(nl, edge) for nl, edge, _, _ in pushable], compiled, self.registry
                 )
                 if raw_scores:
                     m = max(raw_scores)
                     exps = [math.exp(max(-40.0, min(40.0, float(v) - m))) for v in raw_scores]
                     z = max(sum(exps), 1e-12)
                     frontier_priors = [max(1e-6, float(v) / z) for v in exps]
-            for (new_label, e, pred), frontier_prior in zip(pushable, frontier_priors):
+            for (new_label, e, pred, continuation), frontier_prior in zip(pushable, frontier_priors):
                 heapq.heappush(
                     pq,
-                    (self._priority(new_label, pred, frontier_prior=frontier_prior), next(counter), new_label),
+                    (self._priority(new_label, pred, frontier_prior=frontier_prior, continuation=continuation), next(counter), new_label),
                 )
 
         cert = select_certificate(episode_id, compiled.passenger_id, violations)
-        return None, cert, {"expansions": expansions, "violations": len(violations), "frontier_exhausted": True, "initial_states": start_states, "initial_state_source": initial_state_source}
+        return None, cert, {
+            "expansions": expansions,
+            "violations": len(violations),
+            "frontier_exhausted": True,
+            "initial_states": start_states,
+            "initial_state_source": initial_state_source,
+            "continuation_pruned": continuation_pruned,
+            "continuation_scored": continuation_scored,
+            "continuation_envelope": ({
+                "n_states": continuation_envelope.n_states,
+                "n_edges": continuation_envelope.n_edges,
+                "resources": continuation_envelope.resources,
+                "iterations": continuation_envelope.iterations,
+            } if continuation_envelope is not None else None),
+        }
 
     def _try_expand(self, label: SearchLabel, e: CandidateTransition, compiled: CompiledContract, clauses: Sequence, groups: Sequence, pred: Optional[TransitionPrediction]):
         # 1. Legal lifecycle.
@@ -348,7 +421,14 @@ class TypedSafeBudgetSearch:
         spec: UncertaintySpec | None = compiled.uncertainty.get(resource_name)
         return float(spec.beta_tau if spec else self.config.beta)
 
-    def _priority(self, label: SearchLabel, pred: Optional[TransitionPrediction], *, frontier_prior: float = 1.0) -> float:
+    def _priority(
+        self,
+        label: SearchLabel,
+        pred: Optional[TransitionPrediction],
+        *,
+        frontier_prior: float = 1.0,
+        continuation: EnvelopeDecision | None = None,
+    ) -> float:
         value = pred.completion_value if pred else 0.5
         value_term = 0.0 if self.config.no_completion_value_guidance else -self.config.lambda_value * math.log(max(value, 1e-6))
         # Passenger-independent edge validity is a learned *ordering* prior.  It
@@ -359,9 +439,22 @@ class TypedSafeBudgetSearch:
         learned_feasibility = pred.learned_feasibility_prior if pred else 1.0
         feasibility_term = -self.config.lambda_learned_feasibility * math.log(max(float(learned_feasibility), 1e-6))
         frontier_term = -self.config.lambda_frontier_ranker * math.log(max(float(frontier_prior), 1e-6))
+        continuation_cost_term = 0.0
+        continuation_margin_term = 0.0
+        if continuation is not None and continuation.structural_reachable:
+            if math.isfinite(float(continuation.cost_to_go)):
+                continuation_cost_term = self.config.lambda_continuation_cost * math.log1p(max(0.0, float(continuation.cost_to_go)))
+            # Feasible optimistic continuations have min_margin >= 0.  Prefer
+            # states with greater residual headroom without turning the margin
+            # into a hard gate.
+            continuation_margin_term = self.config.lambda_continuation_margin * max(0.0, 1.0 - float(continuation.min_margin))
         service_remaining = max(0, 7 - len(label.history))
         budget_heuristic = 0.0
         for v in label.resource_ledger.values():
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
                 budget_heuristic += 0.001 * abs(float(v))
-        return label.cost + service_remaining + budget_heuristic + value_term + edge_term + feasibility_term + frontier_term
+        return (
+            label.cost + service_remaining + budget_heuristic
+            + value_term + edge_term + feasibility_term + frontier_term
+            + continuation_cost_term + continuation_margin_term
+        )
