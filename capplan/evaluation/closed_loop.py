@@ -299,7 +299,13 @@ class ClosedLoopRunner:
         eval_semantics = {
             "algorithm_version": str(self.config.algorithm_version),
             "evidence_grounded_runtime": bool(self.config.evidence_grounded_runtime),
-            "hard_feasibility_evidence_policy": ("explicit_typed_evidence_v2" if self.config.evidence_grounded_runtime else "learned_overwrite_v1"),
+            "hard_feasibility_evidence_policy": ("explicit_typed_evidence_v2plus" if self.config.evidence_grounded_runtime else "learned_overwrite_v1"),
+            "frontier_guidance_policy": (
+                "executable_capability_frontier_v3"
+                if str(self.config.algorithm_version).upper().startswith("V3") and self.config.frontier_ranker_checkpoint and not self.config.no_frontier_ranker and not self.config.v2_reference_runtime
+                else ("v2_static_typed_feasibility" if self.config.v2_reference_runtime else "none_or_legacy")
+            ),
+            "frontier_ranker_checkpoint": str(self.config.frontier_ranker_checkpoint) if self.config.frontier_ranker_checkpoint else None,
             "vehicle_metric_semantics": vehicle_semantics,
             "publication_integrated_vehicle_closed_loop_ready": integrated_ready,
             "passenger_service_metrics_available": bool(metrics_rows),

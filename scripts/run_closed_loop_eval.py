@@ -72,7 +72,10 @@ def main() -> None:
     p.add_argument("--casa_checkpoint", default=None, help="Checkpoint produced by scripts.train_casa; required for a meaningful learned CASA run.")
     p.add_argument("--casa_device", default="auto", help="Device for learned CASA inference, e.g. cuda:0. Heuristic mode ignores this.")
     p.add_argument("--algorithm_version", default="V1")
-    p.add_argument("--evidence_grounded_runtime", action="store_true", help="V2 dual-channel safety semantics: learned demand/sigma guide but never overwrite explicit typed evidence.")
+    p.add_argument("--evidence_grounded_runtime", action="store_true", help="V2+ dual-channel safety semantics: learned demand/sigma never overwrite explicit typed evidence.")
+    p.add_argument("--frontier_ranker_checkpoint", default=None, help="V3 Executable Capability Frontier ranker checkpoint.")
+    p.add_argument("--frontier_ranker_device", default="cpu")
+    p.add_argument("--frontier_ranker_weight", type=float, default=0.35)
     p.add_argument("--episode_limit", type=int, default=None, help="Deterministic development subset size; full dataset when omitted.")
     p.add_argument("--episode_seed", type=int, default=13)
     p.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Show TQDM request-level evaluation progress and live PCR/latency.")
@@ -93,7 +96,7 @@ def main() -> None:
 
     cfg: PlannerConfig
     if args.ablation == "full":
-        cfg = PlannerConfig(trajectory_mode=args.trajectory_mode, casa_mode=args.casa_mode, casa_checkpoint=args.casa_checkpoint, casa_device=args.casa_device, algorithm_version=args.algorithm_version, evidence_grounded_runtime=args.evidence_grounded_runtime)
+        cfg = PlannerConfig(trajectory_mode=args.trajectory_mode, casa_mode=args.casa_mode, casa_checkpoint=args.casa_checkpoint, casa_device=args.casa_device, algorithm_version=args.algorithm_version, evidence_grounded_runtime=args.evidence_grounded_runtime, frontier_ranker_checkpoint=args.frontier_ranker_checkpoint, frontier_ranker_device=args.frontier_ranker_device, frontier_ranker_weight=args.frontier_ranker_weight)
     else:
         cfg = ablation_config(args.ablation, trajectory_mode=args.trajectory_mode)
         cfg.casa_mode = args.casa_mode
@@ -101,6 +104,9 @@ def main() -> None:
         cfg.casa_device = args.casa_device
         cfg.algorithm_version = args.algorithm_version
         cfg.evidence_grounded_runtime = bool(args.evidence_grounded_runtime)
+        cfg.frontier_ranker_checkpoint = args.frontier_ranker_checkpoint
+        cfg.frontier_ranker_device = args.frontier_ranker_device
+        cfg.frontier_ranker_weight = float(args.frontier_ranker_weight)
     print(f"[CAPPLAN_EVAL] dataset={dataset_dir} mode={args.trajectory_mode} casa={args.casa_mode} casa_device={args.casa_device}")
     res = ClosedLoopRunner(cfg).run_dataset(
         dataset_dir, args.output_dir, show_progress=args.progress,

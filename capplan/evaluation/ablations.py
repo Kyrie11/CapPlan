@@ -28,6 +28,9 @@ ABLATION_FLAGS = {
     # V2 mechanism ablations.
     "no_evidence_grounding": {"evidence_grounded_runtime": False},
     "no_learned_feasibility_guidance": {"no_learned_feasibility_guidance": True},
+    # V3 mechanism controls.
+    "no_frontier_ranker": {"no_frontier_ranker": True},
+    "v2_reference_runtime": {"v2_reference_runtime": True, "no_frontier_ranker": True},
 }
 
 MAIN_ABLATIONS = [

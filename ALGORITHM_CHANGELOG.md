@@ -99,3 +99,63 @@ The frozen benchmark already stores processed path/interface evidence such as ac
 ### Fast-iteration policy
 
 `run_v2_fast_experiments.sh` evaluates a deterministic 256-episode subset and runs independent variant groups concurrently on two GPUs. `run_v2_full_experiments.sh` performs the confirmatory full test only after the fast gate passes. Neither script invokes the other, and neither runs nuPlan closed-loop simulation during algorithm iteration.
+
+## V2-fast seed13 decision — evidence grounding validated; completion value retired
+
+The preregistered 256-episode V2-fast experiment (`2048` passenger requests) validates the V2 mechanism and determines the next algorithmic direction:
+
+- **Full V2** exactly matches the frozen verifier: `OraclePCR=PCR=0.05078125`, `TP=104`, `FP=0`, `FN=0`, `PCDecisionF1=1.0`, `CF_success_flip_precision=1.0`, and `CF_success_flip_recall=1.0`.
+- **w/o evidence grounding** reproduces the V1 collapse: `PCR=0`, `PCDecisionF1=0`, `PCFalseRejectRate=1.0`, and `TSBS p95=1`.  Thus explicit typed evidence is an essential hard-feasibility channel rather than an engineering workaround.
+- **w/o learned feasibility guidance** preserves every hard passenger-complete decision but increases TSBS expansions from `18.879 -> 20.441` on average and `79 -> 87.95` at p95.  Request-paired analysis gives a mean reduction of `1.562` expansions per request; episode-cluster bootstrap 95% CI is approximately `[0.98, 2.23]`.  Learned guidance is therefore useful, but its proper role is search ordering only.
+- **w/o completion-value guidance** is effectively unchanged (`18.889` mean expansions vs `18.879` full) and has slightly lower measured latency.  The historical completion-value head is therefore removed from the default algorithmic path rather than retained for architectural complexity.
+- **w/o conservative margins** increases raw PCR but produces `132` false accepts on the fast subset (`PCDecisionPrecision=0.441`, `PCFalseAcceptRate=0.0679`) and degrades counterfactual precision.  Conservative evidence remains part of executable acceptance semantics.
+
+**Decision:** V2 establishes the correct authority structure (evidence-grounded hard acceptance + non-authoritative learned guidance).  The next algorithm should not return to physical-demand overwrite, and it should not invest further in the global completion-value BCE head.  The remaining research problem is to learn a stronger *state-dependent* ordering of the already feasible typed search frontier.
+
+## V3 — Executable Capability Frontier (ECF) + Frontier-Guided TSBS
+
+**Status:** algorithm candidate for CCF-A-level development.  V3 retains the validated V2 hard acceptance semantics and replaces the weak transition-static learned guidance with a state-dependent capability-frontier ranker.
+
+### Motivation
+
+CapPlan's paper-level claim is that complete-trip functional requirements are compiled into executable acceptance semantics.  Therefore a learned module should reason *inside the feasible frontier* rather than redefine it.  V2 validates this separation but its learned feasibility prior is transition-static: it compares predicted single-edge demand with thresholds before considering the current accumulated typed ledger.  Passenger-complete planning is state-dependent because the same transition can be attractive or unattractive depending on already consumed access/wait/ride budgets, bottleneck residuals, future phase requirements, and the remaining lifecycle.
+
+### V3 mechanism
+
+1. **Executable hard acceptance is unchanged from V2.**  Passenger Capability Compiler + service automaton + evidence-grounded typed ledger + conservative uncertainty + TSBS remain authoritative.  Missing hard evidence stays fail-closed.
+2. **Executable Capability Frontier (new planning representation).**  After a candidate successor has passed the symbolic one-step checks, V3 constructs a state-dependent frontier representation from:
+   - current service phase and remaining lifecycle;
+   - successor typed ledger residuals under the concrete compiled contract;
+   - which typed resources have been observed;
+   - which typed requirements remain active in future phases;
+   - transition cost, dynamic availability, evidence confidence/missingness, and symbolic transition validity.
+   The representation uses runtime physical evidence only to form normalized contract residuals.  It never uses oracle skeleton membership or completion labels as input features.
+3. **Frontier-relative ranking (new learning objective).**  Training replays offline verifier skeletons.  At each oracle search state, the oracle successor is ranked against alternative successors that already pass the same symbolic one-step feasibility checks.  The default objective is pairwise logistic ranking rather than global completion-value BCE.  This removes the extreme global class-imbalance problem and learns the local decision search actually needs.
+4. **Frontier-Guided TSBS (new inference rule).**  For all hard-feasible sibling successors of one popped label, the ranker scores the frontier in one batch.  Scores are converted to a within-frontier softmax prior and affect queue ordering only.  A single feasible successor receives prior 1 and no learned penalty.  Hard feasibility, acceptance, and failure certification remain independent of the learned ranker.
+5. **Completion-value head retired from V3 default.**  V2-fast shows no measurable search benefit.  It remains only as a backward V2-reference control.
+6. **V2 static typed-demand guidance retired from V3 default.**  It remains available through `v2_reference_runtime` for paired comparison.  V3 does not use learned demand/sigma as its principal search signal.
+7. **Tiny-frontier inference is CPU-optimized.**  The V3 ranker uses a NumPy implementation of the trained MLP for small sibling frontiers, avoiding one GPU kernel launch per TSBS expansion while CASA can remain on an A30.
+
+### V3 attribution experiments
+
+The first V3 fast experiment uses the same deterministic 256-episode subset as V2-fast and compares:
+
+- `v3_full_pairwise`: full state-dependent ECF features + pairwise frontier ranking;
+- `v3_no_frontier`: identical hard planner with no ECF ranker;
+- `v2_reference`: exact V2 static learned-feasibility + completion-value ordering in the V3 codebase;
+- `v3_structural_pairwise`: pairwise ranker with typed ledger residual/future-requirement channels removed;
+- `v3_full_bce`: identical full ECF representation trained with global BCE rather than frontier-relative pairwise ranking.
+
+Primary safety gate (must be unchanged): `PCDecisionF1 >= 0.99`, `PCFalseAcceptRate=0`, `PCFalseRejectRate=0`, and counterfactual success-flip precision/recall must not regress materially.
+
+Primary algorithmic gain: compared pairwise on identical requests, V3 should reduce TSBS expansions relative to both `v3_no_frontier` and `v2_reference`.  Search-expansion deltas are reported with an episode-cluster bootstrap 95% CI; planner latency is secondary because GPU/CPU timing is noisier.
+
+Mechanism gates:
+
+- `v3_full_pairwise` better than `v3_structural_pairwise` supports the value of typed ledger residual + future requirement features;
+- `v3_full_pairwise` better than `v3_full_bce` supports frontier-relative ranking rather than global completion classification;
+- if V3 does not improve over the V2 reference with a positive paired CI, the ECF ranker is not retained merely for novelty.
+
+### Scope and novelty boundary
+
+Pairwise search ranking and learned heuristics are established ideas in automated planning; V3 does **not** claim ranking itself as novel.  The intended contribution is the passenger-complete, capability-compiled search state: a learned ranker operates on typed residual/future-requirement frontiers only after executable hard semantics admit a successor, so learning can accelerate complete-trip planning without becoming the authority that defines service feasibility.

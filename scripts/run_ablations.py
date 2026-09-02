@@ -54,7 +54,10 @@ def main() -> None:
     p.add_argument("--casa_checkpoint", default=None)
     p.add_argument("--casa_device", default="auto", help="Device for learned CASA inference, e.g. cuda:0.")
     p.add_argument("--algorithm_version", default="V1")
-    p.add_argument("--evidence_grounded_runtime", action="store_true", help="V2 dual-channel hard-evidence semantics.")
+    p.add_argument("--evidence_grounded_runtime", action="store_true", help="V2+ dual-channel hard-evidence semantics.")
+    p.add_argument("--frontier_ranker_checkpoint", default=None, help="V3 Executable Capability Frontier ranker checkpoint.")
+    p.add_argument("--frontier_ranker_device", default="auto", help="Device for V3 frontier ranker inference.")
+    p.add_argument("--frontier_ranker_weight", type=float, default=0.35)
     p.add_argument("--episode_limit", type=int, default=None)
     p.add_argument("--episode_seed", type=int, default=13)
     p.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
@@ -79,6 +82,9 @@ def main() -> None:
         cfg.casa_checkpoint = args.casa_checkpoint
         cfg.casa_device = args.casa_device
         cfg.algorithm_version = args.algorithm_version
+        cfg.frontier_ranker_checkpoint = args.frontier_ranker_checkpoint
+        cfg.frontier_ranker_device = args.frontier_ranker_device
+        cfg.frontier_ranker_weight = float(args.frontier_ranker_weight)
         if name != "no_evidence_grounding":
             cfg.evidence_grounded_runtime = bool(args.evidence_grounded_runtime)
         runner = ClosedLoopRunner(cfg)

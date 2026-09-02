@@ -35,6 +35,8 @@ class SearchConfig:
     lambda_value: float = 0.5
     lambda_edge_validity: float = 0.25
     lambda_learned_feasibility: float = 0.20
+    # V3: state-dependent ranker over the already hard-feasible successor frontier.
+    lambda_frontier_ranker: float = 0.35
     min_availability: float = 0.05
     # Untyped-ledger ablation: one unit of normalized budget per canonical
     # service transition.  Individual resource kinds may trade off because their
@@ -61,10 +63,14 @@ class SearchLabel:
 
 
 class TypedSafeBudgetSearch:
-    def __init__(self, automaton: ServiceAutomaton, registry: ResourceRegistry = DEFAULT_REGISTRY, config: SearchConfig | None = None) -> None:
+    def __init__(self, automaton: ServiceAutomaton, registry: ResourceRegistry = DEFAULT_REGISTRY, config: SearchConfig | None = None, frontier_ranker: Any | None = None) -> None:
         self.automaton = automaton
         self.registry = registry
         self.config = config or SearchConfig()
+        # Optional V3 ranker. It is queried only after _try_expand has accepted a
+        # successor under the symbolic typed contract, so it cannot change hard
+        # feasibility.
+        self.frontier_ranker = frontier_ranker
 
     def search(
         self,
@@ -143,6 +149,7 @@ class TypedSafeBudgetSearch:
                 candidates = [e for e in transitions if e.from_anchor == label.anchor]
             else:
                 candidates = list(outgoing.get((label.anchor, label.phase), []))
+            pushable = []
             for e in candidates:
                 ok, new_ledger, step, vios = self._try_expand(label, e, compiled, clauses, groups, predictions.get(e.transition_id))
                 if not ok:
@@ -154,7 +161,26 @@ class TypedSafeBudgetSearch:
                     continue
                 labels = [l for l in labels if not dominates(d_new, l.as_dominance_dict(), self.registry)]
                 labels.append(new_label)
-                heapq.heappush(pq, (self._priority(new_label, predictions.get(e.transition_id)), next(counter), new_label))
+                pushable.append((new_label, e, predictions.get(e.transition_id)))
+
+            # V3 scores the sibling frontier in one batch. The raw pairwise ranker
+            # score is converted to a within-frontier softmax prior; a single feasible
+            # successor therefore receives prior=1 and incurs no learned penalty.
+            frontier_priors = [1.0 for _ in pushable]
+            if self.frontier_ranker is not None and pushable:
+                raw_scores = self.frontier_ranker.score_successors(
+                    [(nl, edge) for nl, edge, _ in pushable], compiled, self.registry
+                )
+                if raw_scores:
+                    m = max(raw_scores)
+                    exps = [math.exp(max(-40.0, min(40.0, float(v) - m))) for v in raw_scores]
+                    z = max(sum(exps), 1e-12)
+                    frontier_priors = [max(1e-6, float(v) / z) for v in exps]
+            for (new_label, e, pred), frontier_prior in zip(pushable, frontier_priors):
+                heapq.heappush(
+                    pq,
+                    (self._priority(new_label, pred, frontier_prior=frontier_prior), next(counter), new_label),
+                )
 
         cert = select_certificate(episode_id, compiled.passenger_id, violations)
         return None, cert, {"expansions": expansions, "violations": len(violations), "frontier_exhausted": True, "initial_states": start_states, "initial_state_source": initial_state_source}
@@ -322,7 +348,7 @@ class TypedSafeBudgetSearch:
         spec: UncertaintySpec | None = compiled.uncertainty.get(resource_name)
         return float(spec.beta_tau if spec else self.config.beta)
 
-    def _priority(self, label: SearchLabel, pred: Optional[TransitionPrediction]) -> float:
+    def _priority(self, label: SearchLabel, pred: Optional[TransitionPrediction], *, frontier_prior: float = 1.0) -> float:
         value = pred.completion_value if pred else 0.5
         value_term = 0.0 if self.config.no_completion_value_guidance else -self.config.lambda_value * math.log(max(value, 1e-6))
         # Passenger-independent edge validity is a learned *ordering* prior.  It
@@ -332,9 +358,10 @@ class TypedSafeBudgetSearch:
         edge_term = -self.config.lambda_edge_validity * math.log(max(float(edge_prior), 1e-6))
         learned_feasibility = pred.learned_feasibility_prior if pred else 1.0
         feasibility_term = -self.config.lambda_learned_feasibility * math.log(max(float(learned_feasibility), 1e-6))
+        frontier_term = -self.config.lambda_frontier_ranker * math.log(max(float(frontier_prior), 1e-6))
         service_remaining = max(0, 7 - len(label.history))
         budget_heuristic = 0.0
         for v in label.resource_ledger.values():
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
                 budget_heuristic += 0.001 * abs(float(v))
-        return label.cost + service_remaining + budget_heuristic + value_term + edge_term + feasibility_term
+        return label.cost + service_remaining + budget_heuristic + value_term + edge_term + feasibility_term + frontier_term
