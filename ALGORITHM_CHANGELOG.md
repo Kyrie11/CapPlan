@@ -248,3 +248,115 @@ Mechanism interpretation:
 - `scripts/compare_search_efficiency.py`: request-paired comparison with episode-cluster bootstrap.
 
 Real nuPlan method-specific closed-loop simulation remains deferred until passenger/service algorithm selection is stable; `mock_strict` remains development-only and cannot support the final vehicle-planning SOTA claim.
+
+## V4-fast seed13 decision — efficiency submechanism PASS; full V4 STOP
+
+**Status:** V4 as a complete paper mechanism is **STOP** under its own preregistered gate.  The fast run is nevertheless attribution-valid for hard passenger-complete decisions and search-efficiency mechanism analysis, and it identifies one useful submechanism to carry forward.
+
+The deterministic fast subset contains `256` episodes / `2048` passenger requests and every compared variant evaluates the same requests with the same frozen CASA seed-13 checkpoint.  All six requested V4 controls complete without runtime/traceback failures.  V4 full preserves verifier decisions exactly (`PCDecisionF1=1.0`, `PCFalseAcceptRate=0`, `PCFalseRejectRate=0`) and capability success-flip precision/recall remain `1.0`, so the search comparison is not confounded by a hard-semantics collapse.
+
+### Search result
+
+V4 full reduces mean TSBS expansions from the exact V2 reference `18.8794` to `12.1270`, a paired saving of `6.7524` expansions/request (`35.77%`).  The episode-clustered 95% CI for `(V2 - V4)` is `[4.9253, 8.7862]`, with zero passenger-complete decision mismatches.  Therefore the preregistered *primary efficiency* gate passes strongly.
+
+Mechanism controls isolate where the gain comes from:
+
+- `priority-only`: `18.8569` mean expansions, essentially V2;
+- `pruning-only`: `12.1592` mean expansions, essentially full V4;
+- full V4 vs pruning-only saves only `0.0322` expansion/request (about `0.27%`, CI `[0.0088,0.0674]`).
+
+Thus the V4 continuation priority is not a meaningful mechanism and is retired.  The useful V4 component is backward dead-end pruning.  The V2 static learned typed-feasibility prior remains a secondary ordering signal: removing it from the pruned V4 runtime costs about `+1.006` expansion/request on this paired subset.
+
+### Why full V4 still fails preregistration
+
+The preregistered T5 no-regression gate fails materially against V2:
+
+- phase macro-F1: `0.8297 -> 0.5817` (`-0.2480`);
+- resource macro-F1: `0.6646 -> 0.5791` (`-0.0855`);
+- source macro-F1: `0.6301 -> 0.5942` (`-0.0359`);
+- certificate exact match: `0.7675 -> 0.6322` (`-0.1353`).
+
+Code/result audit explains this failure.  Across all V4-full CCE pruning violations in the fast run, `1991/1991` are `continuation_reachability`; **zero** final pruning proofs are produced by the intended typed numeric continuation relaxation.  Consequently the observed `35.8%` expansion reduction cannot be attributed to a capability-typed CCE.  Operationally it is backward *structural dead-end reachability* pruning.  The generic synthetic `capability_continuation_envelope / continuation_reachability` violation often wins certificate selection, replacing the concrete phase/resource/source failure that T5 is designed to diagnose.
+
+**Promotion decision:** retain backward structural dead-end pruning as an implementation/search optimization, but do **not** promote V4's typed CCE or continuation priority as the paper's main novelty.  The next version must demonstrate capability-specific backward reasoning beyond graph reachability and must carry a concrete failure proof rather than a pseudo-resource certificate.
+
+## V5 — Proof-Carrying Capability Viability Kernel (CVK) + Viability-Guided TSBS
+
+**Status:** next algorithm candidate.  V5 is designed directly from the attribution-valid V4-fast failure.  The first fast round uses the same frozen CASA seed-13 checkpoint and requires no new neural training.
+
+### V5 research question
+
+V4 establishes that backward pruning can greatly reduce search work, but it does not establish that *typed passenger capability semantics* are responsible for the gain.  V5 therefore asks a stricter algorithmic question:
+
+> Can the compiled passenger contract induce a backward capability-viability object that (i) soundly prunes infeasible forward prefixes, (ii) produces a concrete phase/resource/source witness when it prunes, and (iii) yields capability-specific pruning beyond ordinary structural dead-end reachability?
+
+This is the next question that must be answered before a CCF-A paper can claim a typed continuation mechanism.
+
+### V5 mechanism
+
+1. **Validated hard authority remains unchanged.** Evidence-grounded typed transition evidence, the Passenger Capability Compiler, service automaton, conservative typed resource algebra, dynamic-availability gate, and final `Accept AND Safe AND Sat` decision remain authoritative.
+2. **Exact structural viability kernel (new).** On the frozen candidate-transition graph, V5 computes exact backward reachability through lifecycle/static/interface/dynamic hard-valid transitions.  Structural dead ends can be pruned soundly.
+3. **Concrete suffix witnesses (new).** For each structurally reachable `(anchor,phase)` state, V5 stores a bounded set of concrete simple-state suffix transition sequences to an accepting destination.  This preserves cross-resource and requirement-group coupling that V4's independently relaxed per-resource vector discarded.
+4. **Fail-open completeness guard (new).** Typed pruning is permitted only when the concrete suffix set is complete within the configured path/depth guards.  If suffix enumeration hits a path-count or depth guard, the state is marked overflow and typed pruning is disabled there.  Approximation may therefore lose speed but cannot create a false hard rejection.
+5. **Exact typed suffix replay (new).** Given the actual forward typed ledger, V5 replays every complete stored suffix with the **same** `_try_expand`, conservative margins, categorical/group semantics, and final `satisfy_all` used by forward TSBS.  A state is typed-pruned only if every executable suffix fails.  This is a path-coupled viability proof rather than V4's independent-resource relaxation.
+6. **Proof-carrying structural diagnosis (new).** When structural reachability fails, the kernel propagates a concrete downstream transition-test witness (`interface`, `physical`, `availability`, etc.) backward instead of emitting the generic `continuation_reachability` pseudo-resource.
+7. **Proof-carrying typed diagnosis (new).** When every typed suffix fails, the certificate candidate is the best real violation encountered during exact suffix replay (`ride_time_s`, `path_width_m`, grouped interface requirement, missing/low-confidence evidence, etc.), not `typed_viability` unless the explicit generic-certificate control is enabled.
+8. **No new continuation-priority head.** V4 shows that continuation priority has negligible independent value.  V5 uses the exact kernel for pruning/proof only and retains the empirically useful V2 static learned typed-feasibility prior as a secondary queue-ordering signal.
+9. **No V3 ranker and no global completion-value head.** They remain retired unless later evidence establishes a new learning target with independent value.
+
+### Soundness/completeness boundary
+
+Structural reachability is exact on the frozen hard-valid candidate graph.  Typed pruning is fail-open under bounded suffix materialization: a state whose suffix set is incomplete is never typed-pruned.  Cyclic wait/replan suffixes are not materialized because the CapPlan hard resource algebra is monotone: an extra cycle cannot reduce cumulative/probabilistic burden, improve a bottleneck affordance, or repair a categorical/interface predicate.  Thus any feasible cyclic suffix has a no-worse simple-state witness.
+
+Returned-plan soundness remains identical to V2 because V5 never relaxes `_try_expand` or final `satisfy_all`.  As with previous versions, finite `max_expansions` means search-time completeness is an empirical/runtime property rather than an unconditional theorem.
+
+### Learning target after V5
+
+V5 deliberately does **not** retrain CASA.  A network should not relearn verifier-equivalent processed values such as the same slope/width/distance already present in authoritative `resource_evidence`, and it should not regain hard-feasibility authority.  If V5 establishes a useful exact capability-viability target, the next learned module should amortize one of two lower-level problems:
+
+- raw/dynamic evidence -> calibrated uncertainty/guidance; or
+- compiled capability state + raw service graph -> **viability proposal / ordering** supervised by the exact CVK while symbolic CVK/TSBS remains the hard verifier.
+
+Whether a genuine HGT/R-GCN is justified is therefore deferred until V5 tells us that learning is actually the dominant bottleneck.
+
+### V5 preregistered fast experiment
+
+Use the same deterministic `256`-episode subset and the same frozen CASA checkpoint.  Required controls:
+
+- `v5_full`: proof-carrying structural + typed viability pruning, V2 static learned ordering;
+- `v5_no_kernel`: no backward viability kernel;
+- `v5_structural_only`: structural reachability/proof only, typed suffix pruning disabled;
+- `v2_reference`: exact V2 reference runtime;
+- `v5_generic_certificate`: identical V5 search but replace concrete viability witnesses by generic pseudo-certificates;
+- `v5_no_static_guidance`: remove the V2 learned static ordering signal;
+- `v4_reference`: exact V4 full on the same subset.
+
+Hard/semantic gate:
+
+- `PCDecisionF1 >= 0.99`, `FAR=0`, `FRR=0`;
+- T4 success-flip precision/recall do not regress versus V2;
+- each of `DF_phase_macro_f1`, `DF_resource_macro_f1`, `DF_source_macro_f1`, and `DF_certificate_exact_match` may drop by **at most 0.01** versus V2 on the fast review.
+
+Primary efficiency gate:
+
+- paired `(V2 expansions - V5 expansions)` mean `> 0`;
+- episode-cluster bootstrap 95% CI lower bound `> 0`;
+- zero paired passenger-complete decision mismatches.
+
+Capability-specific promotion gate:
+
+- `CVK_typed_pruned_mean > 0`; and
+- full V5 must beat `v5_structural_only` in paired expansions with a positive 95% CI lower bound.
+
+Without this gate, backward reachability may remain a useful engineering optimization, but the experiment still does not support a paper claim that capability-typed backward viability is the source of the gain.
+
+Proof-carrying diagnosis gate:
+
+- `v5_generic_certificate` and full V5 must have identical hard decisions and identical expansion counts;
+- concrete proof witnesses must improve at least one preregistered T5 macro/exact metric by >= `0.01` over the generic-certificate control while satisfying the V2 no-regression gate.
+
+`run_v5_fast_experiments.sh` executes these controls and writes `v5_fast_gate.json` automatically so the GO/STOP decision is not selected after seeing the results.  Run `run_v5_full_experiments.sh` only if that file reports `status=GO`.
+
+### Novelty boundary
+
+V5 does **not** claim generic backward reachability, bidirectional resource-constrained search, or learned heuristics as novel.  Those are established planning/search techniques.  The intended paper-level contribution is a **passenger-complete, capability-compiled viability semantics** in which heterogeneous non-substitutable capability requirements induce both a forward consumed-resource state and a backward proof-carrying executable-continuation state, while learning remains a subordinate accelerator rather than the authority that defines passenger feasibility.

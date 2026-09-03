@@ -54,6 +54,15 @@ class PlannerConfig:
     no_continuation_priority: bool = False
     continuation_cost_weight: float = 0.20
     continuation_margin_weight: float = 0.35
+    # V5 Proof-Carrying Capability Viability Kernel (CVK).  The backward
+    # kernel is a hard-semantics accelerator only: it can prune a prefix when
+    # there is no structurally executable suffix or, when the finite suffix set
+    # is complete, when exact typed replay proves every suffix infeasible.
+    no_viability_kernel: bool = False
+    no_typed_viability: bool = False
+    generic_viability_certificates: bool = False
+    viability_max_paths_per_state: int = 256
+    viability_max_depth: int = 16
     beta: float = 1.0
     trajectory_mode: str = "mock_strict"
     casa_mode: str = "heuristic_oracle_baseline"
@@ -79,21 +88,24 @@ class CapPlanPlanner:
         version = str(self.config.algorithm_version).upper()
         is_v3 = version.startswith("V3")
         is_v4 = version.startswith("V4")
+        is_v5 = version.startswith("V5")
         # V3 removes the empirically redundant completion-value head and replaces
         # V2's transition-static typed-feasibility prior with a learned local
-        # frontier ranker.  V4 is intentionally different: it retires the V3
-        # ranker after the full-test NO-GO result, restores the useful V2 static
-        # prior, and adds a symbolic typed continuation envelope.
-        use_v2_reference = bool((is_v3 or is_v4) and self.config.v2_reference_runtime)
+        # frontier ranker.  V4 retired that ranker and tested a relaxed suffix
+        # envelope. V5 keeps the verified V2 static prior but replaces V4's
+        # generic reachability-dominated envelope with a proof-carrying exact
+        # capability viability kernel.
+        use_v2_reference = bool((is_v3 or is_v4 or is_v5) and self.config.v2_reference_runtime)
         frontier_ranker = None
         if is_v3 and (not use_v2_reference) and (not self.config.no_frontier_ranker) and self.config.frontier_ranker_checkpoint:
             frontier_ranker = FrontierRanker(self.config.frontier_ranker_checkpoint, device=self.config.frontier_ranker_device)
-        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4) and not use_v2_reference)
+        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5) and not use_v2_reference)
         if is_v3 and not use_v2_reference:
             lambda_static = 0.0
         else:
             lambda_static = 0.0 if self.config.no_learned_feasibility_guidance else 0.20
         use_continuation = bool(is_v4 and (not use_v2_reference) and (not self.config.no_continuation_envelope))
+        use_viability = bool(is_v5 and (not use_v2_reference) and (not self.config.no_viability_kernel))
         self.searcher = TypedSafeBudgetSearch(
             self.automaton,
             registry,
@@ -109,6 +121,12 @@ class CapPlanPlanner:
                 continuation_pruning=bool(use_continuation and (not self.config.no_continuation_pruning)),
                 lambda_continuation_cost=(0.0 if (not use_continuation or self.config.no_continuation_priority) else float(self.config.continuation_cost_weight)),
                 lambda_continuation_margin=(0.0 if (not use_continuation or self.config.no_continuation_priority) else float(self.config.continuation_margin_weight)),
+                use_viability_kernel=use_viability,
+                viability_pruning=use_viability,
+                viability_typed_pruning=bool(use_viability and (not self.config.no_typed_viability)),
+                viability_generic_certificates=bool(use_viability and self.config.generic_viability_certificates),
+                viability_max_paths_per_state=int(self.config.viability_max_paths_per_state),
+                viability_max_depth=int(self.config.viability_max_depth),
             ),
             frontier_ranker=frontier_ranker,
         )

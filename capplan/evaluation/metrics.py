@@ -373,6 +373,26 @@ def continuation_pruned_p95(episodes: List[Dict[str, Any]]) -> float:
     return _percentile([float(e.get("continuation_pruned", 0.0)) for e in episodes if e.get("continuation_pruned") is not None], 0.95)
 
 
+def viability_pruned_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("viability_pruned", 0.0)) for e in episodes if e.get("viability_pruned") is not None])
+
+
+def viability_structural_pruned_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("viability_structural_pruned", 0.0)) for e in episodes if e.get("viability_structural_pruned") is not None])
+
+
+def viability_typed_pruned_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("viability_typed_pruned", 0.0)) for e in episodes if e.get("viability_typed_pruned") is not None])
+
+
+def viability_path_checks_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("viability_path_checks", 0.0)) for e in episodes if e.get("viability_path_checks") is not None])
+
+
+def viability_cache_hits_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("viability_cache_hits", 0.0)) for e in episodes if e.get("viability_cache_hits") is not None])
+
+
 def planning_latency_mean_ms(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("planning_latency_ms", 0.0)) for e in episodes if e.get("planning_latency_ms") is not None])
 
@@ -455,6 +475,11 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "TSBS_expansions_p95": search_expansion_p95(episodes),
         "CCE_pruned_mean": continuation_pruned_mean(episodes),
         "CCE_pruned_p95": continuation_pruned_p95(episodes),
+        "CVK_pruned_mean": viability_pruned_mean(episodes),
+        "CVK_structural_pruned_mean": viability_structural_pruned_mean(episodes),
+        "CVK_typed_pruned_mean": viability_typed_pruned_mean(episodes),
+        "CVK_path_checks_mean": viability_path_checks_mean(episodes),
+        "CVK_cache_hits_mean": viability_cache_hits_mean(episodes),
         "PlannerLatency_ms_mean": planning_latency_mean_ms(episodes),
         "PlannerLatency_ms_p95": planning_latency_p95_ms(episodes),
     }

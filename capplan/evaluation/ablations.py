@@ -30,11 +30,15 @@ ABLATION_FLAGS = {
     "no_learned_feasibility_guidance": {"no_learned_feasibility_guidance": True},
     # V3 mechanism controls.
     "no_frontier_ranker": {"no_frontier_ranker": True},
-    "v2_reference_runtime": {"v2_reference_runtime": True, "no_frontier_ranker": True, "no_continuation_envelope": True},
+    "v2_reference_runtime": {"v2_reference_runtime": True, "no_frontier_ranker": True, "no_continuation_envelope": True, "no_viability_kernel": True},
     # V4 mechanism controls.
     "no_continuation_envelope": {"no_continuation_envelope": True},
     "no_continuation_pruning": {"no_continuation_pruning": True},
     "no_continuation_priority": {"no_continuation_priority": True},
+    # V5 proof-carrying capability viability controls.
+    "no_viability_kernel": {"no_viability_kernel": True},
+    "no_typed_viability": {"no_typed_viability": True},
+    "generic_viability_certificates": {"generic_viability_certificates": True},
 }
 
 MAIN_ABLATIONS = [

@@ -15,6 +15,10 @@ from capplan.planning.capability_continuation_envelope import (
     evaluate_continuation,
 )
 from capplan.planning.certificates import select_certificate
+from capplan.planning.capability_viability_kernel import (
+    CapabilityViabilityKernel,
+    build_capability_viability_kernel,
+)
 from capplan.semantics.capability_compiler import CompiledContract, UncertaintySpec
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
 from capplan.semantics.service_automaton import ServiceAutomaton
@@ -49,6 +53,15 @@ class SearchConfig:
     continuation_pruning: bool = True
     lambda_continuation_cost: float = 0.20
     lambda_continuation_margin: float = 0.35
+    # V5: proof-carrying exact suffix viability. The kernel stores concrete
+    # structurally executable suffixes and may typed-prune only when the suffix
+    # set is complete for the state (overflow disables typed pruning).
+    use_viability_kernel: bool = False
+    viability_pruning: bool = True
+    viability_typed_pruning: bool = True
+    viability_generic_certificates: bool = False
+    viability_max_paths_per_state: int = 256
+    viability_max_depth: int = 16
     min_availability: float = 0.05
     # Untyped-ledger ablation: one unit of normalized budget per canonical
     # service transition.  Individual resource kinds may trade off because their
@@ -109,6 +122,16 @@ class TypedSafeBudgetSearch:
                 no_conservative_margins=self.config.no_conservative_margins,
             )
 
+        viability_kernel: CapabilityViabilityKernel | None = None
+        if self.config.use_viability_kernel and not self.automaton.disabled and not self.config.no_typed_resource_ledger:
+            viability_kernel = build_capability_viability_kernel(
+                transitions, predictions, self.automaton,
+                min_availability=self.config.min_availability,
+                max_paths_per_state=self.config.viability_max_paths_per_state,
+                max_depth=self.config.viability_max_depth,
+            )
+        viability_cache: Dict[Tuple[Any, ...], Tuple[bool, Optional[ViolationRecord], int]] = {}
+
         # The dataset uses concrete entrance IDs, not the literal string
         # ``origin``.  The offline oracle already derives these states from the
         # access transitions; runtime TSBS must do the same or it can falsely
@@ -143,6 +166,11 @@ class TypedSafeBudgetSearch:
         expansions = 0
         continuation_pruned = 0
         continuation_scored = 0
+        viability_pruned = 0
+        viability_structural_pruned = 0
+        viability_typed_pruned = 0
+        viability_path_checks = 0
+        viability_cache_hits = 0
         while pq and expansions < self.config.max_expansions:
             _, _, label = heapq.heappop(pq)
             expansions += 1
@@ -166,6 +194,19 @@ class TypedSafeBudgetSearch:
                     "initial_state_source": initial_state_source,
                     "continuation_pruned": continuation_pruned,
                     "continuation_scored": continuation_scored,
+                    "viability_pruned": viability_pruned,
+                    "viability_structural_pruned": viability_structural_pruned,
+                    "viability_typed_pruned": viability_typed_pruned,
+                    "viability_path_checks": viability_path_checks,
+                    "viability_cache_hits": viability_cache_hits,
+                    "viability_kernel": ({
+                        "n_states": viability_kernel.n_states,
+                        "n_valid_edges": viability_kernel.n_valid_edges,
+                        "n_invalid_edges": viability_kernel.n_invalid_edges,
+                        "overflow_states": len(viability_kernel.overflow_states),
+                        "max_paths_per_state": viability_kernel.max_paths_per_state,
+                        "max_depth": viability_kernel.max_depth,
+                    } if viability_kernel is not None else None),
                     "continuation_envelope": ({
                         "n_states": continuation_envelope.n_states,
                         "n_edges": continuation_envelope.n_edges,
@@ -215,6 +256,44 @@ class TypedSafeBudgetSearch:
                                 "no_relaxed_typed_continuation",
                             ))
                         continue
+
+                if viability_kernel is not None and self.config.viability_pruning:
+                    v_state = (new_label.anchor, new_label.phase)
+                    if not viability_kernel.is_reachable(v_state):
+                        viability_pruned += 1
+                        viability_structural_pruned += 1
+                        witness = viability_kernel.failure_witness(v_state)
+                        if self.config.viability_generic_certificates or witness is None:
+                            violations.append(ViolationRecord(
+                                new_label.phase, e.transition_id, "viability_reachability", -1.0,
+                                "capability_viability_kernel", 1.0, "no_structurally_executable_suffix",
+                            ))
+                        else:
+                            violations.append(witness)
+                        continue
+                    if self.config.viability_typed_pruning and not viability_kernel.overflowed(v_state):
+                        cache_key = (v_state, self._ledger_signature(new_label.resource_ledger))
+                        cached = viability_cache.get(cache_key)
+                        if cached is None:
+                            viable, witness, checked = self._typed_suffix_viability(
+                                new_label, compiled, clauses, groups, predictions, viability_kernel
+                            )
+                            viability_cache[cache_key] = (viable, witness, checked)
+                        else:
+                            viable, witness, checked = cached
+                            viability_cache_hits += 1
+                        viability_path_checks += int(checked)
+                        if not viable:
+                            viability_pruned += 1
+                            viability_typed_pruned += 1
+                            if self.config.viability_generic_certificates or witness is None:
+                                violations.append(ViolationRecord(
+                                    new_label.phase, e.transition_id, "typed_viability", -1.0,
+                                    "capability_viability_kernel", 1.0, "no_typed_executable_suffix",
+                                ))
+                            else:
+                                violations.append(witness)
+                            continue
                 d_new = new_label.as_dominance_dict()
                 if any(dominates(existing.as_dominance_dict(), d_new, self.registry) for existing in labels):
                     continue
@@ -250,6 +329,19 @@ class TypedSafeBudgetSearch:
             "initial_state_source": initial_state_source,
             "continuation_pruned": continuation_pruned,
             "continuation_scored": continuation_scored,
+            "viability_pruned": viability_pruned,
+            "viability_structural_pruned": viability_structural_pruned,
+            "viability_typed_pruned": viability_typed_pruned,
+            "viability_path_checks": viability_path_checks,
+            "viability_cache_hits": viability_cache_hits,
+            "viability_kernel": ({
+                "n_states": viability_kernel.n_states,
+                "n_valid_edges": viability_kernel.n_valid_edges,
+                "n_invalid_edges": viability_kernel.n_invalid_edges,
+                "overflow_states": len(viability_kernel.overflow_states),
+                "max_paths_per_state": viability_kernel.max_paths_per_state,
+                "max_depth": viability_kernel.max_depth,
+            } if viability_kernel is not None else None),
             "continuation_envelope": ({
                 "n_states": continuation_envelope.n_states,
                 "n_edges": continuation_envelope.n_edges,
@@ -361,6 +453,92 @@ class TypedSafeBudgetSearch:
             return False, new_ledger, None, violations
         step = LedgerStep(e.transition_id, e.to_phase, e.action, dict(new_ledger), margins, [ev.__dict__ for ev in e.resource_evidence])
         return True, new_ledger, step, []
+
+    @staticmethod
+    def _ledger_signature(ledger: Mapping[str, Any]) -> Tuple[Any, ...]:
+        """Hashable exact-enough signature for per-request viability memoization."""
+        out: List[Any] = []
+        for name in sorted(ledger):
+            value = ledger[name]
+            if isinstance(value, MissingEvidence):
+                out.append((name, "missing", value.phase, value.reason, value.evidence_source, float(value.confidence)))
+            elif hasattr(value, "ok") and hasattr(value, "observed"):
+                out.append((
+                    name, "predicate", bool(getattr(value, "ok", False)),
+                    repr(getattr(value, "observed", None)), repr(getattr(value, "required", None)),
+                    str(getattr(value, "operator", "")),
+                ))
+            elif isinstance(value, (int, float)):
+                out.append((name, "numeric", float(value)))
+            else:
+                out.append((name, "other", repr(value)))
+        return tuple(out)
+
+    def _typed_suffix_viability(
+        self,
+        label: SearchLabel,
+        compiled: CompiledContract,
+        clauses: Sequence,
+        groups: Sequence,
+        predictions: Mapping[str, TransitionPrediction],
+        kernel: CapabilityViabilityKernel,
+    ) -> Tuple[bool, Optional[ViolationRecord], int]:
+        """Replay concrete suffix witnesses under the label's exact typed ledger.
+
+        Returns ``(exists_feasible_suffix, best_failure_witness, checked_paths)``.
+        The replay calls the same ``_try_expand`` implementation as forward TSBS,
+        so grouped categorical predicates, missing evidence, conservative margins,
+        and probabilistic resource algebra remain identical.
+        """
+        state = (label.anchor, label.phase)
+        suffixes = kernel.state_suffixes(state)
+        if not suffixes:
+            return False, kernel.failure_witness(state), 0
+        best: Optional[ViolationRecord] = None
+        checked = 0
+        for suffix in suffixes:
+            checked += 1
+            temp = SearchLabel(label.anchor, label.phase, dict(label.resource_ledger), label.cost, list(label.history), list(label.steps))
+            path_violations: List[ViolationRecord] = []
+            path_ok = True
+            for tid in suffix.transition_ids:
+                edge = kernel.edge_by_id.get(tid)
+                if edge is None:
+                    path_ok = False
+                    break
+                ok, new_ledger, step, vios = self._try_expand(
+                    temp, edge, compiled, clauses, groups, predictions.get(tid)
+                )
+                if not ok:
+                    path_violations.extend(vios)
+                    path_ok = False
+                    break
+                temp = SearchLabel(
+                    edge.to_anchor, edge.to_phase, new_ledger, temp.cost + edge.cost,
+                    temp.history + [edge], temp.steps + ([step] if step is not None else []),
+                )
+            if path_ok:
+                final_ok, _, failed = satisfy_all(temp.resource_ledger, clauses, groups, self.registry)
+                if self.automaton.accept(temp.phase) and final_ok:
+                    return True, None, checked
+                if not final_ok:
+                    for name in failed:
+                        c = next((x for x in clauses if x.resource_name == name or x.id == name), None)
+                        path_violations.append(ViolationRecord(
+                            temp.phase, suffix.transition_ids[-1] if suffix.transition_ids else "destination",
+                            name, signed_margin(temp.resource_ledger, c, self.registry) if c else -1.0,
+                            c.source if c else "capability_contract", c.confidence if c else 1.0,
+                            "resource_or_interface",
+                        ))
+            for vio in path_violations:
+                if best is None:
+                    best = vio
+                else:
+                    a = (float(vio.signed_margin), -float(vio.confidence), self.automaton.phase_index(vio.phase), str(vio.transition_id))
+                    b = (float(best.signed_margin), -float(best.confidence), self.automaton.phase_index(best.phase), str(best.transition_id))
+                    if a < b:
+                        best = vio
+        return False, best, checked
 
     def _scalarized_clause_utilization(self, clause, ev: ResourceEvidence | None, compiled: CompiledContract, phase: str) -> float:
         """Map one typed clause to a dimensionless scalar utilization.
