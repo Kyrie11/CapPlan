@@ -94,6 +94,13 @@ def result_to_episode_metrics(
         "viability_typed_pruned": int(result.diagnostics.get("viability_typed_pruned", 0) or 0),
         "viability_path_checks": int(result.diagnostics.get("viability_path_checks", 0) or 0),
         "viability_cache_hits": int(result.diagnostics.get("viability_cache_hits", 0) or 0),
+        "precondition_summary_checks": int(result.diagnostics.get("precondition_summary_checks", 0) or 0),
+        "precondition_proof_checks": int(result.diagnostics.get("precondition_proof_checks", 0) or 0),
+        "precondition_proof_envelope_hits": int(result.diagnostics.get("precondition_proof_envelope_hits", 0) or 0),
+        "precondition_raw_suffixes": int(result.diagnostics.get("precondition_raw_suffixes", 0) or 0),
+        "precondition_antichain_size": int(result.diagnostics.get("precondition_antichain_size", 0) or 0),
+        "precondition_raw_proofs": int(result.diagnostics.get("precondition_raw_proofs", 0) or 0),
+        "precondition_proof_antichain_size": int(result.diagnostics.get("precondition_proof_antichain_size", 0) or 0),
         "phase_accepted": phase_accepted,
         "vehicle_safe": traffic_safe,
         "capability_satisfied": capability_satisfied,
@@ -308,9 +315,12 @@ class ClosedLoopRunner:
             "evidence_grounded_runtime": bool(self.config.evidence_grounded_runtime),
             "hard_feasibility_evidence_policy": ("explicit_typed_evidence_v2plus" if self.config.evidence_grounded_runtime else "learned_overwrite_v1"),
             "frontier_guidance_policy": (
-                "proof_carrying_capability_viability_v5"
-                if str(self.config.algorithm_version).upper().startswith("V5") and not self.config.no_viability_kernel and not self.config.v2_reference_runtime
+                "proof_carrying_weakest_precondition_antichain_v6"
+                if str(self.config.algorithm_version).upper().startswith("V6") and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime
                 else (
+                    "proof_carrying_capability_viability_v5"
+                    if (str(self.config.algorithm_version).upper().startswith("V5") or (str(self.config.algorithm_version).upper().startswith("V6") and self.config.v5_reference_runtime)) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime
+                    else (
                     "capability_continuation_envelope_v4"
                     if str(self.config.algorithm_version).upper().startswith("V4") and not self.config.no_continuation_envelope and not self.config.v2_reference_runtime
                     else (
@@ -319,13 +329,24 @@ class ClosedLoopRunner:
                         else ("v2_static_typed_feasibility" if self.config.v2_reference_runtime else "none_or_legacy")
                     )
                 )
+                )
             ),
             "frontier_ranker_checkpoint": str(self.config.frontier_ranker_checkpoint) if self.config.frontier_ranker_checkpoint else None,
             "continuation_envelope_enabled": bool(str(self.config.algorithm_version).upper().startswith("V4") and not self.config.no_continuation_envelope and not self.config.v2_reference_runtime),
             "continuation_pruning_enabled": bool(str(self.config.algorithm_version).upper().startswith("V4") and not self.config.no_continuation_envelope and not self.config.no_continuation_pruning and not self.config.v2_reference_runtime),
-            "capability_viability_kernel_enabled": bool(str(self.config.algorithm_version).upper().startswith("V5") and not self.config.no_viability_kernel and not self.config.v2_reference_runtime),
-            "typed_viability_pruning_enabled": bool(str(self.config.algorithm_version).upper().startswith("V5") and not self.config.no_viability_kernel and not self.config.no_typed_viability and not self.config.v2_reference_runtime),
-            "proof_carrying_viability_certificates": bool(str(self.config.algorithm_version).upper().startswith("V5") and not self.config.no_viability_kernel and not self.config.generic_viability_certificates and not self.config.v2_reference_runtime),
+            "capability_viability_kernel_enabled": bool((str(self.config.algorithm_version).upper().startswith("V5") or str(self.config.algorithm_version).upper().startswith("V6")) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime),
+            "typed_viability_pruning_enabled": bool((str(self.config.algorithm_version).upper().startswith("V5") or str(self.config.algorithm_version).upper().startswith("V6")) and not self.config.no_viability_kernel and not self.config.no_typed_viability and not self.config.v2_reference_runtime),
+            "precondition_antichain_enabled": bool(str(self.config.algorithm_version).upper().startswith("V6") and not self.config.no_viability_kernel and not self.config.no_precondition_antichain and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "viability_proof_envelope_enabled": bool(str(self.config.algorithm_version).upper().startswith("V6") and not self.config.no_viability_kernel and not self.config.no_viability_proof_envelope and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "proof_carrying_viability_certificates": bool(
+                (
+                    str(self.config.algorithm_version).upper().startswith("V5")
+                    or (str(self.config.algorithm_version).upper().startswith("V6") and not self.config.no_viability_proof_envelope)
+                )
+                and not self.config.no_viability_kernel
+                and not self.config.generic_viability_certificates
+                and not self.config.v2_reference_runtime
+            ),
             "vehicle_metric_semantics": vehicle_semantics,
             "publication_integrated_vehicle_closed_loop_ready": integrated_ready,
             "passenger_service_metrics_available": bool(metrics_rows),

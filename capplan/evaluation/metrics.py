@@ -393,6 +393,34 @@ def viability_cache_hits_mean(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("viability_cache_hits", 0.0)) for e in episodes if e.get("viability_cache_hits") is not None])
 
 
+def precondition_summary_checks_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_summary_checks", 0.0)) for e in episodes if e.get("precondition_summary_checks") is not None])
+
+
+def precondition_proof_checks_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_proof_checks", 0.0)) for e in episodes if e.get("precondition_proof_checks") is not None])
+
+
+def precondition_proof_envelope_hits_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_proof_envelope_hits", 0.0)) for e in episodes if e.get("precondition_proof_envelope_hits") is not None])
+
+
+def precondition_raw_suffixes_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_raw_suffixes", 0.0)) for e in episodes if e.get("precondition_raw_suffixes") is not None])
+
+
+def precondition_antichain_size_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_antichain_size", 0.0)) for e in episodes if e.get("precondition_antichain_size") is not None])
+
+
+def precondition_raw_proofs_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_raw_proofs", 0.0)) for e in episodes if e.get("precondition_raw_proofs") is not None])
+
+
+def precondition_proof_antichain_size_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_proof_antichain_size", 0.0)) for e in episodes if e.get("precondition_proof_antichain_size") is not None])
+
+
 def planning_latency_mean_ms(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("planning_latency_ms", 0.0)) for e in episodes if e.get("planning_latency_ms") is not None])
 
@@ -480,6 +508,13 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "CVK_typed_pruned_mean": viability_typed_pruned_mean(episodes),
         "CVK_path_checks_mean": viability_path_checks_mean(episodes),
         "CVK_cache_hits_mean": viability_cache_hits_mean(episodes),
+        "WPA_summary_checks_mean": precondition_summary_checks_mean(episodes),
+        "WPA_proof_checks_mean": precondition_proof_checks_mean(episodes),
+        "WPA_proof_envelope_hits_mean": precondition_proof_envelope_hits_mean(episodes),
+        "WPA_raw_suffixes_mean": precondition_raw_suffixes_mean(episodes),
+        "WPA_antichain_size_mean": precondition_antichain_size_mean(episodes),
+        "WPA_raw_proofs_mean": precondition_raw_proofs_mean(episodes),
+        "WPA_proof_antichain_size_mean": precondition_proof_antichain_size_mean(episodes),
         "PlannerLatency_ms_mean": planning_latency_mean_ms(episodes),
         "PlannerLatency_ms_p95": planning_latency_p95_ms(episodes),
     }

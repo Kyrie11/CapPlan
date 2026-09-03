@@ -19,6 +19,13 @@ from capplan.planning.capability_viability_kernel import (
     CapabilityViabilityKernel,
     build_capability_viability_kernel,
 )
+from capplan.planning.capability_precondition_antichain import (
+    CapabilityPreconditionAntichain,
+    better_violation as better_precondition_violation,
+    build_capability_precondition_antichain,
+    evaluate_precondition_antichain,
+    evaluate_proof_precondition_antichain,
+)
 from capplan.semantics.capability_compiler import CompiledContract, UncertaintySpec
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
 from capplan.semantics.service_automaton import ServiceAutomaton
@@ -60,6 +67,11 @@ class SearchConfig:
     viability_pruning: bool = True
     viability_typed_pruning: bool = True
     viability_generic_certificates: bool = False
+    # V6: compile the complete V5 suffix set into a nondominated typed
+    # weakest-precondition antichain.  This preserves V5 viability decisions
+    # while replacing repeated path replay with compact summary checks.
+    use_precondition_antichain: bool = False
+    viability_use_proof_envelope: bool = True
     viability_max_paths_per_state: int = 256
     viability_max_depth: int = 16
     min_availability: float = 0.05
@@ -130,6 +142,13 @@ class TypedSafeBudgetSearch:
                 max_paths_per_state=self.config.viability_max_paths_per_state,
                 max_depth=self.config.viability_max_depth,
             )
+        precondition_antichain: CapabilityPreconditionAntichain | None = None
+        if viability_kernel is not None and self.config.use_precondition_antichain and self.config.viability_typed_pruning:
+            precondition_antichain = build_capability_precondition_antichain(
+                viability_kernel, compiled, predictions, self.registry,
+                no_conservative_margins=self.config.no_conservative_margins,
+                default_beta=self.config.beta,
+            )
         viability_cache: Dict[Tuple[Any, ...], Tuple[bool, Optional[ViolationRecord], int]] = {}
 
         # The dataset uses concrete entrance IDs, not the literal string
@@ -171,6 +190,9 @@ class TypedSafeBudgetSearch:
         viability_typed_pruned = 0
         viability_path_checks = 0
         viability_cache_hits = 0
+        precondition_summary_checks = 0
+        precondition_proof_checks = 0
+        precondition_proof_envelope_hits = 0
         while pq and expansions < self.config.max_expansions:
             _, _, label = heapq.heappop(pq)
             expansions += 1
@@ -199,6 +221,13 @@ class TypedSafeBudgetSearch:
                     "viability_typed_pruned": viability_typed_pruned,
                     "viability_path_checks": viability_path_checks,
                     "viability_cache_hits": viability_cache_hits,
+                    "precondition_summary_checks": precondition_summary_checks,
+                    "precondition_proof_checks": precondition_proof_checks,
+                    "precondition_proof_envelope_hits": precondition_proof_envelope_hits,
+                    "precondition_raw_suffixes": (precondition_antichain.raw_total if precondition_antichain is not None else 0),
+                    "precondition_antichain_size": (precondition_antichain.antichain_total if precondition_antichain is not None else 0),
+                    "precondition_raw_proofs": (precondition_antichain.proof_raw_total if precondition_antichain is not None else 0),
+                    "precondition_proof_antichain_size": (precondition_antichain.proof_antichain_total if precondition_antichain is not None else 0),
                     "viability_kernel": ({
                         "n_states": viability_kernel.n_states,
                         "n_valid_edges": viability_kernel.n_valid_edges,
@@ -263,6 +292,14 @@ class TypedSafeBudgetSearch:
                         viability_pruned += 1
                         viability_structural_pruned += 1
                         witness = viability_kernel.failure_witness(v_state)
+                        if self.config.viability_use_proof_envelope and precondition_antichain is not None:
+                            pdec = evaluate_proof_precondition_antichain(
+                                v_state, new_label.resource_ledger, compiled, precondition_antichain, self.registry
+                            )
+                            precondition_proof_checks += int(pdec.checked_proofs)
+                            if pdec.witness is not None:
+                                precondition_proof_envelope_hits += 1
+                                witness = better_precondition_violation(witness, pdec.witness)
                         if self.config.viability_generic_certificates or witness is None:
                             violations.append(ViolationRecord(
                                 new_label.phase, e.transition_id, "viability_reachability", -1.0,
@@ -275,17 +312,32 @@ class TypedSafeBudgetSearch:
                         cache_key = (v_state, self._ledger_signature(new_label.resource_ledger))
                         cached = viability_cache.get(cache_key)
                         if cached is None:
-                            viable, witness, checked = self._typed_suffix_viability(
-                                new_label, compiled, clauses, groups, predictions, viability_kernel
-                            )
+                            if precondition_antichain is not None:
+                                dec = evaluate_precondition_antichain(
+                                    v_state, new_label.resource_ledger, compiled, precondition_antichain, self.registry
+                                )
+                                viable, witness, checked = dec.viable, dec.witness, dec.checked_summaries
+                                precondition_summary_checks += int(checked)
+                            else:
+                                viable, witness, checked = self._typed_suffix_viability(
+                                    new_label, compiled, clauses, groups, predictions, viability_kernel
+                                )
+                                viability_path_checks += int(checked)
                             viability_cache[cache_key] = (viable, witness, checked)
                         else:
                             viable, witness, checked = cached
                             viability_cache_hits += 1
-                        viability_path_checks += int(checked)
                         if not viable:
                             viability_pruned += 1
                             viability_typed_pruned += 1
+                            if self.config.viability_use_proof_envelope and precondition_antichain is not None:
+                                pdec = evaluate_proof_precondition_antichain(
+                                    v_state, new_label.resource_ledger, compiled, precondition_antichain, self.registry
+                                )
+                                precondition_proof_checks += int(pdec.checked_proofs)
+                                if pdec.witness is not None:
+                                    precondition_proof_envelope_hits += 1
+                                    witness = better_precondition_violation(witness, pdec.witness)
                             if self.config.viability_generic_certificates or witness is None:
                                 violations.append(ViolationRecord(
                                     new_label.phase, e.transition_id, "typed_viability", -1.0,
@@ -334,6 +386,13 @@ class TypedSafeBudgetSearch:
             "viability_typed_pruned": viability_typed_pruned,
             "viability_path_checks": viability_path_checks,
             "viability_cache_hits": viability_cache_hits,
+            "precondition_summary_checks": precondition_summary_checks,
+            "precondition_proof_checks": precondition_proof_checks,
+            "precondition_proof_envelope_hits": precondition_proof_envelope_hits,
+            "precondition_raw_suffixes": (precondition_antichain.raw_total if precondition_antichain is not None else 0),
+            "precondition_antichain_size": (precondition_antichain.antichain_total if precondition_antichain is not None else 0),
+            "precondition_raw_proofs": (precondition_antichain.proof_raw_total if precondition_antichain is not None else 0),
+            "precondition_proof_antichain_size": (precondition_antichain.proof_antichain_total if precondition_antichain is not None else 0),
             "viability_kernel": ({
                 "n_states": viability_kernel.n_states,
                 "n_valid_edges": viability_kernel.n_valid_edges,

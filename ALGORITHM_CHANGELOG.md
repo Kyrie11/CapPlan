@@ -360,3 +360,108 @@ Proof-carrying diagnosis gate:
 ### Novelty boundary
 
 V5 does **not** claim generic backward reachability, bidirectional resource-constrained search, or learned heuristics as novel.  Those are established planning/search techniques.  The intended paper-level contribution is a **passenger-complete, capability-compiled viability semantics** in which heterogeneous non-substitutable capability requirements induce both a forward consumed-resource state and a backward proof-carrying executable-continuation state, while learning remains a subordinate accelerator rather than the authority that defines passenger feasibility.
+
+## V5-fast seed13 decision — typed viability PROMOTED; exact suffix replay and incomplete proof semantics STOP
+
+The preregistered V5-fast review uses the same deterministic `256` test episodes / `2048` passenger requests and the same frozen CASA seed-13 checkpoint as the V2–V4 mechanism studies.  The run is attribution-valid for the V5 mechanism controls: every requested variant completed, V5/V2/structural/generic-certificate comparisons are request-paired, hard passenger-complete decisions are identical to the frozen verifier, and the prewritten `v5_fast_gate.json` reports the GO/STOP decision without post-hoc threshold changes.
+
+### What V5 proves
+
+Hard semantics remain exact:
+
+- `OraclePCR=PCR=0.05078125` (`104/2048` passenger-complete requests);
+- `PCDecisionPrecision=PCDecisionRecall=PCDecisionF1=1.0`;
+- `PCFalseAcceptRate=PCFalseRejectRate=0`;
+- capability success-flip precision/recall remain `1.0` on the fast subset.
+
+The primary search gain is strong.  V5 reduces mean TSBS expansions from V2's `18.8794` to `4.9307` (`73.88%`), with paired `V2 - V5 = +13.9487` expansions/request and episode-cluster bootstrap 95% CI `[11.2182, 16.8731]`; paired passenger-complete decision mismatches are zero.
+
+Most importantly, V5 passes the preregistered **capability-specific promotion gate** rather than merely reproducing V4 structural reachability:
+
+- `CVK_typed_pruned_mean = 1.2471 > 0`;
+- structural-only mean expansions are `12.1592`, versus `4.9307` for full V5;
+- paired `structural-only - V5 = +7.2285` expansions/request, 95% CI `[5.1089, 9.5796]`.
+
+Therefore path-coupled, passenger-specific typed backward viability is promoted from a hypothesis to a main algorithmic mechanism candidate.  This is the first version in which the backward gain is demonstrably more than generic graph dead-end detection.
+
+The proof-carrying control also behaves causally.  Full V5 and `generic_viability_certificates` have identical hard decisions and exactly identical expansions (`4.9307`), while concrete witnesses substantially improve T5 relative to generic pseudo-certificates.  Proof carrying is therefore useful independently of search trajectory.
+
+### Why V5 as a whole still STOPs
+
+The preregistered overall gate requires every T5 macro/exact metric to remain within `0.01` of V2.  V5 does not satisfy this condition:
+
+- phase macro-F1: `0.8297 -> 0.7518` (`-0.0779`);
+- resource macro-F1: `0.6646 -> 0.5743` (`-0.0902`);
+- source macro-F1: `0.6301 -> 0.5751` (`-0.0551`);
+- certificate exact match: `0.7675 -> 0.7073` (`-0.0602`).
+
+Thus `v5_fast_gate.json` correctly reports `status=STOP`, even though both the typed-viability promotion gate and the proof-carrying diagnosis gate pass.  The result must not be reclassified as GO after seeing the large expansion reduction.
+
+The remaining T5 error is not mainly a certificate-selector bug.  Among `359` oracle-failure requests on which typed pruning fires, the V2 canonical `(phase,resource,source)` witness is still present in V5's collected violations for `213`; V5 selects the same witness for `210/213`.  The other `146` V2 witnesses are absent because typed pruning prevents forward TSBS from ever visiting the rejected hard branch that generated them.  These missing witnesses are overwhelmingly downstream `board/alight` failures of `interface` or `physical` transition tests.  V5 carries failures of executable suffixes, but not the rejected hard branches inside a still-structurally-reachable subtree.
+
+A second bottleneck is computational rather than semantic.  V5's exact suffix replay checks `215.45` concrete suffix paths/request on average (p95 about `1280`; heavy tail above `3000`) and raises planner latency from V2's about `19.9 ms` to `128.6 ms` mean and `745.5 ms` p95.  Per-request suffix-check count is strongly correlated with latency.  Structural-only viability remains near `21 ms`, showing that repeated query-time `_try_expand` replay, not backward graph construction itself, is the dominant runtime cost.
+
+**Promotion/retirement decision after V5-fast:**
+
+- **PROMOTE:** passenger-complete semantics; capability-as-typed-feasibility; evidence-grounded hard authority; conservative margins; exact structural dead-end pruning; **typed path-coupled backward viability**; proof-carrying explanation as a required semantic property; V2 static learned feasibility as a small secondary ordering aid.
+- **RETIRE as final form:** explicit query-time replay of hundreds of concrete suffix paths.
+- **INCOMPLETE:** V5 proof object, because it does not conditionally carry rejected hard branches that are reachable from the current typed ledger.
+- **REMAIN RETIRED:** V3 ECF ranker, V4 continuation priority, global completion-value head, neural overwrite of authoritative typed evidence.
+
+## V6 — Executable Capability Precondition Kernel (ECPK)
+
+**Status:** next algorithm candidate.  V6 does not change the V5 mechanism being tested; it compiles it into a compact, proof-complete backward semantic object.  No new neural training is required for the first V6 experiment.
+
+### Tightened paper object
+
+The paper's method is now organized around one semantic object rather than a chain of loosely coupled modules:
+
+`Passenger-complete contract -> executable typed transition semantics -> forward consumed-capability state × backward executable-capability precondition kernel -> TSBS -> accepted complete-trip plan OR concrete rejection proof`.
+
+For a service state `s`, a complete hard-valid suffix `pi` induces a monotone typed transformer `phi_pi` over the forward ledger.  Let `A_acc(s)` be the nondominated antichain of these complete-suffix transformers.  Passenger-specific viability is
+
+`V_Psi(s,R) = exists phi in A_acc(s) : Sat(phi(R), Psi) = 1`.
+
+This is a weakest-precondition-style object specialized to CapPlan's phase-scoped, heterogeneous resource algebra.  It is not a scalar RCSP remaining-budget bound: cumulative, upper-bottleneck, lower-affordance, probabilistic, categorical/interface, missing-evidence, uncertainty, and requirement-group semantics remain non-substitutable and are evaluated by the same compiled contract used by forward TSBS.
+
+### V6 mechanism
+
+1. **Exact V5 suffix universe retained as the semantic reference.**  Structural reachability and the bounded-complete simple suffix universe remain exactly V5's.  Overflow remains fail-open: no typed pruning is permitted from an incomplete suffix universe.
+2. **Executable Capability Precondition Antichain (new representation).**  Every complete V5 suffix is composed once into a typed suffix-effect transformer.  Effects are combined with the same associative resource algebra and conservative evidence used by forward TSBS.  Exact duplicate and conservatively dominated suffix transformers are removed.  Query-time viability therefore checks compact summaries rather than replaying every transition of every suffix.
+3. **Exact-representation control.**  `v5_reference_runtime` runs the original path-by-path V5 query inside the V6 codebase.  V6 is preregistered to have zero decision mismatches and exactly equal TSBS expansion counts to this control.  A speedup is not accepted if the antichain silently changes the V5 pruning set.
+4. **Conditional rejection-proof precondition antichain (new).**  V5 analysis shows that the missing T5 witness is often a hard-invalid `interface/physical` branch inside a subtree pruned earlier by typed viability.  V6 therefore compiles hard-valid prefixes leading to rejected hard branches into a second proof antichain.  A downstream witness may participate in certificate selection **only if its prefix precondition is satisfied by the current forward typed ledger**.  This conditionality prevents a proof from being propagated through a typed-infeasible prefix and creating an oracle-unreachable failure explanation.
+5. **Same-object diagnosis.**  On typed or structural pruning, V6 selects between the typed viability failure and all conditionally reachable rejected-branch proofs using the same certificate ordering as TSBS/oracle.  Search and explanation are therefore two queries over the same capability precondition kernel rather than unrelated post-hoc modules.
+6. **Learning remains subordinate.**  The validated V2 static learned feasibility prior remains only as queue ordering.  V6 does not train a network to approximate verifier-equivalent slope/width/distance values and does not give learning hard-feasibility authority.
+
+### Why this is the next paper-level mechanism
+
+V5 establishes the causal value of capability-specific backward viability, so V6 is not complexity added for novelty.  It addresses the two measured V5 bottlenecks directly:
+
+- **scalability:** replace `O(number of stored suffix paths × suffix length)` query replay by antichain summary checks;
+- **diagnostic equivalence:** replace prefix-independent downstream witness propagation with typed-reachability-conditioned proof preconditions.
+
+Generic bidirectional A*, Pareto dominance, antichains, and weakest-precondition reasoning are established techniques and are **not** claimed as individually novel.  The intended contribution is the *passenger-complete capability compilation* that turns one complete-trip contract into a dual forward/backward executable semantics over phase-scoped, non-substitutable resources, with an accepting precondition antichain and a proof-carrying rejection antichain in the same planner object.
+
+### V6-fast preregistration
+
+Use the same `256`-episode deterministic subset and frozen CASA seed-13 checkpoint.  Controls:
+
+- `v6_full`: ECPK accepting antichain + conditional proof antichain;
+- `v5_reference_runtime`: exact V5 concrete suffix replay in the V6 codebase;
+- `v2_reference_runtime`: validated V2 baseline;
+- `no_typed_viability`: structural-only backward pruning;
+- `no_viability_kernel`: no backward viability;
+- `no_viability_proof_envelope`: identical V6 search/precondition antichain but no conditional rejected-branch proof;
+- `no_learned_feasibility_guidance`: remove the small V2 static learned ordering signal.
+
+Hard/semantic gate remains unchanged: `PCDecisionF1>=0.99`, FAR/FRR `=0`, no T4 success-flip regression, and every T5 phase/resource/source macro-F1 plus exact certificate match within `0.01` of V2.
+
+Primary mechanism gate: V6 beats V2 in paired expansions with episode-cluster bootstrap 95% CI lower bound `>0`, with zero hard-decision mismatches.  Typed viability must still fire and beat structural-only with positive paired CI.
+
+**Exact-representation gate:** V6 and exact V5 reference must have identical decisions and exactly equal TSBS expansions.  `ECPK antichain size <= raw suffix count`, and V6 summary checks must be lower than V5 concrete path checks.
+
+**Scalability gate:** V6 must beat V5 mean planner latency with a positive episode-cluster bootstrap latency CI and must bring mean latency to no more than `2×` V2 on the fast subset.  This explicitly prevents the publication algorithm from trading an expansion win for an order-of-magnitude implementation slowdown.
+
+**Proof-completeness gate:** disabling the conditional proof antichain must leave decisions and expansions unchanged; full V6 must improve at least one preregistered T5 metric by `>=0.01`, while the full semantic gate requires all T5 metrics to recover to within `0.01` of V2.
+
+`run_v6_fast_experiments.sh` writes `v6_fast_gate.json` automatically.  Run `run_v6_full_experiments.sh` only when this file reports `status=GO`.

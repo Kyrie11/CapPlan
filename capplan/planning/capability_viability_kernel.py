@@ -49,6 +49,17 @@ class CapabilityViabilityKernel:
     reachable: Dict[State, bool] = field(default_factory=dict)
     overflow_states: Set[State] = field(default_factory=set)
     structural_failure_witness: Dict[State, ViolationRecord] = field(default_factory=dict)
+    # V6: canonical rejected-branch proof available from every state, including
+    # states that remain structurally reachable.  V5 only propagated witnesses
+    # through structural dead ends, which hid interface/physical failures when
+    # typed pruning cut a still-reachable subtree.
+    downstream_failure_witness: Dict[State, ViolationRecord] = field(default_factory=dict)
+    # Direct rejected hard branch at each state and the exact hard-valid
+    # adjacency are exported for V6 conditional proof-precondition compilation.
+    # Unlike ``downstream_failure_witness``, these primitives do not claim that
+    # a downstream witness is reachable under a particular passenger ledger.
+    direct_failure_witness: Dict[State, ViolationRecord] = field(default_factory=dict)
+    valid_outgoing_ids: Dict[State, Tuple[str, ...]] = field(default_factory=dict)
     edge_by_id: Dict[str, CandidateTransition] = field(default_factory=dict)
     n_states: int = 0
     n_valid_edges: int = 0
@@ -67,6 +78,9 @@ class CapabilityViabilityKernel:
 
     def failure_witness(self, state: State) -> ViolationRecord | None:
         return self.structural_failure_witness.get(state)
+
+    def proof_envelope_witness(self, state: State) -> ViolationRecord | None:
+        return self.downstream_failure_witness.get(state)
 
 
 def _state_from(e: CandidateTransition) -> State:
@@ -192,6 +206,11 @@ def build_capability_viability_kernel(
 
     for es in outgoing.values():
         es.sort(key=lambda e: (max(0.0, float(e.cost)), str(e.transition_id)))
+    kernel.direct_failure_witness = dict(direct_failure)
+    kernel.valid_outgoing_ids = {
+        state: tuple(str(e.transition_id) for e in es)
+        for state, es in outgoing.items()
+    }
 
     kernel.n_states = len(states)
     kernel.n_valid_edges = len(valid_edges)
@@ -307,4 +326,27 @@ def build_capability_viability_kernel(
         if not changed:
             break
     kernel.structural_failure_witness = witness
+
+    # V6 proof envelope: propagate the canonical invalid-edge witness through
+    # *all* hard-valid reachable edges, not only through structural dead ends.
+    # The independent oracle inspects invalid outgoing branches whenever it
+    # visits a state.  A typed-pruned subtree must therefore preserve those
+    # rejected-branch witnesses or the same pruning decision can silently change
+    # T5 phase/resource/source diagnosis.  This fixed-point stores the minimum
+    # certificate-key witness reachable from each state without changing search.
+    proof: Dict[State, ViolationRecord] = dict(direct_failure)
+    for _ in range(max(1, len(states))):
+        changed = False
+        for e in valid_edges:
+            u, v = _state_from(e), _state_to(e)
+            cand = proof.get(v)
+            if cand is None:
+                continue
+            best = _better_violation(proof.get(u), cand)
+            if best is not None and best != proof.get(u):
+                proof[u] = best
+                changed = True
+        if not changed:
+            break
+    kernel.downstream_failure_witness = proof
     return kernel

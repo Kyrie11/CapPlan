@@ -61,6 +61,15 @@ class PlannerConfig:
     no_viability_kernel: bool = False
     no_typed_viability: bool = False
     generic_viability_certificates: bool = False
+    # V6 Executable Capability Weakest-Precondition Antichain (EC-WPA).
+    # The exact V5 suffix universe is compiled into nondominated typed suffix
+    # transformers; the same kernel also carries a downstream rejected-branch
+    # proof envelope so pruning and diagnosis remain one semantic object.
+    no_precondition_antichain: bool = False
+    no_viability_proof_envelope: bool = False
+    # Control that replays the exact V5 path-by-path typed viability in the V6
+    # codebase.  It isolates representation/runtime changes from mechanism gain.
+    v5_reference_runtime: bool = False
     viability_max_paths_per_state: int = 256
     viability_max_depth: int = 16
     beta: float = 1.0
@@ -89,23 +98,33 @@ class CapPlanPlanner:
         is_v3 = version.startswith("V3")
         is_v4 = version.startswith("V4")
         is_v5 = version.startswith("V5")
+        is_v6 = version.startswith("V6")
         # V3 removes the empirically redundant completion-value head and replaces
         # V2's transition-static typed-feasibility prior with a learned local
         # frontier ranker.  V4 retired that ranker and tested a relaxed suffix
         # envelope. V5 keeps the verified V2 static prior but replaces V4's
         # generic reachability-dominated envelope with a proof-carrying exact
-        # capability viability kernel.
-        use_v2_reference = bool((is_v3 or is_v4 or is_v5) and self.config.v2_reference_runtime)
+        # capability viability kernel. V6 promotes the validated typed viability
+        # mechanism into a compact weakest-precondition antichain plus proof
+        # envelope, retaining V5 as an exact representation control.
+        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6) and self.config.v2_reference_runtime)
+        use_v5_reference = bool(is_v6 and (not use_v2_reference) and self.config.v5_reference_runtime)
         frontier_ranker = None
         if is_v3 and (not use_v2_reference) and (not self.config.no_frontier_ranker) and self.config.frontier_ranker_checkpoint:
             frontier_ranker = FrontierRanker(self.config.frontier_ranker_checkpoint, device=self.config.frontier_ranker_device)
-        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5) and not use_v2_reference)
+        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6) and not use_v2_reference)
         if is_v3 and not use_v2_reference:
             lambda_static = 0.0
         else:
             lambda_static = 0.0 if self.config.no_learned_feasibility_guidance else 0.20
         use_continuation = bool(is_v4 and (not use_v2_reference) and (not self.config.no_continuation_envelope))
-        use_viability = bool(is_v5 and (not use_v2_reference) and (not self.config.no_viability_kernel))
+        use_viability = bool((is_v5 or is_v6) and (not use_v2_reference) and (not self.config.no_viability_kernel))
+        use_precondition_antichain = bool(
+            is_v6 and use_viability and (not use_v5_reference) and (not self.config.no_precondition_antichain)
+        )
+        use_proof_envelope = bool(
+            is_v6 and use_viability and (not use_v5_reference) and (not self.config.no_viability_proof_envelope)
+        )
         self.searcher = TypedSafeBudgetSearch(
             self.automaton,
             registry,
@@ -125,6 +144,8 @@ class CapPlanPlanner:
                 viability_pruning=use_viability,
                 viability_typed_pruning=bool(use_viability and (not self.config.no_typed_viability)),
                 viability_generic_certificates=bool(use_viability and self.config.generic_viability_certificates),
+                use_precondition_antichain=use_precondition_antichain,
+                viability_use_proof_envelope=use_proof_envelope,
                 viability_max_paths_per_state=int(self.config.viability_max_paths_per_state),
                 viability_max_depth=int(self.config.viability_max_depth),
             ),

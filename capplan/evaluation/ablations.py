@@ -39,6 +39,10 @@ ABLATION_FLAGS = {
     "no_viability_kernel": {"no_viability_kernel": True},
     "no_typed_viability": {"no_typed_viability": True},
     "generic_viability_certificates": {"generic_viability_certificates": True},
+    # V6 weakest-precondition antichain / proof-envelope controls.
+    "v5_reference_runtime": {"v5_reference_runtime": True},
+    "no_precondition_antichain": {"no_precondition_antichain": True},
+    "no_viability_proof_envelope": {"no_viability_proof_envelope": True},
 }
 
 MAIN_ABLATIONS = [
