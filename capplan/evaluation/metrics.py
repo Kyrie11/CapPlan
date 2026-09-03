@@ -421,6 +421,25 @@ def precondition_proof_antichain_size_mean(episodes: List[Dict[str, Any]]) -> fl
     return _mean([float(e.get("precondition_proof_antichain_size", 0.0)) for e in episodes if e.get("precondition_proof_antichain_size") is not None])
 
 
+def precondition_rejection_checks_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_rejection_checks", 0.0)) for e in episodes if e.get("precondition_rejection_checks") is not None])
+
+def precondition_rejection_hits_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_rejection_hits", 0.0)) for e in episodes if e.get("precondition_rejection_hits") is not None])
+
+def precondition_rejection_antichain_size_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_rejection_antichain_size", 0.0)) for e in episodes if e.get("precondition_rejection_antichain_size") is not None])
+
+def direct_precondition_build_candidates_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("direct_precondition_build_candidates", 0.0)) for e in episodes if e.get("direct_precondition_build_candidates") is not None])
+
+def direct_precondition_edge_relaxations_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("direct_precondition_edge_relaxations", 0.0)) for e in episodes if e.get("direct_precondition_edge_relaxations") is not None])
+
+def direct_precondition_incomplete_states_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("direct_precondition_incomplete_states", 0.0)) for e in episodes if e.get("direct_precondition_incomplete_states") is not None])
+
+
 def planning_latency_mean_ms(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("planning_latency_ms", 0.0)) for e in episodes if e.get("planning_latency_ms") is not None])
 
@@ -515,6 +534,12 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "WPA_antichain_size_mean": precondition_antichain_size_mean(episodes),
         "WPA_raw_proofs_mean": precondition_raw_proofs_mean(episodes),
         "WPA_proof_antichain_size_mean": precondition_proof_antichain_size_mean(episodes),
+        "DCP_rejection_checks_mean": precondition_rejection_checks_mean(episodes),
+        "DCP_rejection_hits_mean": precondition_rejection_hits_mean(episodes),
+        "DCP_rejection_antichain_size_mean": precondition_rejection_antichain_size_mean(episodes),
+        "DCP_build_candidates_mean": direct_precondition_build_candidates_mean(episodes),
+        "DCP_edge_relaxations_mean": direct_precondition_edge_relaxations_mean(episodes),
+        "DCP_incomplete_states_mean": direct_precondition_incomplete_states_mean(episodes),
         "PlannerLatency_ms_mean": planning_latency_mean_ms(episodes),
         "PlannerLatency_ms_p95": planning_latency_p95_ms(episodes),
     }

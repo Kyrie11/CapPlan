@@ -25,7 +25,9 @@ from capplan.planning.capability_precondition_antichain import (
     build_capability_precondition_antichain,
     evaluate_precondition_antichain,
     evaluate_proof_precondition_antichain,
+    evaluate_rejection_precondition_antichain,
 )
+from capplan.planning.direct_capability_precondition_kernel import build_direct_dual_precondition_kernel
 from capplan.semantics.capability_compiler import CompiledContract, UncertaintySpec
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
 from capplan.semantics.service_automaton import ServiceAutomaton
@@ -71,6 +73,12 @@ class SearchConfig:
     # weakest-precondition antichain.  This preserves V5 viability decisions
     # while replacing repeated path replay with compact summary checks.
     use_precondition_antichain: bool = False
+    # V7: compile acceptance/rejection/proof frontiers directly over the hard-
+    # valid service graph instead of enumerating the V5 suffix universe first.
+    use_direct_dual_precondition_kernel: bool = False
+    # Rejection frontier can be ablated without changing the accepting frontier,
+    # giving a causal T5 control with identical hard decisions/search behavior.
+    use_rejection_antichain: bool = False
     viability_use_proof_envelope: bool = True
     viability_max_paths_per_state: int = 256
     viability_max_depth: int = 16
@@ -141,14 +149,25 @@ class TypedSafeBudgetSearch:
                 min_availability=self.config.min_availability,
                 max_paths_per_state=self.config.viability_max_paths_per_state,
                 max_depth=self.config.viability_max_depth,
+                # V7 direct compilation must not pay the V5 raw-suffix cost.
+                enumerate_suffixes=not self.config.use_direct_dual_precondition_kernel,
             )
         precondition_antichain: CapabilityPreconditionAntichain | None = None
         if viability_kernel is not None and self.config.use_precondition_antichain and self.config.viability_typed_pruning:
-            precondition_antichain = build_capability_precondition_antichain(
-                viability_kernel, compiled, predictions, self.registry,
-                no_conservative_margins=self.config.no_conservative_margins,
-                default_beta=self.config.beta,
-            )
+            if self.config.use_direct_dual_precondition_kernel:
+                precondition_antichain = build_direct_dual_precondition_kernel(
+                    viability_kernel, compiled, predictions, self.registry,
+                    no_conservative_margins=self.config.no_conservative_margins,
+                    default_beta=self.config.beta,
+                    max_frontier_per_state=self.config.viability_max_paths_per_state,
+                    max_depth=self.config.viability_max_depth,
+                )
+            else:
+                precondition_antichain = build_capability_precondition_antichain(
+                    viability_kernel, compiled, predictions, self.registry,
+                    no_conservative_margins=self.config.no_conservative_margins,
+                    default_beta=self.config.beta,
+                )
         viability_cache: Dict[Tuple[Any, ...], Tuple[bool, Optional[ViolationRecord], int]] = {}
 
         # The dataset uses concrete entrance IDs, not the literal string
@@ -193,6 +212,8 @@ class TypedSafeBudgetSearch:
         precondition_summary_checks = 0
         precondition_proof_checks = 0
         precondition_proof_envelope_hits = 0
+        precondition_rejection_checks = 0
+        precondition_rejection_hits = 0
         while pq and expansions < self.config.max_expansions:
             _, _, label = heapq.heappop(pq)
             expansions += 1
@@ -224,10 +245,16 @@ class TypedSafeBudgetSearch:
                     "precondition_summary_checks": precondition_summary_checks,
                     "precondition_proof_checks": precondition_proof_checks,
                     "precondition_proof_envelope_hits": precondition_proof_envelope_hits,
+                    "precondition_rejection_checks": precondition_rejection_checks,
+                    "precondition_rejection_hits": precondition_rejection_hits,
                     "precondition_raw_suffixes": (precondition_antichain.raw_total if precondition_antichain is not None else 0),
                     "precondition_antichain_size": (precondition_antichain.antichain_total if precondition_antichain is not None else 0),
                     "precondition_raw_proofs": (precondition_antichain.proof_raw_total if precondition_antichain is not None else 0),
                     "precondition_proof_antichain_size": (precondition_antichain.proof_antichain_total if precondition_antichain is not None else 0),
+                    "precondition_rejection_antichain_size": (precondition_antichain.rejection_antichain_total if precondition_antichain is not None else 0),
+                    "direct_precondition_build_candidates": (precondition_antichain.direct_build_candidates_total if precondition_antichain is not None else 0),
+                    "direct_precondition_edge_relaxations": (precondition_antichain.direct_build_edge_relaxations if precondition_antichain is not None else 0),
+                    "direct_precondition_incomplete_states": (precondition_antichain.direct_incomplete_states if precondition_antichain is not None else 0),
                     "viability_kernel": ({
                         "n_states": viability_kernel.n_states,
                         "n_valid_edges": viability_kernel.n_valid_edges,
@@ -330,6 +357,17 @@ class TypedSafeBudgetSearch:
                         if not viable:
                             viability_pruned += 1
                             viability_typed_pruned += 1
+                            if precondition_antichain is not None and self.config.use_rejection_antichain:
+                                # V7 diagnostic dual: existential acceptance and
+                                # rejection explanation use opposite antichain
+                                # orders.  This query cannot alter the prune decision.
+                                rdec = evaluate_rejection_precondition_antichain(
+                                    v_state, new_label.resource_ledger, compiled, precondition_antichain, self.registry
+                                )
+                                precondition_rejection_checks += int(rdec.checked_summaries)
+                                if rdec.witness is not None:
+                                    precondition_rejection_hits += 1
+                                    witness = rdec.witness
                             if self.config.viability_use_proof_envelope and precondition_antichain is not None:
                                 pdec = evaluate_proof_precondition_antichain(
                                     v_state, new_label.resource_ledger, compiled, precondition_antichain, self.registry
@@ -389,10 +427,16 @@ class TypedSafeBudgetSearch:
             "precondition_summary_checks": precondition_summary_checks,
             "precondition_proof_checks": precondition_proof_checks,
             "precondition_proof_envelope_hits": precondition_proof_envelope_hits,
+            "precondition_rejection_checks": precondition_rejection_checks,
+            "precondition_rejection_hits": precondition_rejection_hits,
             "precondition_raw_suffixes": (precondition_antichain.raw_total if precondition_antichain is not None else 0),
             "precondition_antichain_size": (precondition_antichain.antichain_total if precondition_antichain is not None else 0),
             "precondition_raw_proofs": (precondition_antichain.proof_raw_total if precondition_antichain is not None else 0),
             "precondition_proof_antichain_size": (precondition_antichain.proof_antichain_total if precondition_antichain is not None else 0),
+            "precondition_rejection_antichain_size": (precondition_antichain.rejection_antichain_total if precondition_antichain is not None else 0),
+            "direct_precondition_build_candidates": (precondition_antichain.direct_build_candidates_total if precondition_antichain is not None else 0),
+            "direct_precondition_edge_relaxations": (precondition_antichain.direct_build_edge_relaxations if precondition_antichain is not None else 0),
+            "direct_precondition_incomplete_states": (precondition_antichain.direct_incomplete_states if precondition_antichain is not None else 0),
             "viability_kernel": ({
                 "n_states": viability_kernel.n_states,
                 "n_valid_edges": viability_kernel.n_valid_edges,

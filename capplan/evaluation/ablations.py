@@ -43,6 +43,9 @@ ABLATION_FLAGS = {
     "v5_reference_runtime": {"v5_reference_runtime": True},
     "no_precondition_antichain": {"no_precondition_antichain": True},
     "no_viability_proof_envelope": {"no_viability_proof_envelope": True},
+    # V7 direct asymmetric dual-kernel controls.
+    "v6_reference_runtime": {"v6_reference_runtime": True},
+    "no_rejection_kernel": {"no_rejection_kernel": True},
 }
 
 MAIN_ABLATIONS = [

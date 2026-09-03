@@ -67,7 +67,13 @@ class PlannerConfig:
     # proof envelope so pruning and diagnosis remain one semantic object.
     no_precondition_antichain: bool = False
     no_viability_proof_envelope: bool = False
-    # Control that replays the exact V5 path-by-path typed viability in the V6
+    # V7 direct asymmetric dual-kernel controls.  ``v6_reference_runtime`` keeps
+    # the V6 enumerate-then-compress implementation as a representation control;
+    # ``no_rejection_kernel`` ablates only diagnostic rejection frontiers and
+    # cannot alter passenger-complete decisions/search expansions.
+    v6_reference_runtime: bool = False
+    no_rejection_kernel: bool = False
+    # Control that replays the exact V5 path-by-path typed viability in the V6/V7
     # codebase.  It isolates representation/runtime changes from mechanism gain.
     v5_reference_runtime: bool = False
     viability_max_paths_per_state: int = 256
@@ -99,6 +105,7 @@ class CapPlanPlanner:
         is_v4 = version.startswith("V4")
         is_v5 = version.startswith("V5")
         is_v6 = version.startswith("V6")
+        is_v7 = version.startswith("V7")
         # V3 removes the empirically redundant completion-value head and replaces
         # V2's transition-static typed-feasibility prior with a learned local
         # frontier ranker.  V4 retired that ranker and tested a relaxed suffix
@@ -106,25 +113,32 @@ class CapPlanPlanner:
         # generic reachability-dominated envelope with a proof-carrying exact
         # capability viability kernel. V6 promotes the validated typed viability
         # mechanism into a compact weakest-precondition antichain plus proof
-        # envelope, retaining V5 as an exact representation control.
-        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6) and self.config.v2_reference_runtime)
-        use_v5_reference = bool(is_v6 and (not use_v2_reference) and self.config.v5_reference_runtime)
+        # envelope, retaining V5 as an exact representation control. V7 removes
+        # enumerate-then-compress and separates existential acceptance dominance
+        # from diagnostic rejection dominance.
+        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6 or is_v7) and self.config.v2_reference_runtime)
+        use_v5_reference = bool((is_v6 or is_v7) and (not use_v2_reference) and self.config.v5_reference_runtime)
+        use_v6_reference = bool(is_v7 and (not use_v2_reference) and (not use_v5_reference) and self.config.v6_reference_runtime)
         frontier_ranker = None
         if is_v3 and (not use_v2_reference) and (not self.config.no_frontier_ranker) and self.config.frontier_ranker_checkpoint:
             frontier_ranker = FrontierRanker(self.config.frontier_ranker_checkpoint, device=self.config.frontier_ranker_device)
-        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6) and not use_v2_reference)
+        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6 or is_v7) and not use_v2_reference)
         if is_v3 and not use_v2_reference:
             lambda_static = 0.0
         else:
             lambda_static = 0.0 if self.config.no_learned_feasibility_guidance else 0.20
         use_continuation = bool(is_v4 and (not use_v2_reference) and (not self.config.no_continuation_envelope))
-        use_viability = bool((is_v5 or is_v6) and (not use_v2_reference) and (not self.config.no_viability_kernel))
+        use_viability = bool((is_v5 or is_v6 or is_v7) and (not use_v2_reference) and (not self.config.no_viability_kernel))
+        use_direct_dual = bool(is_v7 and use_viability and (not use_v5_reference) and (not use_v6_reference))
         use_precondition_antichain = bool(
-            is_v6 and use_viability and (not use_v5_reference) and (not self.config.no_precondition_antichain)
-        )
+            (is_v6 and use_viability and (not use_v5_reference))
+            or (is_v7 and use_viability and (not use_v5_reference))
+        ) and (not self.config.no_precondition_antichain)
         use_proof_envelope = bool(
-            is_v6 and use_viability and (not use_v5_reference) and (not self.config.no_viability_proof_envelope)
+            ((is_v6 and not use_v5_reference) or (is_v7 and not use_v5_reference))
+            and use_viability and (not self.config.no_viability_proof_envelope)
         )
+        use_rejection_antichain = bool(use_direct_dual and (not self.config.no_rejection_kernel))
         self.searcher = TypedSafeBudgetSearch(
             self.automaton,
             registry,
@@ -145,6 +159,8 @@ class CapPlanPlanner:
                 viability_typed_pruning=bool(use_viability and (not self.config.no_typed_viability)),
                 viability_generic_certificates=bool(use_viability and self.config.generic_viability_certificates),
                 use_precondition_antichain=use_precondition_antichain,
+                use_direct_dual_precondition_kernel=use_direct_dual,
+                use_rejection_antichain=use_rejection_antichain,
                 viability_use_proof_envelope=use_proof_envelope,
                 viability_max_paths_per_state=int(self.config.viability_max_paths_per_state),
                 viability_max_depth=int(self.config.viability_max_depth),

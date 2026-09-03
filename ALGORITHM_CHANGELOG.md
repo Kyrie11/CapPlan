@@ -465,3 +465,159 @@ Primary mechanism gate: V6 beats V2 in paired expansions with episode-cluster bo
 **Proof-completeness gate:** disabling the conditional proof antichain must leave decisions and expansions unchanged; full V6 must improve at least one preregistered T5 metric by `>=0.01`, while the full semantic gate requires all T5 metrics to recover to within `0.01` of V2.
 
 `run_v6_fast_experiments.sh` writes `v6_fast_gate.json` automatically.  Run `run_v6_full_experiments.sh` only when this file reports `status=GO`.
+
+## V6-fast seed13 decision — representation-faithful but STOP; eager compilation and diagnostic dominance are the new bottlenecks
+
+**Date:** 2026-09-03  
+**Decision:** `STOP` under the V6 preregistered gate.  The fast run is attribution-valid for mechanism selection, but V6 is not promoted as the final ECPK implementation.
+
+The V6-fast run uses the same deterministic `256` test episodes / `2048` passenger requests and frozen seed-13 CASA checkpoint as the V2–V5 mechanism studies.  All seven requested variants completed on the same request universe.  `algorithm_attribution_ready=true` with no attribution warnings, and request-level pairing is complete.  V6 and the exact V5-reference runtime have **zero passenger-decision mismatches and exactly equal TSBS expansion counts for all 2048 requests**, so the central question “does the compressed query reproduce the V5 typed-viability pruning set?” is answered cleanly.
+
+### What V6 passes
+
+Hard passenger semantics remain exact:
+
+- `OraclePCR=PCR=0.05078125` (`104/2048`);
+- `PCDecisionPrecision=PCDecisionRecall=PCDecisionF1=1.0`;
+- `PCFalseAcceptRate=PCFalseRejectRate=0`;
+- capability success-flip precision/recall remain `1.0` on the fast subset.
+
+The already-promoted typed backward mechanism remains strong:
+
+- V2 mean expansions: `18.8794`;
+- V6 mean expansions: `4.9307`;
+- paired `V2 - V6 = +13.9487` expansions/request, episode-cluster 95% CI `[11.2182, 16.8731]`;
+- structural-only mean expansions: `12.1592`;
+- paired `structural-only - V6 = +7.2285`, 95% CI `[5.1089, 9.5796]`;
+- `CVK_typed_pruned_mean = 1.2471`.
+
+Therefore V6 does **not** overturn the V5 promotion: passenger-specific, path-coupled typed backward viability remains a main mechanism.
+
+The V6 accepting antichain also performs real *query compression*:
+
+- raw complete suffixes materialized per request: `941.1484` mean;
+- accepting antichain size: `63.3877` mean;
+- V5 concrete path checks: `213.3643` mean;
+- V6 query-time summary checks: `25.9990` mean;
+- V6 concrete path replay checks: `0`.
+
+The conditional proof envelope has an independent causal effect.  Full V6 and `no_viability_proof_envelope` have identical hard decisions and identical expansions, while the proof envelope improves T5 by `+0.0285/+0.0313/+0.0132/+0.0314` for phase/resource/source macro-F1 and exact match respectively.  Proof-carrying diagnosis remains a promoted semantic requirement.
+
+The V2 static learned-feasibility ordering signal remains small but measurable: disabling it increases expansions from `4.9307` to `5.1968`; paired saving is `0.2661` expansion/request with 95% CI `[0.0688, 0.4942]`.  It remains a **secondary ordering mechanism**, not a paper-defining contribution and never a hard-feasibility authority.
+
+### Why V6 STOPs
+
+V6 fails two preregistered hard gates.
+
+**1. T5 diagnostic equivalence still fails.**  Relative to V2:
+
+- phase macro-F1: `0.82969 -> 0.56738` (`-0.26232`);
+- resource macro-F1: `0.66456 -> 0.50911` (`-0.15545`);
+- source macro-F1: `0.63013 -> 0.44926` (`-0.18088`);
+- certificate exact match: `0.76749 -> 0.71759` (`-0.04990`).
+
+The failure is not adequately described as “the proof envelope needs more examples.”  V6 exposes a more fundamental semantic asymmetry.  The accepting antichain is designed for an **existential** query: preserve at least one resource-wise best suffix such that `exists suffix: Sat(...)`.  Diagnostic rejection is a different query: when every completion fails, preserve a concrete and executable witness explaining *which unavoidable/downstream condition fails*.  An effect that is dominated for acceptance can still carry the canonical rejection witness.  Therefore **feasibility-preserving dominance and diagnosis-preserving dominance are not the same partial order**.  Reusing one aggressive “best suffix” antichain as the basis for both queries can preserve viability perfectly while erasing failure diversity.  On this fast subset, V6 even reduces the `wait` failure phase F1 to `0`, despite nonzero oracle support.
+
+**2. V6 is not computationally compact despite query compression.**
+
+- V2 mean planner latency: `22.33 ms`;
+- V5 reference: `146.24 ms`;
+- V6: `617.38 ms` (p95 `1496.65 ms`);
+- paired `V5 - V6` latency delta: `-471.14 ms`, episode-cluster 95% CI `[-529.69, -415.73]`.
+
+The reason is architectural: V6 is still **enumerate-then-compress**.  It first materializes the same bounded concrete suffix universe used by V5, compiles roughly `941` complete suffixes/request, and separately enumerates/compiles roughly `305` proof prefixes/request, before the antichain can reduce them to `63` accepting summaries and `141` proof summaries.  The work moved from query-time replay to eager request-time compilation rather than disappearing.  Consequently the preregistered scalability gate (`V6 < V5 latency`, positive latency CI, and `V6 <= 2x V2`) correctly fails.
+
+Absolute fast-run latency has a system-contention caveat because a second worker runs diagnosis controls concurrently, so publication wall-clock claims require a serial calibration.  This does **not** rescue V6: the slowdown over V5 is hundreds of milliseconds/request and the paired clustered CI is entirely on the wrong side of zero.  V7 latency-critical controls are therefore deliberately scheduled without a competing GPU worker.
+
+### Promotion / retirement after V6-fast
+
+- **PROMOTE / core:** Passenger-Complete terminal semantics.
+- **PROMOTE / core:** Capability-as-Typed-Feasibility with phase-scoped non-substitutable resource algebra.
+- **PROMOTE:** evidence-grounded hard authority; neural predictions cannot overwrite authoritative typed evidence.
+- **PROMOTE:** conservative typed safety semantics.
+- **PROMOTE:** lifecycle/service automaton as executable service semantics (publication-level isolated stress test still required if the candidate graph structurally encodes lifecycle).
+- **PROMOTE:** structural backward viability as a search optimization.
+- **PROMOTE / main mechanism:** passenger-specific path-coupled typed backward viability.
+- **PROMOTE / semantic requirement:** proof-carrying diagnostic rejection.
+- **RETAIN secondary:** V2 static learned feasibility guidance (`~0.266` expansion/request saving on V6-fast).
+- **RETAIN as reference only:** V5 exact suffix replay.
+- **RETIRE as final implementation:** V6 enumerate-then-compress ECPK construction.
+- **RETIRE as a shared compression rule:** one acceptance-style dominance relation for both completion and diagnosis.
+- **REMAIN RETIRED:** V3 ECF pairwise ranker; V4 continuation priority; global completion-value head; neural hard-evidence overwrite.
+
+### Dominant bottleneck after V6
+
+The dominant bottleneck is no longer CASA prediction and no longer whether typed backward viability is useful.  It is now the **representation and compilation of backward executable semantics**:
+
+1. **computational:** build capability preconditions directly, without first enumerating the raw suffix/proof universe;
+2. **semantic:** distinguish an existential acceptance frontier from a certificate-preserving rejection frontier;
+3. **proof:** preserve downstream failure witnesses only when the current typed ledger can execute the prefix that reaches them;
+4. **boundedness:** any frontier/depth cap must fail open so an incomplete compiler can only lose pruning, never create a false reject.
+
+This becomes the only algorithmic target for the next fast iteration.  A larger HGT/raw-evidence model is deliberately postponed: on the frozen benchmark hard passenger decisions are already exact, whereas the measured V6 failure lies in executable-precondition representation.  The current relation-aware CASA surrogate remains a paper/implementation gap for later raw-evidence generalization, not the immediate V7 bottleneck.
+
+## V7 — Asymmetric Direct Capability Precondition Kernel (A-DCPK)
+
+**Status:** implemented next candidate; correctness-first direct compiler.  No retraining is required for the first V7 experiment.
+
+### Core design change
+
+V7 replaces V6's `enumerate concrete paths -> compile -> antichain` pipeline by **direct backward fixed-point propagation on the hard-valid lifecycle graph**.  Partial precondition summaries are propagated edge-by-edge and dominance-pruned immediately; the full raw complete-suffix universe and full raw proof-prefix universe are never materialized by the V7 path.
+
+V7 explicitly separates three backward frontiers:
+
+1. **Acceptance frontier `A_acc(s)` — best-effect / existential order.**  This frontier answers: “does there exist an executable passenger-complete continuation?”  It may discard a suffix when another suffix is no worse in every typed resource under the same compiled semantics.  It is allowed to be aggressive because the query is existential.
+2. **Typed-rejection frontier `A_rej(s)` — certificate-preserving reverse order.**  This frontier answers: “if completion is impossible, which typed resource failure remains executable and diagnostic?”  Rejection summaries use the **opposite resource preference direction** and are compressed only under a compatible witness/precondition signature.  A suffix that is useless for acceptance can therefore remain necessary for explanation.
+3. **Hard-proof frontier `A_proof(s)` — easiest executable prefix to a concrete rejected transition.**  Interface/physical/topology/availability rejection witnesses are propagated backward together with the precondition needed to reach the rejecting transition.  A witness is eligible only when the current forward ledger satisfies that prefix.  It cannot cross a typed-infeasible prefix.
+
+This is the main V7 conceptual result: **acceptance dominance and rejection-proof dominance are intentionally asymmetric**.  Antichains remain an implementation tool; the paper-level object is the passenger capability program compiled into dual executable preconditions whose order depends on the query being answered.
+
+### Soundness / boundedness contract
+
+- Hard returned-plan acceptance is unchanged and remains evidence-grounded TSBS acceptance.
+- V7 typed pruning is enabled only when direct acceptance compilation for the relevant state is complete.
+- A depth/frontier cap overflow marks the state/compiler incomplete and **fails open** to normal forward TSBS; bounded approximation may reduce acceleration but must not create a false reject.
+- Rejection frontiers never alter allow/accept decisions or expansion order.  They affect only which concrete failure witness is available after a prune/rejection.
+- `v5_reference_runtime` and `v6_reference_runtime` remain available as frozen mechanism/reference controls.
+
+### Why V7 is more consistent with the tightened CCF-A story
+
+The intended final method is no longer “CASA-Net plus a constrained search.”  It is:
+
+`Passenger-Complete Planning -> Compiled Capability Program -> Forward consumed capability × asymmetric backward executable preconditions -> Proof-Carrying Typed Safe-Budget Search -> accepting complete-trip execution OR concrete executable rejection proof`.
+
+The novelty claim must **not** be “a new antichain algorithm,” “first bidirectional resource search,” or “first weakest-precondition planner.”  Those generic ideas are established.  The candidate contribution is the passenger-complete compilation that makes lifecycle-indexed, heterogeneous typed capability semantics simultaneously define forward state, backward acceptance viability, backward rejection reachability, pruning soundness, and failure proof.
+
+### V7-fast preregistration
+
+Use the same deterministic `256` test episodes and frozen seed-13 CASA checkpoint.  No retraining and no real nuPlan closed loop in this selection run.
+
+Latency-critical controls are intentionally run **serially** before the diagnosis controls, so the V7/V6/V5/V2 wall-clock comparison is not confounded by a competing second worker.
+
+Main controls:
+
+- `v7_full`: direct asymmetric acceptance + typed-rejection + hard-proof frontiers;
+- `v6_reference_runtime`: frozen V6 enumerate-then-compress runtime;
+- `v5_reference_runtime`: frozen V5 exact suffix replay;
+- `v2_reference_runtime`: validated V2 baseline;
+- `no_typed_viability`: structural-only backward viability;
+- `no_viability_kernel`: no backward kernel;
+- `no_rejection_kernel`: identical V7 pruning/expansions with the **typed-rejection antichain query** disabled while the hard-proof prefix envelope remains active, isolating the new `A_rej` contribution;
+- `no_learned_feasibility_guidance`: tests whether the small V2 static ordering signal is still useful.
+
+Preregistered GO conditions:
+
+1. **Hard semantics:** `PCDecisionF1>=0.99`, FAR=FRR=`0`, no T4 success-flip regression.
+2. **T5:** phase/resource/source macro-F1 and certificate exact match must each be `>= V2 - 0.01`.
+3. **Primary search:** V7 must beat V2 in paired expansions with episode-cluster 95% CI lower bound `>0` and zero decision mismatches.
+4. **Typed-specific:** V7 must beat structural-only in paired expansions with CI lower bound `>0` and typed pruning must fire.
+5. **V5 mechanism preservation:** V7 must have zero decision mismatches and exactly equal expansions to the exact V5 reference.  If this fails, the direct compiler changed the promoted mechanism rather than merely representing it better.
+6. **Direct representation:** V7 must report zero raw suffix/proof enumeration, an active direct compiler, and less direct candidate-composition work than V6's raw suffix+proof universe.  A smaller final frontier without lower construction work is not accepted as scalability progress.
+7. **Runtime:** V7 must beat **both V6 and V5** mean latency with positive clustered latency CIs and must be `<=2x` V2 mean latency on the fast subset.
+8. **Asymmetric diagnosis:** `no_rejection_kernel` must have identical hard decisions and expansions.  Full V7 must not reduce any preregistered T5 metric and must produce a material diagnosis gain (`>=0.02` on at least one preregistered macro/exact metric) while rejection/proof frontiers demonstrably fire.
+
+Run `run_v7_full_experiments.sh` only when `v7_fast_gate.json` reports `status=GO`.
+
+### V7 implementation note
+
+This first direct compiler is deliberately correctness-first.  Candidate propagation is direct and raw universes are removed, but a candidate summary may still rescan a short stored transition prefix while composing its typed effect.  If V7 preserves semantics/T5 but narrowly misses the `<=2x V2` runtime gate, the next change should be **incremental associative edge-transformer composition and episode-level precondition caching**, not a new semantic algorithm and not a neural backbone change.

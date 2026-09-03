@@ -66,6 +66,8 @@ class CapabilityViabilityKernel:
     n_invalid_edges: int = 0
     max_paths_per_state: int = 0
     max_depth: int = 0
+    destination_states: Set[State] = field(default_factory=set)
+    suffix_enumeration_enabled: bool = True
 
     def is_reachable(self, state: State) -> bool:
         return bool(self.reachable.get(state, False))
@@ -161,6 +163,7 @@ def build_capability_viability_kernel(
     min_availability: float = 0.05,
     max_paths_per_state: int = 256,
     max_depth: int = 16,
+    enumerate_suffixes: bool = True,
 ) -> CapabilityViabilityKernel:
     """Build a proof-carrying backward kernel of executable suffixes.
 
@@ -182,6 +185,7 @@ def build_capability_viability_kernel(
     kernel = CapabilityViabilityKernel(
         max_paths_per_state=max(1, int(max_paths_per_state)),
         max_depth=max(1, int(max_depth)),
+        suffix_enumeration_enabled=bool(enumerate_suffixes),
     )
     if automaton.disabled:
         return kernel
@@ -219,6 +223,7 @@ def build_capability_viability_kernel(
         return kernel
 
     destination_states = {s for s in states if automaton.accept(s[1])}
+    kernel.destination_states = set(destination_states)
 
     # Exact structural reachability: backward graph traversal from every
     # accepting destination.  This part is independent of suffix enumeration
@@ -235,75 +240,71 @@ def build_capability_viability_kernel(
                 stack.append(u)
     kernel.reachable = {s: (s in reachable) for s in states}
 
-    # Enumerate concrete simple-state suffixes independently for each reachable
-    # state.  A bounded/incomplete enumeration is never used to prove typed
-    # impossibility; overflow disables typed pruning for that state.
-    for root in states:
-        if root not in reachable:
-            kernel.suffixes[root] = ()
-            continue
-        if root in destination_states:
-            kernel.suffixes[root] = (SuffixWitness((), 0.0),)
-            continue
+    # V5/V6 reference path: enumerate concrete simple-state suffixes.  V7 can
+    # deliberately skip this step and compile its capability frontiers directly
+    # over the hard-valid state graph.  Structural reachability and concrete hard
+    # rejection witnesses remain available in both modes.
+    if enumerate_suffixes:
+        for root in states:
+            if root not in reachable:
+                kernel.suffixes[root] = ()
+                continue
+            if root in destination_states:
+                kernel.suffixes[root] = (SuffixWitness((), 0.0),)
+                continue
 
-        found: List[SuffixWitness] = []
-        seen_paths: Set[Tuple[str, ...]] = set()
-        incomplete = False
-        # stack entries: state, transition_ids, cost, visited_states
-        work: List[Tuple[State, Tuple[str, ...], float, frozenset[State]]] = [
-            (root, (), 0.0, frozenset({root}))
-        ]
-        while work:
-            state, tids, cost, visited = work.pop()
-            if state in destination_states:
-                if tids not in seen_paths:
-                    seen_paths.add(tids)
-                    found.append(SuffixWitness(tids, cost))
-                    if len(found) > kernel.max_paths_per_state:
+            found: List[SuffixWitness] = []
+            seen_paths: Set[Tuple[str, ...]] = set()
+            incomplete = False
+            # stack entries: state, transition_ids, cost, visited_states
+            work: List[Tuple[State, Tuple[str, ...], float, frozenset[State]]] = [
+                (root, (), 0.0, frozenset({root}))
+            ]
+            while work:
+                state, tids, cost, visited = work.pop()
+                if state in destination_states:
+                    if tids not in seen_paths:
+                        seen_paths.add(tids)
+                        found.append(SuffixWitness(tids, cost))
+                        if len(found) > kernel.max_paths_per_state:
+                            incomplete = True
+                            break
+                    continue
+
+                if len(tids) >= kernel.max_depth:
+                    if any(_state_to(e) in reachable for e in outgoing.get(state, ())):
                         incomplete = True
-                        break
-                continue
-
-            if len(tids) >= kernel.max_depth:
-                # There may be a longer simple witness; do not use an incomplete
-                # set for typed pruning.
-                if any(_state_to(e) in reachable for e in outgoing.get(state, ())):
-                    incomplete = True
-                continue
-
-            pushed = False
-            for e in reversed(outgoing.get(state, ())):
-                nxt = _state_to(e)
-                if nxt not in reachable:
                     continue
-                # Remove wait/replan cycles from the witness set. See docstring.
-                if nxt in visited:
-                    continue
-                pushed = True
-                work.append((
-                    nxt,
-                    tids + (str(e.transition_id),),
-                    cost + max(0.0, float(e.cost)),
-                    visited | frozenset({nxt}),
-                ))
-            # Exact reachability says a route exists, but all continuations may
-            # have been cut by the simple-state/depth guard. Be conservative.
-            if not pushed and state not in destination_states and state in reachable:
-                # If there are valid outgoing edges but all revisit a state, the
-                # cycle can be removed and need not mark incompleteness.  Only a
-                # depth cut is handled above; a pure cycle cannot be the sole
-                # route to a distinct destination in an exact reachable graph.
-                pass
 
-        if incomplete:
-            kernel.overflow_states.add(root)
-        found = found[: kernel.max_paths_per_state]
-        found.sort(key=lambda w: (float(w.cost), len(w.transition_ids), w.transition_ids))
-        kernel.suffixes[root] = tuple(found)
-        if root in reachable and not found:
-            # We could not materialize a complete witness set despite exact
-            # reachability; typed pruning must fail open.
-            kernel.overflow_states.add(root)
+                pushed = False
+                for e in reversed(outgoing.get(state, ())):
+                    nxt = _state_to(e)
+                    if nxt not in reachable:
+                        continue
+                    if nxt in visited:
+                        continue
+                    pushed = True
+                    work.append((
+                        nxt,
+                        tids + (str(e.transition_id),),
+                        cost + max(0.0, float(e.cost)),
+                        visited | frozenset({nxt}),
+                    ))
+                if not pushed and state not in destination_states and state in reachable:
+                    pass
+
+            if incomplete:
+                kernel.overflow_states.add(root)
+            found = found[: kernel.max_paths_per_state]
+            found.sort(key=lambda w: (float(w.cost), len(w.transition_ids), w.transition_ids))
+            kernel.suffixes[root] = tuple(found)
+            if root in reachable and not found:
+                kernel.overflow_states.add(root)
+    else:
+        # No raw suffix universe is materialized.  Destination identity is kept
+        # only as a structural marker; V7's direct compiler seeds its own identity
+        # summary from ``destination_states``.
+        kernel.suffixes = {s: () for s in states}
 
     # Propagate a concrete failure witness backwards through hard-valid edges
     # for states that are structurally unable to reach destination.  This turns

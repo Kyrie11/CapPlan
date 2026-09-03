@@ -84,6 +84,18 @@ class CapabilityPreconditionAntichain:
     proof_complete: Dict[State, bool] = field(default_factory=dict)
     proof_raw_total: int = 0
     proof_antichain_total: int = 0
+    # V7: acceptance and rejection require different dominance orders.  The
+    # acceptance antichain above keeps resource-wise *best* suffixes for an
+    # existential feasibility query; the rejection antichain keeps certificate-
+    # preserving *worst* suffixes so diagnostic failures are not erased by the
+    # same compression relation.
+    rejection_summaries: Dict[State, Tuple[SuffixEffectSummary, ...]] = field(default_factory=dict)
+    rejection_antichain_total: int = 0
+    # Direct-compiler instrumentation.  V6 leaves these at zero because it first
+    # enumerates the V5 raw suffix/proof universes and compresses afterwards.
+    direct_build_candidates_total: int = 0
+    direct_build_edge_relaxations: int = 0
+    direct_incomplete_states: int = 0
 
     def state_summaries(self, state: State) -> Tuple[SuffixEffectSummary, ...]:
         return self.summaries.get(state, ())
@@ -93,6 +105,9 @@ class CapabilityPreconditionAntichain:
 
     def state_proofs(self, state: State) -> Tuple[ProofPrefixSummary, ...]:
         return self.proof_summaries.get(state, ())
+
+    def state_rejections(self, state: State) -> Tuple[SuffixEffectSummary, ...]:
+        return self.rejection_summaries.get(state, ())
 
 
 @dataclass(frozen=True)
@@ -106,6 +121,12 @@ class AntichainDecision:
 class ProofDecision:
     witness: ViolationRecord | None
     checked_proofs: int
+
+
+@dataclass(frozen=True)
+class RejectionDecision:
+    witness: ViolationRecord | None
+    checked_summaries: int
 
 
 def _vio_key(v: ViolationRecord) -> Tuple[float, float, int, str]:
@@ -598,6 +619,29 @@ def _typed_failure_witness(
         margin = signed_margin(combined, c, registry) if c is not None else -1.0
         best = better_violation(best, ViolationRecord(phase, tid, name, margin, src, conf, "resource_or_interface"))
     return best
+
+
+def evaluate_rejection_precondition_antichain(
+    state: State,
+    ledger: Mapping[str, Any],
+    compiled: CompiledContract,
+    antichain: CapabilityPreconditionAntichain,
+    registry: ResourceRegistry = DEFAULT_REGISTRY,
+) -> RejectionDecision:
+    """Evaluate the V7 diagnostic (worst-effect) antichain.
+
+    Unlike the existential acceptance antichain, these summaries are retained
+    under a certificate-preserving reverse dominance order.  They are queried
+    only after acceptance viability has failed; therefore they cannot alter hard
+    planning decisions or search expansions.
+    """
+    best: ViolationRecord | None = None
+    checked = 0
+    for summary in antichain.state_rejections(state):
+        checked += 1
+        vio = _typed_failure_witness(state, ledger, summary, compiled, registry)
+        best = better_violation(best, vio)
+    return RejectionDecision(best, checked)
 
 
 def evaluate_precondition_antichain(
