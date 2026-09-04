@@ -73,6 +73,12 @@ class PlannerConfig:
     # cannot alter passenger-complete decisions/search expansions.
     v6_reference_runtime: bool = False
     no_rejection_kernel: bool = False
+    # V8 controls. ``v7_reference_runtime`` replays the frozen V7 direct dual
+    # compiler on a V8 checkout.  Full V8 uses an incremental acceptance kernel
+    # and invokes exact forward certificate replay only after an infeasible
+    # primary search.
+    v7_reference_runtime: bool = False
+    no_lazy_diagnostic_replay: bool = False
     # Control that replays the exact V5 path-by-path typed viability in the V6/V7
     # codebase.  It isolates representation/runtime changes from mechanism gain.
     v5_reference_runtime: bool = False
@@ -106,6 +112,7 @@ class CapPlanPlanner:
         is_v5 = version.startswith("V5")
         is_v6 = version.startswith("V6")
         is_v7 = version.startswith("V7")
+        is_v8 = version.startswith("V8")
         # V3 removes the empirically redundant completion-value head and replaces
         # V2's transition-static typed-feasibility prior with a learned local
         # frontier ranker.  V4 retired that ranker and tested a relaxed suffix
@@ -116,26 +123,39 @@ class CapPlanPlanner:
         # envelope, retaining V5 as an exact representation control. V7 removes
         # enumerate-then-compress and separates existential acceptance dominance
         # from diagnostic rejection dominance.
-        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6 or is_v7) and self.config.v2_reference_runtime)
-        use_v5_reference = bool((is_v6 or is_v7) and (not use_v2_reference) and self.config.v5_reference_runtime)
-        use_v6_reference = bool(is_v7 and (not use_v2_reference) and (not use_v5_reference) and self.config.v6_reference_runtime)
+        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8) and self.config.v2_reference_runtime)
+        use_v5_reference = bool((is_v6 or is_v7 or is_v8) and (not use_v2_reference) and self.config.v5_reference_runtime)
+        use_v6_reference = bool((is_v7 or is_v8) and (not use_v2_reference) and (not use_v5_reference) and self.config.v6_reference_runtime)
+        use_v7_reference = bool(is_v8 and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and self.config.v7_reference_runtime)
         frontier_ranker = None
         if is_v3 and (not use_v2_reference) and (not self.config.no_frontier_ranker) and self.config.frontier_ranker_checkpoint:
             frontier_ranker = FrontierRanker(self.config.frontier_ranker_checkpoint, device=self.config.frontier_ranker_device)
-        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6 or is_v7) and not use_v2_reference)
+        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8) and not use_v2_reference)
         if is_v3 and not use_v2_reference:
             lambda_static = 0.0
         else:
             lambda_static = 0.0 if self.config.no_learned_feasibility_guidance else 0.20
         use_continuation = bool(is_v4 and (not use_v2_reference) and (not self.config.no_continuation_envelope))
-        use_viability = bool((is_v5 or is_v6 or is_v7) and (not use_v2_reference) and (not self.config.no_viability_kernel))
-        use_direct_dual = bool(is_v7 and use_viability and (not use_v5_reference) and (not use_v6_reference))
+        use_viability = bool((is_v5 or is_v6 or is_v7 or is_v8) and (not use_v2_reference) and (not self.config.no_viability_kernel))
+        use_direct_dual = bool(
+            ((is_v7 and not use_v5_reference and not use_v6_reference)
+             or (is_v8 and use_v7_reference))
+            and use_viability
+        )
+        use_incremental_acceptance = bool(
+            is_v8 and use_viability and (not use_v5_reference) and (not use_v6_reference)
+            and (not use_v7_reference)
+        )
         use_precondition_antichain = bool(
             (is_v6 and use_viability and (not use_v5_reference))
             or (is_v7 and use_viability and (not use_v5_reference))
+            or (is_v8 and use_viability and (not use_v5_reference))
         ) and (not self.config.no_precondition_antichain)
+        # V8 deliberately removes eager rejection/proof frontiers.  Its
+        # certificate is generated on demand by exact forward replay.  V7
+        # reference mode retains the old proof/rejection semantics.
         use_proof_envelope = bool(
-            ((is_v6 and not use_v5_reference) or (is_v7 and not use_v5_reference))
+            ((is_v6 and not use_v5_reference) or (is_v7 and not use_v5_reference) or (is_v8 and use_v7_reference))
             and use_viability and (not self.config.no_viability_proof_envelope)
         )
         use_rejection_antichain = bool(use_direct_dual and (not self.config.no_rejection_kernel))
@@ -160,6 +180,7 @@ class CapPlanPlanner:
                 viability_generic_certificates=bool(use_viability and self.config.generic_viability_certificates),
                 use_precondition_antichain=use_precondition_antichain,
                 use_direct_dual_precondition_kernel=use_direct_dual,
+                use_incremental_acceptance_kernel=use_incremental_acceptance,
                 use_rejection_antichain=use_rejection_antichain,
                 viability_use_proof_envelope=use_proof_envelope,
                 viability_max_paths_per_state=int(self.config.viability_max_paths_per_state),
@@ -167,6 +188,27 @@ class CapPlanPlanner:
             ),
             frontier_ranker=frontier_ranker,
         )
+        self._v8_lazy_diagnostic_replay = bool(
+            is_v8 and use_incremental_acceptance and (not self.config.no_lazy_diagnostic_replay)
+        )
+        self.diagnostic_searcher = None
+        if self._v8_lazy_diagnostic_replay:
+            # Demand-driven certificate extraction.  It uses the same exact
+            # forward _try_expand semantics but no backward pruning.  Thus the
+            # acceptance kernel never needs to encode a lossy reverse-dominance
+            # rejection frontier.
+            self.diagnostic_searcher = TypedSafeBudgetSearch(
+                self.automaton, registry, SearchConfig(
+                    beta=self.config.beta,
+                    no_typed_resource_ledger=self.config.no_typed_resource_ledger,
+                    no_conservative_margins=self.config.no_conservative_margins,
+                    no_completion_value_guidance=no_value,
+                    soft_only_capability=self.config.soft_only_capability,
+                    lambda_learned_feasibility=lambda_static,
+                    lambda_frontier_ranker=0.0,
+                    use_viability_kernel=False,
+                )
+            )
 
     def plan(
         self,
@@ -208,6 +250,32 @@ class CapPlanPlanner:
             episode_id, compiled, transitions, casa_out.transition_predictions,
             initial_anchor=initial_anchor, initial_phase="origin",
         )
+        diag["diagnostic_replay_executed"] = False
+        diag["diagnostic_replay_expansions"] = 0
+        diag["diagnostic_replay_rescued_plan"] = False
+        # V8 proves existence/non-existence with the compact accepting frontier
+        # but computes a concrete failure certificate only when the primary
+        # search has actually failed.  Running this exact no-kernel replay only
+        # after a kernel prune avoids V7's eager rejection-frontier explosion and
+        # provides a semantic guard: if replay unexpectedly finds a plan, V8
+        # fails open to that plan rather than returning a false reject.
+        if (
+            skeleton is None and self._v8_lazy_diagnostic_replay
+            and self.diagnostic_searcher is not None
+            and int(diag.get("viability_pruned", 0) or 0) > 0
+        ):
+            replay_skeleton, replay_cert, replay_diag = self.diagnostic_searcher.search(
+                episode_id, compiled, transitions, casa_out.transition_predictions,
+                initial_anchor=initial_anchor, initial_phase="origin",
+            )
+            diag["diagnostic_replay_executed"] = True
+            diag["diagnostic_replay_expansions"] = int(replay_diag.get("expansions", 0) or 0)
+            diag["diagnostic_replay_violation_count"] = int(replay_diag.get("violations", 0) or 0)
+            if replay_skeleton is not None:
+                skeleton, cert = replay_skeleton, None
+                diag["diagnostic_replay_rescued_plan"] = True
+            elif replay_cert is not None:
+                cert = replay_cert
         traj = refine_trajectory(skeleton, route_length_m=float(trip_context.get("route_length_m", trip_context.get("route_corridor", {}).get("length_m", 4000.0) if isinstance(trip_context.get("route_corridor"), dict) else 4000.0)), mode=self.config.trajectory_mode, scene_context=trip_context)
         phase_accepted = bool(skeleton and skeleton.accepted and self.automaton.accept("destination"))
         vehicle_safe = bool(traj.get("vehicle_evaluated", False) and not traj.get("collision", False) and traj.get("drivable_area", True) and traj.get("rule_compliance", not traj.get("rule_violation", False)))

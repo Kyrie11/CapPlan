@@ -440,6 +440,16 @@ def direct_precondition_incomplete_states_mean(episodes: List[Dict[str, Any]]) -
     return _mean([float(e.get("direct_precondition_incomplete_states", 0.0)) for e in episodes if e.get("direct_precondition_incomplete_states") is not None])
 
 
+def diagnostic_replay_rate(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([1.0 if e.get("diagnostic_replay_executed", False) else 0.0 for e in episodes])
+
+def diagnostic_replay_expansions_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("diagnostic_replay_expansions", 0.0)) for e in episodes if e.get("diagnostic_replay_expansions") is not None])
+
+def diagnostic_replay_rescue_rate(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([1.0 if e.get("diagnostic_replay_rescued_plan", False) else 0.0 for e in episodes])
+
+
 def planning_latency_mean_ms(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("planning_latency_ms", 0.0)) for e in episodes if e.get("planning_latency_ms") is not None])
 
@@ -540,6 +550,9 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "DCP_build_candidates_mean": direct_precondition_build_candidates_mean(episodes),
         "DCP_edge_relaxations_mean": direct_precondition_edge_relaxations_mean(episodes),
         "DCP_incomplete_states_mean": direct_precondition_incomplete_states_mean(episodes),
+        "DiagnosticReplayRate": diagnostic_replay_rate(episodes),
+        "DiagnosticReplayExpansionsMean": diagnostic_replay_expansions_mean(episodes),
+        "DiagnosticReplayRescueRate": diagnostic_replay_rescue_rate(episodes),
         "PlannerLatency_ms_mean": planning_latency_mean_ms(episodes),
         "PlannerLatency_ms_p95": planning_latency_p95_ms(episodes),
     }

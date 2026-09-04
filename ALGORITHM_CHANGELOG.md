@@ -621,3 +621,99 @@ Run `run_v7_full_experiments.sh` only when `v7_fast_gate.json` reports `status=G
 ### V7 implementation note
 
 This first direct compiler is deliberately correctness-first.  Candidate propagation is direct and raw universes are removed, but a candidate summary may still rescan a short stored transition prefix while composing its typed effect.  If V7 preserves semantics/T5 but narrowly misses the `<=2x V2` runtime gate, the next change should be **incremental associative edge-transformer composition and episode-level precondition caching**, not a new semantic algorithm and not a neural backbone change.
+
+## V8 — Incremental Acceptance / Lazy Proof Kernel (IALP-K)
+
+**Status:** implemented next candidate after the V7-fast audit; fast experiment not yet run on the server. No CASA retraining is required for the first V8 selection experiment.
+
+### Why V7 is STOP
+
+The uploaded `v7_fast_seed13` package contains a complete latency-critical GPU0 group (256 episodes / 2048 requests) but the GPU1 `no_rejection_kernel` control stops at roughly 86%, so the generated package has no `v7_fast_gate.json`.  The completed controls are nevertheless sufficient to make GO impossible under the preregistered V7 gate:
+
+- hard passenger semantics remain exact (`PCDecisionF1=1`, FAR=FRR=0; 104 TP / 0 FP / 0 FN);
+- V7 reduces mean expansions from V2 `18.879 -> 3.956` (paired saving `14.923`, episode-cluster CI `[12.038,18.004]`);
+- V7 also beats structural-only `12.159 -> 3.956`, so typed backward viability remains a promoted mechanism;
+- however all four T5 metrics are below `V2-0.01`;
+- V7 changes the promoted V5 search behavior (`4.931 -> 3.956` expansions), violating the representation-equivalence preregistration;
+- latency is catastrophic: V2 `22.4 ms`, V5 `145.6 ms`, V6 `602.3 ms`, V7 `18,347.7 ms/request` (p95 `109.3 s`), so every preregistered scalability gate fails.
+
+The latency diagnosis is structural rather than noise: request-level V7 latency correlates strongly with direct build candidates (`rho≈0.953`) and rejection-frontier size (`rho≈0.904`).  The compiler produces on average `461` direct candidates and a `370`-element rejection antichain per request.  Code inspection identifies two causes:
+
+1. every backward candidate calls `_build_suffix_summary()` over its full stored transition path, so a "direct" candidate is repeatedly recompiled from the first edge;
+2. the reverse rejection antichain requires an extremely specific witness/precondition signature and therefore compresses poorly.
+
+The diagnostic assumption itself is also retired.  A resource-wise reverse order over a complete suffix is not a proof that the reported downstream failure is executable: a suffix may already violate an earlier passenger-specific condition.  In the complete GPU0 results V7 and V2 disagree on the `(phase,resource,source)` certificate signature for 180 oracle-failure requests, with common shifts from wait/board/alight failures to deeper egress failures.
+
+### Promotion / retirement after V7-fast
+
+- **PROMOTE / core:** Passenger-Complete terminal semantics.
+- **PROMOTE / core:** Capability-as-Typed-Feasibility and the phase-scoped non-substitutable typed resource algebra.
+- **PROMOTE:** evidence-grounded hard authority and conservative typed evidence semantics.
+- **PROMOTE / main planning mechanism:** passenger-specific typed backward viability; V5/V6/V7 all show large independent expansion savings over structural/no-kernel controls.
+- **PROMOTE as an algorithmic principle:** direct backward compilation, but **not** the V7 path-recompilation implementation.
+- **RETAIN secondary:** V2 static learned-feasibility ordering; it never owns hard feasibility.
+- **RETIRE:** V7 global reverse `A_rej` antichain. Diagnosis is not obtained by simply reversing the acceptance resource order.
+- **RETIRE:** V7 full-path recompilation during backward candidate propagation.
+- **RETAIN as references only:** V5 exact suffix replay, V6 enumerate-then-compress, and V7 direct-dual implementation.
+- **REMAIN RETIRED:** V3 ECF pairwise ranker, V4 continuation priority, global completion-value head, and neural hard-evidence overwrite.
+
+### Core V8 design
+
+V8 separates the existential acceptance query from diagnostic proof generation instead of trying to encode both with one eagerly materialized frontier.
+
+#### 1. Incremental accepting precondition kernel
+
+For each hard-valid edge `e`, compile a local monotone typed transformer `T_e` exactly once.  The accepting frontier is computed directly by
+
+`A_acc(d)={Id}`
+
+`A_acc(s)=ND_acc( Union_{e:s->s'} T_e o A_acc(s') )`.
+
+Composition uses the same associative cumulative / upper-bottleneck / lower-affordance / probabilistic / categorical algebra as forward TSBS.  A candidate therefore costs one edge-summary composition rather than a full re-scan of its stored suffix path.  No raw suffix/proof universe and no rejection antichain are materialized.
+
+Frontier/depth bounds remain **fail-open**.  An incomplete backward state disables typed pruning at that state and all affected ancestors; approximation may lose acceleration but must not create a false passenger reject.
+
+#### 2. Lazy exact diagnostic replay
+
+V7 showed that explanation fidelity should not be purchased by eagerly compiling a huge reverse rejection universe for every request.  V8 therefore produces a concrete certificate only when the primary accepting search actually fails.
+
+The first implementation invokes an exact no-kernel forward replay using the same `_try_expand`, typed ledger, conservative evidence and certificate selector.  Its result may replace only the failure certificate.  If replay unexpectedly finds a passenger-complete plan, V8 explicitly **fails open to the rescued plan**, exposing the event in diagnostics rather than returning a false reject.
+
+This is intentionally a correctness-first implementation of proof-on-demand.  If V8-fast passes semantics/T5/runtime, a later optimization may restrict replay to recorded kernel cut obligations; it must remain certificate-equivalent to the exact replay.
+
+### V8 theory targets
+
+The paper-facing claims to validate are:
+
+1. **Returned-plan soundness:** any plan returned by V8 satisfies the same evidence-grounded `Accept ∧ Safe ∧ Sat` predicate as V2+.
+2. **Fail-open pruning soundness:** an incomplete incremental frontier cannot prune; bounded compilation can only reduce acceleration.
+3. **Associative compilation:** for monotone registered resource algebras, incremental composition of edge transformers is equivalent to composing the same transition sequence from scratch.
+4. **Lazy-diagnosis equivalence:** when exact replay is complete and uses the same transition set/typed semantics, the returned failure certificate is identical to the no-kernel forward diagnostic result.
+5. **Learning non-authority:** CASA static guidance may change ordering only; it cannot modify hard evidence, the accepting frontier, or the final verifier predicate.
+
+### V8-fast preregistration
+
+Use the same deterministic 256 test episodes and frozen seed-13 CASA checkpoint.  All latency-critical controls run serially.
+
+Main controls:
+
+- `full`: incremental acceptance + lazy exact diagnostic replay;
+- `v2_reference_runtime`;
+- `v5_reference_runtime`;
+- `no_typed_viability`: structural-only backward pruning;
+- `no_viability_kernel`;
+- `no_lazy_diagnostic_replay`: identical primary search, diagnosis ablated;
+- `no_learned_feasibility_guidance`.
+
+GO requires all of:
+
+1. `PCDecisionF1>=0.99`, FAR=FRR=0 and zero decision mismatch vs V2;
+2. every preregistered T5 macro/exact metric `>= V2-0.01`;
+3. paired expansion saving vs V2 and vs structural-only with episode-cluster CI lower bound `>0`;
+4. typed pruning fires;
+5. zero raw suffixes, zero raw proofs, zero eager rejection-antichain elements, active incremental direct compiler, and zero incomplete states on the fast subset;
+6. mean latency beats V5 with positive paired clustered latency CI and is `<=2x` V2 mean latency;
+7. `full` and `no_lazy_diagnostic_replay` have identical hard decisions and identical primary expansions; lazy replay does not reduce any T5 metric and improves at least one by `>=0.02`;
+8. diagnostic replay is actually exercised on failures and `DiagnosticReplayRescueRate=0` on the selection subset (a nonzero rescue is a soundness warning requiring investigation, not a hidden success).
+
+Only a V8-fast `status=GO` permits the 997-episode confirmatory run.  Real method-specific nuPlan closed loop remains postponed until the passenger/service algorithm is frozen.

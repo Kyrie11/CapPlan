@@ -46,6 +46,9 @@ ABLATION_FLAGS = {
     # V7 direct asymmetric dual-kernel controls.
     "v6_reference_runtime": {"v6_reference_runtime": True},
     "no_rejection_kernel": {"no_rejection_kernel": True},
+    # V8 incremental acceptance / lazy-proof controls.
+    "v7_reference_runtime": {"v7_reference_runtime": True},
+    "no_lazy_diagnostic_replay": {"no_lazy_diagnostic_replay": True},
 }
 
 MAIN_ABLATIONS = [

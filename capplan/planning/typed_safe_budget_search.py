@@ -28,6 +28,7 @@ from capplan.planning.capability_precondition_antichain import (
     evaluate_rejection_precondition_antichain,
 )
 from capplan.planning.direct_capability_precondition_kernel import build_direct_dual_precondition_kernel
+from capplan.planning.incremental_capability_precondition_kernel import build_incremental_acceptance_kernel
 from capplan.semantics.capability_compiler import CompiledContract, UncertaintySpec
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
 from capplan.semantics.service_automaton import ServiceAutomaton
@@ -76,6 +77,10 @@ class SearchConfig:
     # V7: compile acceptance/rejection/proof frontiers directly over the hard-
     # valid service graph instead of enumerating the V5 suffix universe first.
     use_direct_dual_precondition_kernel: bool = False
+    # V8: edge-local associative composition of the accepting precondition
+    # frontier.  It deliberately does not precompile a reverse rejection
+    # frontier; diagnosis is produced lazily with the exact forward semantics.
+    use_incremental_acceptance_kernel: bool = False
     # Rejection frontier can be ablated without changing the accepting frontier,
     # giving a causal T5 control with identical hard decisions/search behavior.
     use_rejection_antichain: bool = False
@@ -149,12 +154,20 @@ class TypedSafeBudgetSearch:
                 min_availability=self.config.min_availability,
                 max_paths_per_state=self.config.viability_max_paths_per_state,
                 max_depth=self.config.viability_max_depth,
-                # V7 direct compilation must not pay the V5 raw-suffix cost.
-                enumerate_suffixes=not self.config.use_direct_dual_precondition_kernel,
+                # V7/V8 direct compilation must not pay the V5 raw-suffix cost.
+                enumerate_suffixes=not (self.config.use_direct_dual_precondition_kernel or self.config.use_incremental_acceptance_kernel),
             )
         precondition_antichain: CapabilityPreconditionAntichain | None = None
         if viability_kernel is not None and self.config.use_precondition_antichain and self.config.viability_typed_pruning:
-            if self.config.use_direct_dual_precondition_kernel:
+            if self.config.use_incremental_acceptance_kernel:
+                precondition_antichain = build_incremental_acceptance_kernel(
+                    viability_kernel, compiled, predictions, self.registry,
+                    no_conservative_margins=self.config.no_conservative_margins,
+                    default_beta=self.config.beta,
+                    max_frontier_per_state=self.config.viability_max_paths_per_state,
+                    max_depth=self.config.viability_max_depth,
+                )
+            elif self.config.use_direct_dual_precondition_kernel:
                 precondition_antichain = build_direct_dual_precondition_kernel(
                     viability_kernel, compiled, predictions, self.registry,
                     no_conservative_margins=self.config.no_conservative_margins,

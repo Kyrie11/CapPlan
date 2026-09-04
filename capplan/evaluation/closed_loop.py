@@ -107,6 +107,9 @@ def result_to_episode_metrics(
         "direct_precondition_build_candidates": int(result.diagnostics.get("direct_precondition_build_candidates", 0) or 0),
         "direct_precondition_edge_relaxations": int(result.diagnostics.get("direct_precondition_edge_relaxations", 0) or 0),
         "direct_precondition_incomplete_states": int(result.diagnostics.get("direct_precondition_incomplete_states", 0) or 0),
+        "diagnostic_replay_executed": bool(result.diagnostics.get("diagnostic_replay_executed", False)),
+        "diagnostic_replay_expansions": int(result.diagnostics.get("diagnostic_replay_expansions", 0) or 0),
+        "diagnostic_replay_rescued_plan": bool(result.diagnostics.get("diagnostic_replay_rescued_plan", False)),
         "phase_accepted": phase_accepted,
         "vehicle_safe": traffic_safe,
         "capability_satisfied": capability_satisfied,
@@ -317,11 +320,13 @@ class ClosedLoopRunner:
             bool(self.config.no_typed_resource_ledger),
         ])
         version_upper = str(self.config.algorithm_version).upper()
-        if version_upper.startswith("V7") and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime:
+        if version_upper.startswith("V8") and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime:
+            frontier_guidance_policy = "incremental_acceptance_lazy_exact_proof_v8"
+        elif (version_upper.startswith("V7") or (version_upper.startswith("V8") and self.config.v7_reference_runtime)) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime:
             frontier_guidance_policy = "direct_asymmetric_dual_precondition_kernel_v7"
-        elif (version_upper.startswith("V6") or (version_upper.startswith("V7") and self.config.v6_reference_runtime)) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime:
+        elif (version_upper.startswith("V6") or ((version_upper.startswith("V7") or version_upper.startswith("V8")) and self.config.v6_reference_runtime)) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime:
             frontier_guidance_policy = "proof_carrying_weakest_precondition_antichain_v6"
-        elif (version_upper.startswith("V5") or ((version_upper.startswith("V6") or version_upper.startswith("V7")) and self.config.v5_reference_runtime)) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime:
+        elif (version_upper.startswith("V5") or ((version_upper.startswith("V6") or version_upper.startswith("V7") or version_upper.startswith("V8")) and self.config.v5_reference_runtime)) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime:
             frontier_guidance_policy = "proof_carrying_capability_viability_v5"
         elif version_upper.startswith("V4") and not self.config.no_continuation_envelope and not self.config.v2_reference_runtime:
             frontier_guidance_policy = "capability_continuation_envelope_v4"
@@ -337,17 +342,20 @@ class ClosedLoopRunner:
             "frontier_ranker_checkpoint": str(self.config.frontier_ranker_checkpoint) if self.config.frontier_ranker_checkpoint else None,
             "continuation_envelope_enabled": bool(str(self.config.algorithm_version).upper().startswith("V4") and not self.config.no_continuation_envelope and not self.config.v2_reference_runtime),
             "continuation_pruning_enabled": bool(str(self.config.algorithm_version).upper().startswith("V4") and not self.config.no_continuation_envelope and not self.config.no_continuation_pruning and not self.config.v2_reference_runtime),
-            "capability_viability_kernel_enabled": bool((str(self.config.algorithm_version).upper().startswith("V5") or str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7")) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime),
-            "typed_viability_pruning_enabled": bool((str(self.config.algorithm_version).upper().startswith("V5") or str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7")) and not self.config.no_viability_kernel and not self.config.no_typed_viability and not self.config.v2_reference_runtime),
-            "precondition_antichain_enabled": bool((str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7")) and not self.config.no_viability_kernel and not self.config.no_precondition_antichain and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
-            "viability_proof_envelope_enabled": bool((str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7")) and not self.config.no_viability_kernel and not self.config.no_viability_proof_envelope and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
-            "direct_precondition_compilation_enabled": bool(str(self.config.algorithm_version).upper().startswith("V7") and not self.config.no_viability_kernel and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
-            "rejection_antichain_enabled": bool(str(self.config.algorithm_version).upper().startswith("V7") and not self.config.no_viability_kernel and not self.config.no_rejection_kernel and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "capability_viability_kernel_enabled": bool((str(self.config.algorithm_version).upper().startswith("V5") or str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7") or str(self.config.algorithm_version).upper().startswith("V8")) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime),
+            "typed_viability_pruning_enabled": bool((str(self.config.algorithm_version).upper().startswith("V5") or str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7") or str(self.config.algorithm_version).upper().startswith("V8")) and not self.config.no_viability_kernel and not self.config.no_typed_viability and not self.config.v2_reference_runtime),
+            "precondition_antichain_enabled": bool((str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7") or str(self.config.algorithm_version).upper().startswith("V8")) and not self.config.no_viability_kernel and not self.config.no_precondition_antichain and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "viability_proof_envelope_enabled": bool((str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7") or (str(self.config.algorithm_version).upper().startswith("V8") and self.config.v7_reference_runtime)) and not self.config.no_viability_kernel and not self.config.no_viability_proof_envelope and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "direct_precondition_compilation_enabled": bool((str(self.config.algorithm_version).upper().startswith("V7") or str(self.config.algorithm_version).upper().startswith("V8")) and not self.config.no_viability_kernel and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "incremental_acceptance_compilation_enabled": bool(str(self.config.algorithm_version).upper().startswith("V8") and not self.config.no_viability_kernel and not self.config.v7_reference_runtime and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "lazy_exact_diagnostic_replay_enabled": bool(str(self.config.algorithm_version).upper().startswith("V8") and not self.config.no_lazy_diagnostic_replay and not self.config.no_viability_kernel and not self.config.v7_reference_runtime and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "rejection_antichain_enabled": bool((str(self.config.algorithm_version).upper().startswith("V7") or (str(self.config.algorithm_version).upper().startswith("V8") and self.config.v7_reference_runtime)) and not self.config.no_viability_kernel and not self.config.no_rejection_kernel and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
             "proof_carrying_viability_certificates": bool(
                 (
                     str(self.config.algorithm_version).upper().startswith("V5")
                     or (str(self.config.algorithm_version).upper().startswith("V6") and not self.config.no_viability_proof_envelope)
                     or (str(self.config.algorithm_version).upper().startswith("V7") and not self.config.no_rejection_kernel)
+                    or (str(self.config.algorithm_version).upper().startswith("V8") and not self.config.no_lazy_diagnostic_replay)
                 )
                 and not self.config.no_viability_kernel
                 and not self.config.generic_viability_certificates
