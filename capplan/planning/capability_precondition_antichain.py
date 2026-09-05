@@ -96,6 +96,15 @@ class CapabilityPreconditionAntichain:
     direct_build_candidates_total: int = 0
     direct_build_edge_relaxations: int = 0
     direct_incomplete_states: int = 0
+    # V9 capability-projected compiler instrumentation.  These fields are kept
+    # on the shared container so evaluation can compare V8/V9 representations
+    # without changing the search API.
+    projected_resource_count: int = 0
+    projected_evidence_dropped: int = 0
+    frontier_signature_hits: int = 0
+    frontier_dominance_checks: int = 0
+    frontier_peak_size: int = 0
+    precondition_build_ms: float = 0.0
 
     def state_summaries(self, state: State) -> Tuple[SuffixEffectSummary, ...]:
         return self.summaries.get(state, ())
@@ -231,6 +240,8 @@ def _build_suffix_summary(
     *,
     no_conservative_margins: bool,
     default_beta: float,
+    resource_filter: set[str] | None = None,
+    instrumentation: Dict[str, int] | None = None,
 ) -> Tuple[SuffixEffectSummary | None, ViolationRecord | None]:
     effects: Dict[str, Any] = {}
     required_observed: Dict[str, ViolationRecord] = {}
@@ -271,6 +282,10 @@ def _build_suffix_summary(
             if not registry.has(ev.resource_name):
                 continue
             name = ev.resource_name
+            if resource_filter is not None and name not in resource_filter:
+                if instrumentation is not None:
+                    instrumentation["projected_evidence_dropped"] = instrumentation.get("projected_evidence_dropped", 0) + 1
+                continue
             rt = registry.get(name)
             clauses_for_resource = by_resource.get(name, [])
             cur = effects.get(name, neutral_value(rt))
@@ -354,7 +369,11 @@ def _build_suffix_summary(
                         )
 
         for ev in evidence_list:
-            if registry.has(ev.resource_name) and not ev.missing and ev.value is not None:
+            if (
+                registry.has(ev.resource_name)
+                and (resource_filter is None or ev.resource_name in resource_filter)
+                and not ev.missing and ev.value is not None
+            ):
                 seen_valid_observation.add(ev.resource_name)
 
     # A suffix with an intrinsic hard evidence failure can never be a viable

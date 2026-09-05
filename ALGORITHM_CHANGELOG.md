@@ -717,3 +717,99 @@ GO requires all of:
 8. diagnostic replay is actually exercised on failures and `DiagnosticReplayRescueRate=0` on the selection subset (a nonzero rescue is a soundness warning requiring investigation, not a hidden success).
 
 Only a V8-fast `status=GO` permits the 997-episode confirmatory run.  Real method-specific nuPlan closed loop remains postponed until the passenger/service algorithm is frozen.
+
+## V8-fast seed13 decision — semantic/search GO, runtime STOP
+
+**Date:** 2026-09-05  
+**Decision:** `STOP` under the preregistered V8 gate.  The run is attribution-valid for the 256-episode / 2048-request passenger-service mechanism study; the failure is confined to the preregistered runtime gate, not to hard semantics, typed backward viability, or proof-on-demand diagnosis.
+
+### Reliability / preregistration outcome
+
+All V8 fast variants complete on the same deterministic request universe and report `algorithm_attribution_ready=true` with no attribution warnings.  Full V8 has `PCDecisionF1=1`, FAR=FRR=`0`, zero decision mismatch against V2, and exactly reproduces V2's T5 phase/resource/source macro-F1 and certificate exact-match (`0.82969/0.66456/0.63013/0.76749`).  Lazy exact replay is exercised on failures (`DiagnosticReplayRate=0.3413`) and never rescues a plan (`DiagnosticReplayRescueRate=0`).
+
+The promoted typed backward mechanism remains very strong:
+
+- V2 mean expansions `18.8794 -> V8 3.9561`, a `79.05%` reduction; paired episode-cluster 95% CI for `V2-V8` is `[12.038,18.004]` expansions/request;
+- structural-only `12.1592 -> 3.9561`, a `67.46%` reduction;
+- V5 exact typed-suffix reference `4.9307 -> 3.9561`, showing that incremental acceptance does not merely reproduce the older representation but finds the same hard decisions with a stronger compiled viability query;
+- `CVK_typed_pruned_mean=0.6543`.
+
+The V8 representation and diagnosis targets pass: no raw suffix/proof universe, no eager rejection antichain, active incremental compiler, zero incomplete states on the fast subset, and full/no-lazy have identical primary decisions/expansions.  Lazy replay improves T5 by `+0.2916/+0.1896/+0.1987/+0.0823` over the no-lazy control while adding only a small aggregate runtime difference; diagnosis is therefore retained.
+
+### Why V8 STOPs
+
+Only the runtime gate fails, decisively:
+
+- V2 mean latency: `22.76 ms/request`;
+- V5 reference: `139.68 ms/request`;
+- V8: `644.42 ms/request`, p95 `3145.54 ms`;
+- paired `V5-V8` latency delta `-504.74 ms`, 95% CI `[-731.34,-316.996]`;
+- paired `V2-V8` latency delta `-621.66 ms`, 95% CI `[-864.46,-416.84]`.
+
+Request-level profiling localizes the cost to **acceptance-kernel construction/frontier maintenance**, not TSBS expansion or lazy diagnosis.  Latency is strongly associated with the V8 accepting-frontier work (`Spearman rho≈0.876` for antichain size/build candidates; Pearson `r≈0.910` for build candidates).  Median build candidates are only `56`, but p95 is about `2346` and p99 about `3991`; antichain p95 is about `450`.  Search expansions have much weaker latency association.
+
+Code inspection exposes the representation cause: `_build_suffix_summary()` currently carries every available evidence resource into an acceptance summary even when that resource appears in **no hard passenger capability clause/group**.  `_summary_dominates()` then compares the union of all these effects.  Passenger-irrelevant evidence dimensions can therefore prevent two acceptance-equivalent suffixes from dominating one another and inflate the Pareto frontier.  V8 also rebuilds exact signatures and repeatedly sorts/scans the entire frontier on candidate insertion.
+
+The same-scene counterfactual benchmark amplifies the waste: each retained scene has eight passenger contracts over the same service graph/OD/vehicle.  In the V8 fast trace, all eight requests have exactly the same direct build-candidate and antichain counts for roughly `84.8%` of episodes, showing that much of the expensive graph-side compilation is repeatedly rediscovered.  This is a secondary amortization opportunity, but scene caching alone is not promoted as a paper contribution.
+
+### Promotion / retirement after V8-fast
+
+- **PROMOTE / core:** Passenger-Complete terminal semantics.
+- **PROMOTE / core:** Capability-as-Typed-Feasibility with phase-scoped, non-substitutable typed algebra.
+- **PROMOTE:** evidence-grounded hard authority and conservative typed margins.
+- **PROMOTE / main mechanism:** passenger-specific typed backward executable viability.
+- **PROMOTE / main representation principle:** incremental edge-transformer composition; V8 removes V7's full-path recompilation and eager reverse rejection universe.
+- **PROMOTE / semantic requirement:** lazy exact proof-on-demand diagnosis; it restores V2 certificate fidelity without changing primary search.
+- **RETAIN secondary:** V2 static learned-feasibility ordering.  On V8-fast it saves only about `0.266` expansion/request and is not a paper-defining mechanism; its wall-clock value must be rechecked after the symbolic kernel is fast.
+- **RETIRE as final representation:** full-registry acceptance frontier.  Acceptance should distinguish suffixes only along resources observable by the hard passenger capability program.
+- **REMAIN RETIRED:** V7 reverse rejection antichain, V6 enumerate-then-compress, V5 query-time suffix replay as final implementation, V4 continuation priority, V3 ECF ranker, completion-value head, and neural overwrite of hard typed evidence.
+
+## V9 — Capability-Projected Incremental Precondition Kernel (CP-IPK)
+
+**Status:** implemented next candidate; no retraining is required for the first V9 experiment.
+
+### Core design
+
+V9 treats the compiled hard passenger capability program as an **observation map over resource space**.  Let
+
+`Supp(Psi) = {r | r occurs in a hard clause or in a hard requirement group}`.
+
+For an accepting suffix transformer `phi`, define `Pi_Psi(phi)` by deleting resource effects outside `Supp(Psi)` while retaining the same fail-closed observation requirements, active clause/group semantics, and typed effects for every observable resource.  The V9 accepting recurrence is
+
+`A_Psi(destination) = {Id}`
+
+`A_Psi(s) = ND_Psi ( Union_{e:s->s'} Pi_Psi( T_e o phi ), phi in A_Psi(s') )`.
+
+The key claim is **capability-projection invariance**: if two suffix transformers agree on every resource observable by the hard compiled capability program (and on its missing-observation preconditions), then `Sat(·,Psi)` cannot distinguish them for any forward ledger.  Keeping both suffixes is therefore representational redundancy, not extra planning power.  This is the paper-facing V9 mechanism; it is specific to capability-compiled passenger-complete planning rather than a generic “faster Pareto set” trick.
+
+V9 retains V8's incremental edge-local typed composition and lazy exact diagnostic replay.  It additionally uses exact-signature indexing and defers deterministic frontier sorting until fixed-point completion.  Those two changes are engineering specializations and have separate controls; they are not claimed as novelty.
+
+### New instrumentation
+
+V9 reports capability-support size, number of projected-away evidence values, exact-signature hits, dominance comparisons, peak frontier size, and precondition-build time.  The purpose is to distinguish a genuine semantic-quotient reduction from a low-level timing fluctuation.
+
+### V9-fast controls
+
+- `full`: capability projection + indexed incremental accepting frontier + V8 lazy exact diagnosis;
+- `v8_reference_runtime`: exact frozen V8 full representation;
+- `v2_reference_runtime` and `v5_reference_runtime`;
+- `no_typed_viability` and `no_viability_kernel`;
+- `no_capability_projection`: V9 compiler/indexing in the full evidence-resource space;
+- `no_frontier_signature_index`: capability projection retained, indexing ablated;
+- `no_lazy_diagnostic_replay`;
+- `no_learned_feasibility_guidance`.
+
+### V9-fast preregistration
+
+GO requires all of:
+
+1. `PCDecisionF1>=0.99`, FAR=FRR=`0`, zero passenger-decision mismatch vs exact V8;
+2. **zero request-level TSBS expansion mismatch vs V8**.  V9 is intended to change the representation, not the viability predicate;
+3. all four T5 macro/exact metrics `>= V2-0.01`;
+4. typed V9 beats structural-only in paired expansions with episode-cluster CI lower bound `>0`, and typed pruning fires;
+5. capability projection is actually active: projected-away evidence count `>0`, projected antichain size and direct build-candidate count are both lower than `no_capability_projection`, no raw suffix/rejection universe is materialized, and fast states remain complete;
+6. V9 mean latency beats exact V8 **and V5** with positive episode-clustered latency CI lower bounds and satisfies the original `<=2x V2` mean-latency publication gate;
+7. full/no-lazy have identical hard decisions and primary expansions, lazy replay improves at least one preregistered T5 metric by `>=0.02`, replay fires, and rescue rate remains `0`;
+8. signature indexing is retained only if its paired mean latency is non-worse than the projection-only control.  If not, drop the index and keep capability projection; this engineering choice does not invalidate the semantic V9 mechanism.
+
+Only `v9_fast_gate.json: status=GO` permits the 997-episode V9 confirmatory run.  A genuine heterogeneous learned evidence encoder and method-specific nuPlan closed loop remain separate later gates; neither is allowed to mask a failure of the symbolic executable-precondition backbone.

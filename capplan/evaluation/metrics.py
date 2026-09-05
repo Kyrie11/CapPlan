@@ -439,6 +439,24 @@ def direct_precondition_edge_relaxations_mean(episodes: List[Dict[str, Any]]) ->
 def direct_precondition_incomplete_states_mean(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("direct_precondition_incomplete_states", 0.0)) for e in episodes if e.get("direct_precondition_incomplete_states") is not None])
 
+def projected_resource_count_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("projected_resource_count", 0.0)) for e in episodes if e.get("projected_resource_count") is not None])
+
+def projected_evidence_dropped_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("projected_evidence_dropped", 0.0)) for e in episodes if e.get("projected_evidence_dropped") is not None])
+
+def frontier_signature_hits_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("frontier_signature_hits", 0.0)) for e in episodes if e.get("frontier_signature_hits") is not None])
+
+def frontier_dominance_checks_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("frontier_dominance_checks", 0.0)) for e in episodes if e.get("frontier_dominance_checks") is not None])
+
+def frontier_peak_size_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("frontier_peak_size", 0.0)) for e in episodes if e.get("frontier_peak_size") is not None])
+
+def precondition_build_ms_mean(episodes: List[Dict[str, Any]]) -> float:
+    return _mean([float(e.get("precondition_build_ms", 0.0)) for e in episodes if e.get("precondition_build_ms") is not None])
+
 
 def diagnostic_replay_rate(episodes: List[Dict[str, Any]]) -> float:
     return _mean([1.0 if e.get("diagnostic_replay_executed", False) else 0.0 for e in episodes])
@@ -550,6 +568,12 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "DCP_build_candidates_mean": direct_precondition_build_candidates_mean(episodes),
         "DCP_edge_relaxations_mean": direct_precondition_edge_relaxations_mean(episodes),
         "DCP_incomplete_states_mean": direct_precondition_incomplete_states_mean(episodes),
+        "CPK_projected_resource_count_mean": projected_resource_count_mean(episodes),
+        "CPK_projected_evidence_dropped_mean": projected_evidence_dropped_mean(episodes),
+        "CPK_frontier_signature_hits_mean": frontier_signature_hits_mean(episodes),
+        "CPK_frontier_dominance_checks_mean": frontier_dominance_checks_mean(episodes),
+        "CPK_frontier_peak_size_mean": frontier_peak_size_mean(episodes),
+        "CPK_build_ms_mean": precondition_build_ms_mean(episodes),
         "DiagnosticReplayRate": diagnostic_replay_rate(episodes),
         "DiagnosticReplayExpansionsMean": diagnostic_replay_expansions_mean(episodes),
         "DiagnosticReplayRescueRate": diagnostic_replay_rescue_rate(episodes),

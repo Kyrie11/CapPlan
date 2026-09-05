@@ -24,13 +24,14 @@ def main():
     if not keys: raise RuntimeError('no paired requests')
     by_ep={}
     by_ep_lat={}
-    d_exp=[]; d_lat=[]; decision_mismatch=0
+    d_exp=[]; d_lat=[]; decision_mismatch=0; expansion_mismatch=0
     for k in keys:
         a,b=ref[k],cand[k]
         de=float(a.get('search_expansions',0))-float(b.get('search_expansions',0))
         dl=float(a.get('planning_latency_ms',0))-float(b.get('planning_latency_ms',0))
         d_exp.append(de); d_lat.append(dl); by_ep.setdefault(k[0],[]).append(de); by_ep_lat.setdefault(k[0],[]).append(dl)
         decision_mismatch += int(bool(a.get('passenger_complete')) != bool(b.get('passenger_complete')))
+        expansion_mismatch += int(abs(de) > 1e-12)
     ep=np.array([np.mean(v) for v in by_ep.values()], dtype=float)
     ep_lat=np.array([np.mean(by_ep_lat[e]) for e in sorted(by_ep_lat)], dtype=float)
     rng=np.random.default_rng(args.seed)
@@ -41,6 +42,7 @@ def main():
     result={
         'paired_requests':len(keys),'paired_episodes':len(by_ep),
         'decision_mismatch_count':decision_mismatch,
+        'expansion_mismatch_count':expansion_mismatch,
         'reference_expansions_mean':float(ref_exp),'candidate_expansions_mean':float(cand_exp),
         'expansion_reduction_fraction':float(1.0-cand_exp/max(ref_exp,1e-9)),
         'paired_expansion_delta_reference_minus_candidate_mean':float(np.mean(d_exp)),

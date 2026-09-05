@@ -49,6 +49,10 @@ ABLATION_FLAGS = {
     # V8 incremental acceptance / lazy-proof controls.
     "v7_reference_runtime": {"v7_reference_runtime": True},
     "no_lazy_diagnostic_replay": {"no_lazy_diagnostic_replay": True},
+    # V9 capability-projected incremental-kernel controls.
+    "v8_reference_runtime": {"v8_reference_runtime": True},
+    "no_capability_projection": {"no_capability_projection": True},
+    "no_frontier_signature_index": {"no_frontier_signature_index": True},
 }
 
 MAIN_ABLATIONS = [
