@@ -104,6 +104,15 @@ class CapabilityPreconditionAntichain:
     frontier_signature_hits: int = 0
     frontier_dominance_checks: int = 0
     frontier_peak_size: int = 0
+    # V10 construction instrumentation. Semi-naive propagation changes only
+    # how the V9 fixed point is reached, while packed dominance implements the
+    # exact same passenger-visible partial order with precompiled masks.
+    delta_propagations: int = 0
+    delta_admissions: int = 0
+    delta_stale_skips: int = 0
+    frontier_mask_rejects: int = 0
+    frontier_packed_fastpath: int = 0
+    frontier_packed_fallbacks: int = 0
     precondition_build_ms: float = 0.0
 
     def state_summaries(self, state: State) -> Tuple[SuffixEffectSummary, ...]:

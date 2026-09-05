@@ -813,3 +813,108 @@ GO requires all of:
 8. signature indexing is retained only if its paired mean latency is non-worse than the projection-only control.  If not, drop the index and keep capability projection; this engineering choice does not invalidate the semantic V9 mechanism.
 
 Only `v9_fast_gate.json: status=GO` permits the 997-episode V9 confirmatory run.  A genuine heterogeneous learned evidence encoder and method-specific nuPlan closed loop remain separate later gates; neither is allowed to mask a failure of the symbolic executable-precondition backbone.
+
+## V9-fast seed13 decision — projection GO, exact-backbone runtime still STOP
+
+**Date:** 2026-09-05  
+**Decision:** `STOP` under the preregistered V9-fast gate, with the capability-projection mechanism **PROMOTED**.  The only failing gate is the unchanged `mean latency <= 2x V2` runtime condition; hard passenger semantics, V8-equivalent search behavior, typed-specific pruning, projection compression, and lazy exact diagnosis all pass.
+
+### Reliable V9-fast evidence
+
+The deterministic fast suite contains `256` episodes / `2048` passenger requests for every control, with complete request-level pairing and `algorithm_attribution_ready=true` without warnings. Full V9 preserves the frozen oracle decision exactly (`PCDecisionF1=1`, FAR=FRR=`0`) and has zero decision/TSBS-expansion mismatch against exact V8. It also reproduces the V2 T5 reference (`phase/resource/source macro-F1 = 0.82969/0.66456/0.63013`, certificate exact `0.76749`).
+
+The promoted typed-search mechanism is unchanged: V2 `18.879 -> V9 3.956` mean expansions (`79.05%` reduction), structural-only `12.159 -> 3.956`, and typed pruning fires.  Therefore the semantic spine is no longer under redesign pressure.
+
+### Capability projection is causally validated
+
+Against `no_capability_projection`, primary passenger decisions and expansions are identical while:
+
+- accepting antichain mean `115.43 -> 54.74`;
+- direct build candidates mean about `483.46 -> 239.07`;
+- mean planner latency `191.30 -> 72.13 ms/request`;
+- paired latency saving is about `119.18 ms/request` with a positive episode-clustered 95% CI.
+
+The exact-signature index also has an independent paired runtime contribution: `no_frontier_signature_index` is about `106.51 ms/request` versus V9 `72.13 ms/request`, with zero hard/search change. It is retained as engineering, not claimed as a headline semantic contribution.
+
+Lazy exact proof-on-demand remains necessary for T5. Disabling replay keeps primary decisions/expansions fixed but degrades phase/resource/source/exact diagnosis; full V9 pays roughly `14.6 ms/request` average for the exact replay and `DiagnosticReplayRescueRate=0`.
+
+### Why V9 still STOPs
+
+V9 beats V8 (`641.7 -> 72.1 ms`) and V5 (`135.1 -> 72.1 ms`) but still misses the preregistered publication-oriented bound against V2 (`21.2 ms`): V9 is about `3.4x V2`, not `<=2x`.
+
+Request-level profiling localizes the remaining cost to backward fixed-point construction rather than TSBS or diagnosis. V9 precondition build time is extremely correlated with direct build candidates and dominance comparisons (Spearman roughly `0.98`). The current state-worklist implementation re-propagates the whole child frontier whenever a child state changes; exact-signature filtering catches many repetitions only *after* suffix composition and comparison work has already been paid. The eight same-scene counterfactual passengers also expose large repeated graph-side structure, but cross-passenger caching is treated only as a later amortization/engineering opportunity and must not be used to game cold single-request latency.
+
+The existing relation-aware learned feasibility guidance remains secondary. On this fast subset it saves about `0.266` expansion/request with a positive clustered CI, but increases mean latency by about `4.2 ms/request`; a larger neural backbone is therefore not justified as the next hot-path change.
+
+### Mainline frozen after V9-fast
+
+Freeze the **semantic spine** (subject to later full-test soundness confirmation):
+
+`Passenger-Complete Planning -> Compiled Capability Program -> Evidence-Grounded Typed Service Semantics -> Forward Consumed Capability Ledger × Capability-Projected Backward Executable Preconditions -> Proof-on-Demand Typed Safe-Budget Search -> accepting complete-trip execution OR exact diagnostic rejection`.
+
+Future versions may improve representation/runtime or add learned evidence/guidance, but should not re-open this problem/semantic hierarchy without contradictory evidence.
+
+## V10 — Semi-Naive Capability-Projected Kernel (SN-CPK)
+
+**Status:** implemented exact-construction closure candidate; **not yet promoted into the paper method**. No retraining is required for the first V10 experiment.
+
+### Motivation
+
+V10 does not introduce a new passenger-feasibility predicate. It asks whether the exact V9 projected fixed point can be constructed near the V2 runtime envelope without surrendering the typed backward mechanism.
+
+### Exact semi-naive recurrence
+
+Let `A_k(s)` be the already admitted capability-projected accepting summaries and `Delta_k(s)` the newly admitted summaries not yet propagated.  V10 evaluates only the differential recurrence
+
+`Delta_{k+1}(s) = ND_Psi( Union_{e:s->s'} Pi_Psi(T_e o Delta_k(s')) ) \ A_k(s)`
+
+`A_{k+1}(s) = ND_Psi( A_k(s) Union Delta_{k+1}(s) )`.
+
+Each newly admitted summary is propagated upstream once. A queued summary that has already been dominated before propagation is skipped. Under the registered monotone typed edge transformers, if child transformer `a` is dominated by `b`, then `T_e o a` is dominated by `T_e o b`; therefore an old propagated image is only redundant and does not require semantic retraction.
+
+### Capability-compiled packed dominance
+
+V10 additionally precompiles the *same V9 partial order*:
+
+- required-observation, active-clause and active-group subset relations become integer bit masks;
+- cumulative/upper/probabilistic and lower-affordance effects are normalized into a common `smaller is no worse` numeric vector;
+- categorical/interface transforms preserve V9's conservative semantic-identity rule;
+- unusual/missing representations fall back to the exact historical comparator.
+
+This is an implementation of V9 dominance, not a new feasibility relaxation.
+
+### V10 invariants
+
+- returned-plan soundness is unchanged;
+- capability projection and fail-open frontier/depth bounds are unchanged;
+- V10 may not change a V9 passenger decision or request-level TSBS expansion count;
+- lazy exact diagnostic replay remains unchanged and a nonzero rescue remains a soundness warning;
+- if the packed fast path ever changes the V9 relation, the mechanism is rejected rather than calibrated to the desired result.
+
+### V10-fast preregistration
+
+Use the same deterministic `256`-episode subset and frozen seed-13 CASA checkpoint. Timing controls are serial.
+
+Controls:
+
+- `full`: projection + semi-naive delta propagation + packed dominance + lazy exact proof;
+- `v9_reference_runtime`: frozen exact V9 builder;
+- `v2_reference_runtime`, `v5_reference_runtime`;
+- `no_typed_viability`, `no_viability_kernel`;
+- `no_semnaive_delta_propagation`: the same packed comparator but V9-style full-frontier state propagation;
+- `no_packed_frontier_dominance`: semi-naive deltas with the exact V9 object comparator;
+- `no_lazy_diagnostic_replay`;
+- `no_learned_feasibility_guidance`.
+
+GO requires all of:
+
+1. `PCDecisionF1>=0.99`, FAR=FRR=`0`;
+2. zero decision mismatch and **zero request-level TSBS expansion mismatch vs V9**;
+3. every preregistered T5 macro/exact metric `>=V2-0.01`;
+4. typed viability still beats structural-only with positive clustered expansion CI and typed pruning fires;
+5. semi-naive propagation is active, preserves primary semantics, and lowers build candidates **and** dominance comparisons relative to `no_semnaive_delta_propagation`;
+6. packed dominance preserves decisions/expansions, exercises its exact fast path, and is paired-latency non-worse than `no_packed_frontier_dominance`;
+7. full V10 beats V9 and V5 latency with positive clustered CIs, lowers precondition-build time, and finally satisfies `mean latency <=2x V2`;
+8. lazy replay preserves primary decisions/expansions, materially improves T5, fires on failures, and rescue rate remains zero.
+
+Only `v10_fast_gate.json: status=GO` permits the 997-episode V10 confirmatory run. A genuine heterogeneous evidence network remains a later, separately attributable layer; it is not allowed to mask an unresolved exact-kernel construction bottleneck.

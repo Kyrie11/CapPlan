@@ -30,6 +30,7 @@ from capplan.planning.capability_precondition_antichain import (
 from capplan.planning.direct_capability_precondition_kernel import build_direct_dual_precondition_kernel
 from capplan.planning.incremental_capability_precondition_kernel import build_incremental_acceptance_kernel
 from capplan.planning.capability_projected_precondition_kernel import build_capability_projected_acceptance_kernel
+from capplan.planning.semnaive_capability_projected_kernel import build_semnaive_capability_projected_acceptance_kernel
 from capplan.semantics.capability_compiler import CompiledContract, UncertaintySpec
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
 from capplan.semantics.service_automaton import ServiceAutomaton
@@ -85,6 +86,11 @@ class SearchConfig:
     # V9: quotient the V8 accepting transformer by the hard capability
     # program's observable resource support before Pareto dominance.
     use_capability_projected_acceptance_kernel: bool = False
+    # V10: exact V9 semantics with semi-naive delta propagation and an optional
+    # packed implementation of the same capability-projected dominance order.
+    use_semnaive_projected_acceptance_kernel: bool = False
+    semnaive_delta_propagation: bool = True
+    packed_frontier_dominance: bool = True
     capability_projection: bool = True
     frontier_signature_index: bool = True
     # Rejection frontier can be ablated without changing the accepting frontier,
@@ -165,11 +171,24 @@ class TypedSafeBudgetSearch:
                     self.config.use_direct_dual_precondition_kernel
                     or self.config.use_incremental_acceptance_kernel
                     or self.config.use_capability_projected_acceptance_kernel
+                    or self.config.use_semnaive_projected_acceptance_kernel
                 ),
             )
         precondition_antichain: CapabilityPreconditionAntichain | None = None
         if viability_kernel is not None and self.config.use_precondition_antichain and self.config.viability_typed_pruning:
-            if self.config.use_capability_projected_acceptance_kernel:
+            if self.config.use_semnaive_projected_acceptance_kernel:
+                precondition_antichain = build_semnaive_capability_projected_acceptance_kernel(
+                    viability_kernel, compiled, predictions, self.registry,
+                    no_conservative_margins=self.config.no_conservative_margins,
+                    default_beta=self.config.beta,
+                    max_frontier_per_state=self.config.viability_max_paths_per_state,
+                    max_depth=self.config.viability_max_depth,
+                    use_capability_projection=self.config.capability_projection,
+                    use_signature_index=self.config.frontier_signature_index,
+                    use_delta_propagation=self.config.semnaive_delta_propagation,
+                    use_packed_dominance=self.config.packed_frontier_dominance,
+                )
+            elif self.config.use_capability_projected_acceptance_kernel:
                 precondition_antichain = build_capability_projected_acceptance_kernel(
                     viability_kernel, compiled, predictions, self.registry,
                     no_conservative_margins=self.config.no_conservative_margins,
@@ -293,6 +312,12 @@ class TypedSafeBudgetSearch:
                     "frontier_signature_hits": (precondition_antichain.frontier_signature_hits if precondition_antichain is not None else 0),
                     "frontier_dominance_checks": (precondition_antichain.frontier_dominance_checks if precondition_antichain is not None else 0),
                     "frontier_peak_size": (precondition_antichain.frontier_peak_size if precondition_antichain is not None else 0),
+                    "delta_propagations": (precondition_antichain.delta_propagations if precondition_antichain is not None else 0),
+                    "delta_admissions": (precondition_antichain.delta_admissions if precondition_antichain is not None else 0),
+                    "delta_stale_skips": (precondition_antichain.delta_stale_skips if precondition_antichain is not None else 0),
+                    "frontier_mask_rejects": (precondition_antichain.frontier_mask_rejects if precondition_antichain is not None else 0),
+                    "frontier_packed_fastpath": (precondition_antichain.frontier_packed_fastpath if precondition_antichain is not None else 0),
+                    "frontier_packed_fallbacks": (precondition_antichain.frontier_packed_fallbacks if precondition_antichain is not None else 0),
                     "precondition_build_ms": (precondition_antichain.precondition_build_ms if precondition_antichain is not None else 0.0),
                     "viability_kernel": ({
                         "n_states": viability_kernel.n_states,
@@ -481,6 +506,12 @@ class TypedSafeBudgetSearch:
             "frontier_signature_hits": (precondition_antichain.frontier_signature_hits if precondition_antichain is not None else 0),
             "frontier_dominance_checks": (precondition_antichain.frontier_dominance_checks if precondition_antichain is not None else 0),
             "frontier_peak_size": (precondition_antichain.frontier_peak_size if precondition_antichain is not None else 0),
+            "delta_propagations": (precondition_antichain.delta_propagations if precondition_antichain is not None else 0),
+            "delta_admissions": (precondition_antichain.delta_admissions if precondition_antichain is not None else 0),
+            "delta_stale_skips": (precondition_antichain.delta_stale_skips if precondition_antichain is not None else 0),
+            "frontier_mask_rejects": (precondition_antichain.frontier_mask_rejects if precondition_antichain is not None else 0),
+            "frontier_packed_fastpath": (precondition_antichain.frontier_packed_fastpath if precondition_antichain is not None else 0),
+            "frontier_packed_fallbacks": (precondition_antichain.frontier_packed_fallbacks if precondition_antichain is not None else 0),
             "precondition_build_ms": (precondition_antichain.precondition_build_ms if precondition_antichain is not None else 0.0),
             "viability_kernel": ({
                 "n_states": viability_kernel.n_states,

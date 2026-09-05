@@ -53,6 +53,10 @@ ABLATION_FLAGS = {
     "v8_reference_runtime": {"v8_reference_runtime": True},
     "no_capability_projection": {"no_capability_projection": True},
     "no_frontier_signature_index": {"no_frontier_signature_index": True},
+    # V10 exact construction controls.
+    "v9_reference_runtime": {"v9_reference_runtime": True},
+    "no_semnaive_delta_propagation": {"no_semnaive_delta_propagation": True},
+    "no_packed_frontier_dominance": {"no_packed_frontier_dominance": True},
 }
 
 MAIN_ABLATIONS = [

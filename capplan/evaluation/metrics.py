@@ -457,6 +457,9 @@ def frontier_peak_size_mean(episodes: List[Dict[str, Any]]) -> float:
 def precondition_build_ms_mean(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("precondition_build_ms", 0.0)) for e in episodes if e.get("precondition_build_ms") is not None])
 
+def _construction_metric_mean(episodes: List[Dict[str, Any]], key: str) -> float:
+    return _mean([float(e.get(key, 0.0)) for e in episodes if e.get(key) is not None])
+
 
 def diagnostic_replay_rate(episodes: List[Dict[str, Any]]) -> float:
     return _mean([1.0 if e.get("diagnostic_replay_executed", False) else 0.0 for e in episodes])
@@ -574,6 +577,12 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "CPK_frontier_dominance_checks_mean": frontier_dominance_checks_mean(episodes),
         "CPK_frontier_peak_size_mean": frontier_peak_size_mean(episodes),
         "CPK_build_ms_mean": precondition_build_ms_mean(episodes),
+        "SNK_delta_propagations_mean": _construction_metric_mean(episodes, "delta_propagations"),
+        "SNK_delta_admissions_mean": _construction_metric_mean(episodes, "delta_admissions"),
+        "SNK_delta_stale_skips_mean": _construction_metric_mean(episodes, "delta_stale_skips"),
+        "SNK_frontier_mask_rejects_mean": _construction_metric_mean(episodes, "frontier_mask_rejects"),
+        "SNK_packed_fastpath_mean": _construction_metric_mean(episodes, "frontier_packed_fastpath"),
+        "SNK_packed_fallbacks_mean": _construction_metric_mean(episodes, "frontier_packed_fallbacks"),
         "DiagnosticReplayRate": diagnostic_replay_rate(episodes),
         "DiagnosticReplayExpansionsMean": diagnostic_replay_expansions_mean(episodes),
         "DiagnosticReplayRescueRate": diagnostic_replay_rescue_rate(episodes),

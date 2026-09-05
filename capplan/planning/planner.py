@@ -85,6 +85,12 @@ class PlannerConfig:
     v8_reference_runtime: bool = False
     no_capability_projection: bool = False
     no_frontier_signature_index: bool = False
+    # V10 exact-construction controls.  ``v9_reference_runtime`` freezes the V9
+    # builder; the two ablations isolate semi-naive delta propagation and the
+    # packed implementation of V9's dominance relation.
+    v9_reference_runtime: bool = False
+    no_semnaive_delta_propagation: bool = False
+    no_packed_frontier_dominance: bool = False
     # Control that replays the exact V5 path-by-path typed viability in the V6/V7
     # codebase.  It isolates representation/runtime changes from mechanism gain.
     v5_reference_runtime: bool = False
@@ -120,6 +126,7 @@ class CapPlanPlanner:
         is_v7 = version.startswith("V7")
         is_v8 = version.startswith("V8")
         is_v9 = version.startswith("V9")
+        is_v10 = version.startswith("V10")
         # V3 removes the empirically redundant completion-value head and replaces
         # V2's transition-static typed-feasibility prior with a learned local
         # frontier ranker.  V4 retired that ranker and tested a relaxed suffix
@@ -130,45 +137,53 @@ class CapPlanPlanner:
         # envelope, retaining V5 as an exact representation control. V7 removes
         # enumerate-then-compress and separates existential acceptance dominance
         # from diagnostic rejection dominance.
-        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9) and self.config.v2_reference_runtime)
-        use_v5_reference = bool((is_v6 or is_v7 or is_v8 or is_v9) and (not use_v2_reference) and self.config.v5_reference_runtime)
-        use_v6_reference = bool((is_v7 or is_v8 or is_v9) and (not use_v2_reference) and (not use_v5_reference) and self.config.v6_reference_runtime)
-        use_v7_reference = bool((is_v8 or is_v9) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and self.config.v7_reference_runtime)
-        use_v8_reference = bool(is_v9 and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and self.config.v8_reference_runtime)
+        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10) and self.config.v2_reference_runtime)
+        use_v5_reference = bool((is_v6 or is_v7 or is_v8 or is_v9 or is_v10) and (not use_v2_reference) and self.config.v5_reference_runtime)
+        use_v6_reference = bool((is_v7 or is_v8 or is_v9 or is_v10) and (not use_v2_reference) and (not use_v5_reference) and self.config.v6_reference_runtime)
+        use_v7_reference = bool((is_v8 or is_v9 or is_v10) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and self.config.v7_reference_runtime)
+        use_v8_reference = bool((is_v9 or is_v10) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and self.config.v8_reference_runtime)
+        use_v9_reference = bool(is_v10 and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and self.config.v9_reference_runtime)
         frontier_ranker = None
         if is_v3 and (not use_v2_reference) and (not self.config.no_frontier_ranker) and self.config.frontier_ranker_checkpoint:
             frontier_ranker = FrontierRanker(self.config.frontier_ranker_checkpoint, device=self.config.frontier_ranker_device)
-        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9) and not use_v2_reference)
+        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10) and not use_v2_reference)
         if is_v3 and not use_v2_reference:
             lambda_static = 0.0
         else:
             lambda_static = 0.0 if self.config.no_learned_feasibility_guidance else 0.20
         use_continuation = bool(is_v4 and (not use_v2_reference) and (not self.config.no_continuation_envelope))
-        use_viability = bool((is_v5 or is_v6 or is_v7 or is_v8 or is_v9) and (not use_v2_reference) and (not self.config.no_viability_kernel))
+        use_viability = bool((is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10) and (not use_v2_reference) and (not self.config.no_viability_kernel))
         use_direct_dual = bool(
             ((is_v7 and not use_v5_reference and not use_v6_reference)
-             or ((is_v8 or is_v9) and use_v7_reference))
+             or ((is_v8 or is_v9 or is_v10) and use_v7_reference))
             and use_viability
         )
         use_incremental_acceptance = bool(
-            ((is_v8 and not use_v7_reference) or (is_v9 and use_v8_reference))
+            ((is_v8 and not use_v7_reference) or (is_v9 and use_v8_reference) or (is_v10 and use_v8_reference))
             and use_viability and (not use_v5_reference) and (not use_v6_reference)
         )
         use_capability_projected_acceptance = bool(
-            is_v9 and use_viability and (not use_v2_reference) and (not use_v5_reference)
+            ((is_v9 and not use_v8_reference) or (is_v10 and use_v9_reference))
+            and use_viability and (not use_v2_reference) and (not use_v5_reference)
             and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference)
+        )
+        use_semnaive_projected_acceptance = bool(
+            is_v10 and use_viability and (not use_v2_reference) and (not use_v5_reference)
+            and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference)
+            and (not use_v9_reference)
         )
         use_precondition_antichain = bool(
             (is_v6 and use_viability and (not use_v5_reference))
             or (is_v7 and use_viability and (not use_v5_reference))
             or (is_v8 and use_viability and (not use_v5_reference))
             or (is_v9 and use_viability and (not use_v5_reference))
+            or (is_v10 and use_viability and (not use_v5_reference))
         ) and (not self.config.no_precondition_antichain)
         # V8 deliberately removes eager rejection/proof frontiers.  Its
         # certificate is generated on demand by exact forward replay.  V7
         # reference mode retains the old proof/rejection semantics.
         use_proof_envelope = bool(
-            ((is_v6 and not use_v5_reference) or (is_v7 and not use_v5_reference) or (is_v8 and use_v7_reference) or (is_v9 and use_v7_reference))
+            ((is_v6 and not use_v5_reference) or (is_v7 and not use_v5_reference) or (is_v8 and use_v7_reference) or (is_v9 and use_v7_reference) or (is_v10 and use_v7_reference))
             and use_viability and (not self.config.no_viability_proof_envelope)
         )
         use_rejection_antichain = bool(use_direct_dual and (not self.config.no_rejection_kernel))
@@ -195,6 +210,9 @@ class CapPlanPlanner:
                 use_direct_dual_precondition_kernel=use_direct_dual,
                 use_incremental_acceptance_kernel=use_incremental_acceptance,
                 use_capability_projected_acceptance_kernel=use_capability_projected_acceptance,
+                use_semnaive_projected_acceptance_kernel=use_semnaive_projected_acceptance,
+                semnaive_delta_propagation=not self.config.no_semnaive_delta_propagation,
+                packed_frontier_dominance=not self.config.no_packed_frontier_dominance,
                 capability_projection=not self.config.no_capability_projection,
                 frontier_signature_index=not self.config.no_frontier_signature_index,
                 use_rejection_antichain=use_rejection_antichain,
@@ -205,8 +223,8 @@ class CapPlanPlanner:
             frontier_ranker=frontier_ranker,
         )
         self._v8_lazy_diagnostic_replay = bool(
-            (is_v8 or is_v9)
-            and (use_incremental_acceptance or use_capability_projected_acceptance)
+            (is_v8 or is_v9 or is_v10)
+            and (use_incremental_acceptance or use_capability_projected_acceptance or use_semnaive_projected_acceptance)
             and (not self.config.no_lazy_diagnostic_replay)
         )
         self.diagnostic_searcher = None
