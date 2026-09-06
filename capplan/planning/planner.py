@@ -10,6 +10,7 @@ from capplan.models.casa_net import CASAInput, CASANet
 from capplan.models.frontier_ranker import FrontierRanker
 from capplan.planning.transition_generator import TransitionGenerator
 from capplan.planning.typed_safe_budget_search import ExactTransitionSemanticCache, SearchConfig, TypedSafeBudgetSearch
+from capplan.planning.compiled_transition_program import CompiledTransitionProgramCache
 from capplan.planning.trajectory_refinement import refine_trajectory
 from capplan.semantics.capability_compiler import CapabilityCompiler
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
@@ -111,6 +112,13 @@ class PlannerConfig:
     v11_reference_runtime: bool = False
     no_shared_diagnostic_semantic_cache: bool = False
     v12_legacy_static_guidance: bool = False
+    # V13 exact-diagnosis contingency after V12 SEDR STOP.  V13 compiles the
+    # ledger-independent part of each transition's passenger-specific typed
+    # semantics lazily inside proof replay, so reuse is across *ledgers* rather
+    # than requiring the same state/ledger tuple to recur.
+    v12_reference_runtime: bool = False
+    no_compiled_diagnostic_transition_program: bool = False
+    v13_legacy_static_guidance: bool = False
     # Control that replays the exact V5 path-by-path typed viability in the V6/V7
     # codebase.  It isolates representation/runtime changes from mechanism gain.
     v5_reference_runtime: bool = False
@@ -149,6 +157,7 @@ class CapPlanPlanner:
         is_v10 = version.startswith("V10")
         is_v11 = version.startswith("V11")
         is_v12 = version.startswith("V12")
+        is_v13 = version.startswith("V13")
         # V3 removes the empirically redundant completion-value head and replaces
         # V2's transition-static typed-feasibility prior with a learned local
         # frontier ranker.  V4 retired that ranker and tested a relaxed suffix
@@ -159,18 +168,19 @@ class CapPlanPlanner:
         # envelope, retaining V5 as an exact representation control. V7 removes
         # enumerate-then-compress and separates existential acceptance dominance
         # from diagnostic rejection dominance.
-        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12) and self.config.v2_reference_runtime)
-        use_v5_reference = bool((is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12) and (not use_v2_reference) and self.config.v5_reference_runtime)
-        use_v6_reference = bool((is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12) and (not use_v2_reference) and (not use_v5_reference) and self.config.v6_reference_runtime)
-        use_v7_reference = bool((is_v8 or is_v9 or is_v10 or is_v11 or is_v12) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and self.config.v7_reference_runtime)
-        use_v8_reference = bool((is_v9 or is_v10 or is_v11 or is_v12) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and self.config.v8_reference_runtime)
-        use_v9_reference = bool((is_v10 or is_v11 or is_v12) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and self.config.v9_reference_runtime)
-        use_v10_reference = bool((is_v11 or is_v12) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and self.config.v10_reference_runtime)
-        use_v11_reference = bool(is_v12 and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and (not use_v10_reference) and self.config.v11_reference_runtime)
+        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13) and self.config.v2_reference_runtime)
+        use_v5_reference = bool((is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13) and (not use_v2_reference) and self.config.v5_reference_runtime)
+        use_v6_reference = bool((is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13) and (not use_v2_reference) and (not use_v5_reference) and self.config.v6_reference_runtime)
+        use_v7_reference = bool((is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and self.config.v7_reference_runtime)
+        use_v8_reference = bool((is_v9 or is_v10 or is_v11 or is_v12 or is_v13) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and self.config.v8_reference_runtime)
+        use_v9_reference = bool((is_v10 or is_v11 or is_v12 or is_v13) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and self.config.v9_reference_runtime)
+        use_v10_reference = bool((is_v11 or is_v12 or is_v13) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and self.config.v10_reference_runtime)
+        use_v11_reference = bool((is_v12 or is_v13) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and (not use_v10_reference) and self.config.v11_reference_runtime)
+        use_v12_reference = bool(is_v13 and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and (not use_v10_reference) and (not use_v11_reference) and self.config.v12_reference_runtime)
         frontier_ranker = None
         if is_v3 and (not use_v2_reference) and (not self.config.no_frontier_ranker) and self.config.frontier_ranker_checkpoint:
             frontier_ranker = FrontierRanker(self.config.frontier_ranker_checkpoint, device=self.config.frontier_ranker_device)
-        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12) and not use_v2_reference)
+        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13) and not use_v2_reference)
         if is_v3 and not use_v2_reference:
             lambda_static = 0.0
         elif is_v11 and not use_v2_reference:
@@ -182,21 +192,27 @@ class CapPlanPlanner:
             # original ordering; V11 and full V12 default to exact symbolic order.
             historical_with_guidance = any([use_v5_reference, use_v6_reference, use_v7_reference, use_v8_reference, use_v9_reference, use_v10_reference])
             lambda_static = 0.20 if (historical_with_guidance or self.config.v12_legacy_static_guidance) else 0.0
+        elif is_v13 and not use_v2_reference:
+            # V12 repeated crossover makes the old static prior optional rather
+            # than a contribution.  Keep V13 mainline on exact symbolic ordering
+            # so the diagnostic-program experiment changes one factor only.
+            historical_with_guidance = any([use_v5_reference, use_v6_reference, use_v7_reference, use_v8_reference, use_v9_reference, use_v10_reference])
+            lambda_static = 0.20 if (historical_with_guidance or self.config.v13_legacy_static_guidance) else 0.0
         else:
             lambda_static = 0.0 if self.config.no_learned_feasibility_guidance else 0.20
         use_continuation = bool(is_v4 and (not use_v2_reference) and (not self.config.no_continuation_envelope))
-        use_viability = bool((is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12) and (not use_v2_reference) and (not self.config.no_viability_kernel))
+        use_viability = bool((is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13) and (not use_v2_reference) and (not self.config.no_viability_kernel))
         use_direct_dual = bool(
             ((is_v7 and not use_v5_reference and not use_v6_reference)
-             or ((is_v8 or is_v9 or is_v10 or is_v11 or is_v12) and use_v7_reference))
+             or ((is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13) and use_v7_reference))
             and use_viability
         )
         use_incremental_acceptance = bool(
-            ((is_v8 and not use_v7_reference) or (is_v9 and use_v8_reference) or (is_v10 and use_v8_reference) or (is_v11 and use_v8_reference) or (is_v12 and use_v8_reference))
+            ((is_v8 and not use_v7_reference) or (is_v9 and use_v8_reference) or (is_v10 and use_v8_reference) or (is_v11 and use_v8_reference) or (is_v12 and use_v8_reference) or (is_v13 and use_v8_reference))
             and use_viability and (not use_v5_reference) and (not use_v6_reference)
         )
         use_capability_projected_acceptance = bool(
-            ((is_v9 and not use_v8_reference) or (is_v10 and use_v9_reference) or (is_v11 and use_v9_reference) or (is_v12 and use_v9_reference))
+            ((is_v9 and not use_v8_reference) or (is_v10 and use_v9_reference) or (is_v11 and use_v9_reference) or (is_v12 and use_v9_reference) or (is_v13 and use_v9_reference))
             and use_viability and (not use_v2_reference) and (not use_v5_reference)
             and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference)
         )
@@ -214,6 +230,14 @@ class CapPlanPlanner:
                 and (not use_v6_reference) and (not use_v7_reference)
                 and (not use_v8_reference) and (not use_v9_reference)
             )
+            or (is_v13 and use_v11_reference)
+            or (
+                is_v13
+                and (not use_v2_reference) and (not use_v5_reference)
+                and (not use_v6_reference) and (not use_v7_reference)
+                and (not use_v8_reference) and (not use_v9_reference)
+                and (not use_v10_reference) and (not use_v11_reference)
+            )
         ) and use_viability
         use_native_projected_acceptance = bool(
             is_v11 and self.config.v11_native_quotient_experimental
@@ -229,12 +253,13 @@ class CapPlanPlanner:
             or (is_v10 and use_viability and (not use_v5_reference))
             or (is_v11 and use_viability and (not use_v5_reference))
             or (is_v12 and use_viability and (not use_v5_reference))
+            or (is_v13 and use_viability and (not use_v5_reference))
         ) and (not self.config.no_precondition_antichain)
         # V8 deliberately removes eager rejection/proof frontiers.  Its
         # certificate is generated on demand by exact forward replay.  V7
         # reference mode retains the old proof/rejection semantics.
         use_proof_envelope = bool(
-            ((is_v6 and not use_v5_reference) or (is_v7 and not use_v5_reference) or (is_v8 and use_v7_reference) or (is_v9 and use_v7_reference) or (is_v10 and use_v7_reference) or (is_v11 and use_v7_reference) or (is_v12 and use_v7_reference))
+            ((is_v6 and not use_v5_reference) or (is_v7 and not use_v5_reference) or (is_v8 and use_v7_reference) or (is_v9 and use_v7_reference) or (is_v10 and use_v7_reference) or (is_v11 and use_v7_reference) or (is_v12 and use_v7_reference) or (is_v13 and use_v7_reference))
             and use_viability and (not self.config.no_viability_proof_envelope)
         )
         use_rejection_antichain = bool(use_direct_dual and (not self.config.no_rejection_kernel))
@@ -276,7 +301,7 @@ class CapPlanPlanner:
             frontier_ranker=frontier_ranker,
         )
         self._v8_lazy_diagnostic_replay = bool(
-            (is_v8 or is_v9 or is_v10 or is_v11 or is_v12)
+            (is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13)
             and (use_incremental_acceptance or use_capability_projected_acceptance or use_semnaive_projected_acceptance or use_native_projected_acceptance)
             and (not self.config.no_lazy_diagnostic_replay)
         )
@@ -299,13 +324,24 @@ class CapPlanPlanner:
                 )
             )
         self._shared_diagnostic_semantic_cache_enabled = bool(
-            is_v12
-            and self._v8_lazy_diagnostic_replay
+            self._v8_lazy_diagnostic_replay
             and (not self.config.no_shared_diagnostic_semantic_cache)
+            and (
+                (is_v12 and (not use_v2_reference) and (not use_v5_reference)
+                 and (not use_v6_reference) and (not use_v7_reference)
+                 and (not use_v8_reference) and (not use_v9_reference)
+                 and (not use_v10_reference) and (not use_v11_reference))
+                or (is_v13 and use_v12_reference)
+            )
+        )
+        self._compiled_diagnostic_transition_program_enabled = bool(
+            is_v13 and self._v8_lazy_diagnostic_replay
+            and (not self.config.no_compiled_diagnostic_transition_program)
             and (not use_v2_reference) and (not use_v5_reference)
             and (not use_v6_reference) and (not use_v7_reference)
             and (not use_v8_reference) and (not use_v9_reference)
             and (not use_v10_reference) and (not use_v11_reference)
+            and (not use_v12_reference)
         )
 
     def plan(
@@ -347,6 +383,7 @@ class CapPlanPlanner:
         transition_semantic_cache = (
             ExactTransitionSemanticCache() if self._shared_diagnostic_semantic_cache_enabled else None
         )
+        compiled_transition_program_cache = None
         skeleton, cert, diag = self.searcher.search(
             episode_id, compiled, transitions, casa_out.transition_predictions,
             initial_anchor=initial_anchor, initial_phase="origin",
@@ -361,6 +398,14 @@ class CapPlanPlanner:
         diag["diagnostic_semantic_cache_misses"] = 0
         diag["diagnostic_semantic_cache_entries"] = (len(transition_semantic_cache) if transition_semantic_cache is not None else 0)
         diag["diagnostic_semantic_cache_primary_stores"] = (transition_semantic_cache.primary_stores if transition_semantic_cache is not None else 0)
+        diag["diagnostic_compiled_program_enabled"] = bool(self._compiled_diagnostic_transition_program_enabled)
+        diag["diagnostic_compiled_program_entries"] = 0
+        diag["diagnostic_compiled_program_hits"] = 0
+        diag["diagnostic_compiled_program_misses"] = 0
+        diag["diagnostic_compiled_program_compiles"] = 0
+        diag["diagnostic_compiled_program_applications"] = 0
+        diag["diagnostic_compiled_program_fallbacks"] = 0
+        diag["diagnostic_compiled_program_static_failures"] = 0
         # V8 proves existence/non-existence with the compact accepting frontier
         # but computes a concrete failure certificate only when the primary
         # search has actually failed.  Running this exact no-kernel replay only
@@ -372,11 +417,14 @@ class CapPlanPlanner:
             and self.diagnostic_searcher is not None
             and int(diag.get("viability_pruned", 0) or 0) > 0
         ):
+            if self._compiled_diagnostic_transition_program_enabled:
+                compiled_transition_program_cache = CompiledTransitionProgramCache()
             replay_skeleton, replay_cert, replay_diag = self.diagnostic_searcher.search(
                 episode_id, compiled, transitions, casa_out.transition_predictions,
                 initial_anchor=initial_anchor, initial_phase="origin",
                 transition_semantic_cache=transition_semantic_cache,
                 transition_semantic_cache_mode=("reuse" if transition_semantic_cache is not None else "off"),
+                compiled_transition_program_cache=compiled_transition_program_cache,
             )
             diag["diagnostic_replay_executed"] = True
             diag["diagnostic_replay_expansions"] = int(replay_diag.get("expansions", 0) or 0)
@@ -386,6 +434,14 @@ class CapPlanPlanner:
                 diag["diagnostic_semantic_cache_misses"] = int(transition_semantic_cache.misses)
                 diag["diagnostic_semantic_cache_entries"] = int(len(transition_semantic_cache))
                 diag["diagnostic_semantic_cache_primary_stores"] = int(transition_semantic_cache.primary_stores)
+            if compiled_transition_program_cache is not None:
+                diag["diagnostic_compiled_program_entries"] = int(len(compiled_transition_program_cache))
+                diag["diagnostic_compiled_program_hits"] = int(compiled_transition_program_cache.hits)
+                diag["diagnostic_compiled_program_misses"] = int(compiled_transition_program_cache.misses)
+                diag["diagnostic_compiled_program_compiles"] = int(compiled_transition_program_cache.compiles)
+                diag["diagnostic_compiled_program_applications"] = int(compiled_transition_program_cache.applications)
+                diag["diagnostic_compiled_program_fallbacks"] = int(compiled_transition_program_cache.fallbacks)
+                diag["diagnostic_compiled_program_static_failures"] = int(compiled_transition_program_cache.static_failures)
             if replay_skeleton is not None:
                 skeleton, cert = replay_skeleton, None
                 diag["diagnostic_replay_rescued_plan"] = True

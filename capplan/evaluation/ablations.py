@@ -68,6 +68,10 @@ ABLATION_FLAGS = {
     "v11_reference_runtime": {"v11_reference_runtime": True, "no_shared_diagnostic_semantic_cache": True},
     "no_shared_diagnostic_semantic_cache": {"no_shared_diagnostic_semantic_cache": True},
     "v12_legacy_static_guidance": {"v12_legacy_static_guidance": True},
+    # V13 compiled diagnostic-transition program controls.
+    "v12_reference_runtime": {"v12_reference_runtime": True},
+    "no_compiled_diagnostic_transition_program": {"no_compiled_diagnostic_transition_program": True},
+    "v13_legacy_static_guidance": {"v13_legacy_static_guidance": True},
 }
 
 MAIN_ABLATIONS = [

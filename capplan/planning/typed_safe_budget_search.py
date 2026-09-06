@@ -15,6 +15,11 @@ from capplan.planning.capability_continuation_envelope import (
     evaluate_continuation,
 )
 from capplan.planning.certificates import select_certificate
+from capplan.planning.compiled_transition_program import (
+    CompiledEvidenceUpdate,
+    CompiledTransitionProgram,
+    CompiledTransitionProgramCache,
+)
 from capplan.planning.capability_viability_kernel import (
     CapabilityViabilityKernel,
     build_capability_viability_kernel,
@@ -170,6 +175,7 @@ class TypedSafeBudgetSearch:
         initial_phase: str = "origin",
         transition_semantic_cache: ExactTransitionSemanticCache | None = None,
         transition_semantic_cache_mode: str = "off",
+        compiled_transition_program_cache: CompiledTransitionProgramCache | None = None,
     ):
         predictions = predictions or {}
         clauses = [] if (compiled.soft_only or self.config.soft_only_capability) else compiled.clauses
@@ -367,6 +373,13 @@ class TypedSafeBudgetSearch:
                     "transition_semantic_cache_misses": (transition_semantic_cache.misses if transition_semantic_cache is not None else 0),
                     "transition_semantic_cache_stores": (transition_semantic_cache.stores if transition_semantic_cache is not None else 0),
                     "transition_semantic_cache_primary_stores": (transition_semantic_cache.primary_stores if transition_semantic_cache is not None else 0),
+                    "compiled_transition_program_entries": (len(compiled_transition_program_cache) if compiled_transition_program_cache is not None else 0),
+                    "compiled_transition_program_hits": (compiled_transition_program_cache.hits if compiled_transition_program_cache is not None else 0),
+                    "compiled_transition_program_misses": (compiled_transition_program_cache.misses if compiled_transition_program_cache is not None else 0),
+                    "compiled_transition_program_compiles": (compiled_transition_program_cache.compiles if compiled_transition_program_cache is not None else 0),
+                    "compiled_transition_program_applications": (compiled_transition_program_cache.applications if compiled_transition_program_cache is not None else 0),
+                    "compiled_transition_program_fallbacks": (compiled_transition_program_cache.fallbacks if compiled_transition_program_cache is not None else 0),
+                    "compiled_transition_program_static_failures": (compiled_transition_program_cache.static_failures if compiled_transition_program_cache is not None else 0),
                     "viability_kernel": ({
                         "n_states": viability_kernel.n_states,
                         "n_valid_edges": viability_kernel.n_valid_edges,
@@ -395,10 +408,16 @@ class TypedSafeBudgetSearch:
                 candidates = list(outgoing.get((label.anchor, label.phase), []))
             pushable = []
             for e in candidates:
-                ok, new_ledger, step, vios = self._try_expand_with_semantic_cache(
-                    label, e, compiled, clauses, groups, predictions.get(e.transition_id),
-                    transition_semantic_cache, transition_semantic_cache_mode,
-                )
+                if compiled_transition_program_cache is not None:
+                    ok, new_ledger, step, vios = self._try_expand_with_compiled_transition_program(
+                        label, e, compiled, clauses, groups, predictions.get(e.transition_id),
+                        compiled_transition_program_cache,
+                    )
+                else:
+                    ok, new_ledger, step, vios = self._try_expand_with_semantic_cache(
+                        label, e, compiled, clauses, groups, predictions.get(e.transition_id),
+                        transition_semantic_cache, transition_semantic_cache_mode,
+                    )
                 if not ok:
                     violations.extend(vios)
                     continue
@@ -568,6 +587,18 @@ class TypedSafeBudgetSearch:
             "native_projected_fallbacks": (precondition_antichain.native_projected_fallbacks if precondition_antichain is not None else 0),
             "fused_frontier_passes": (precondition_antichain.fused_frontier_passes if precondition_antichain is not None else 0),
             "precondition_build_ms": (precondition_antichain.precondition_build_ms if precondition_antichain is not None else 0.0),
+            "transition_semantic_cache_entries": (len(transition_semantic_cache) if transition_semantic_cache is not None else 0),
+            "transition_semantic_cache_hits": (transition_semantic_cache.hits if transition_semantic_cache is not None else 0),
+            "transition_semantic_cache_misses": (transition_semantic_cache.misses if transition_semantic_cache is not None else 0),
+            "transition_semantic_cache_stores": (transition_semantic_cache.stores if transition_semantic_cache is not None else 0),
+            "transition_semantic_cache_primary_stores": (transition_semantic_cache.primary_stores if transition_semantic_cache is not None else 0),
+            "compiled_transition_program_entries": (len(compiled_transition_program_cache) if compiled_transition_program_cache is not None else 0),
+            "compiled_transition_program_hits": (compiled_transition_program_cache.hits if compiled_transition_program_cache is not None else 0),
+            "compiled_transition_program_misses": (compiled_transition_program_cache.misses if compiled_transition_program_cache is not None else 0),
+            "compiled_transition_program_compiles": (compiled_transition_program_cache.compiles if compiled_transition_program_cache is not None else 0),
+            "compiled_transition_program_applications": (compiled_transition_program_cache.applications if compiled_transition_program_cache is not None else 0),
+            "compiled_transition_program_fallbacks": (compiled_transition_program_cache.fallbacks if compiled_transition_program_cache is not None else 0),
+            "compiled_transition_program_static_failures": (compiled_transition_program_cache.static_failures if compiled_transition_program_cache is not None else 0),
             "viability_kernel": ({
                 "n_states": viability_kernel.n_states,
                 "n_valid_edges": viability_kernel.n_valid_edges,
@@ -583,6 +614,185 @@ class TypedSafeBudgetSearch:
                 "iterations": continuation_envelope.iterations,
             } if continuation_envelope is not None else None),
         }
+
+    def _compile_transition_program(
+        self,
+        e: CandidateTransition,
+        compiled: CompiledContract,
+        clauses: Sequence,
+        groups: Sequence,
+        pred: Optional[TransitionPrediction],
+    ) -> CompiledTransitionProgram:
+        """Compile ledger-independent transition semantics for one request.
+
+        This deliberately mirrors ``_try_expand``.  Only operations whose inputs
+        are fixed by ``(Psi, e, prediction, SearchConfig)`` are hoisted.  All
+        ledger-dependent update/group/satisfaction logic remains exact at apply
+        time, which makes the program safe for arbitrary replay ledgers.
+        """
+        active = tuple(active_clauses(clauses, [e.from_phase, e.to_phase]))
+        active_groups_for_edge = tuple(active_groups(groups, [e.from_phase, e.to_phase]))
+        grouped_clause_ids = frozenset(cid for g in active_groups_for_edge for cid in g.clause_ids)
+        active_by_resource: Dict[str, List[Any]] = {}
+        for c in active:
+            active_by_resource.setdefault(c.resource_name, []).append(c)
+
+        # Static gates after lifecycle legality.  Their violation record is fixed
+        # for the request and transition and can be returned without rebuilding
+        # clause/evidence bookkeeping.
+        static_failure: Tuple[ViolationRecord, ...] = ()
+        for attr, resource, reason in [
+            ("spatially_anchored", "anchor", "not_spatially_anchored"),
+            ("topologically_valid", "topology", "not_topologically_valid"),
+            ("physically_valid", "physical", "not_physically_valid"),
+        ]:
+            if not getattr(e.tests, attr):
+                static_failure = (ViolationRecord(e.to_phase, e.transition_id, resource, -1.0, "transition_tests", e.map_confidence, reason),)
+                break
+        if not static_failure and not e.tests.interface_valid:
+            static_failure = (ViolationRecord(e.to_phase, e.transition_id, "interface", -1.0, "transition_tests", e.map_confidence, ";".join(e.tests.reasons) or "interface_invalid"),)
+        a_hat = pred.dynamic_availability if pred else e.availability
+        if not static_failure and (a_hat < self.config.min_availability or not e.tests.dynamically_available or e.dynamic.get("blocked", False)):
+            static_failure = (ViolationRecord(e.to_phase, e.transition_id, "availability", float(a_hat) - self.config.min_availability, "prediction", e.map_confidence, "dynamic_unavailable"),)
+
+        evidence_list = tuple(pred.typed_evidence if pred else e.resource_evidence)
+        observed_resources = set()
+        updates: List[CompiledEvidenceUpdate] = []
+        observed_uncertainty: List[ViolationRecord] = []
+        for ev in evidence_list:
+            if not self.registry.has(ev.resource_name):
+                continue
+            observed_resources.add(ev.resource_name)
+            rt = self.registry.get(ev.resource_name)
+            clauses_for_resource = tuple(active_by_resource.get(ev.resource_name, []))
+            if rt.kind == "categorical" and clauses_for_resource:
+                prepared = ev.value if not ev.missing else MissingEvidence(ev.resource_name, e.to_phase, ev.reason or "not_observed", ev.source, ev.confidence)
+                categorical = True
+            else:
+                beta = self._beta_for(compiled, ev.resource_name)
+                if self.config.no_conservative_margins:
+                    beta = 0.0
+                elif beta is None:
+                    beta = self.config.beta
+                prepared = MissingEvidence(ev.resource_name, e.to_phase, ev.reason or "not_observed", ev.source, ev.confidence) if ev.missing or ev.value is None else conservative_value(ev.value, ev.sigma, rt, beta=float(beta))
+                categorical = False
+            updates.append(CompiledEvidenceUpdate(ev, ev.resource_name, rt, clauses_for_resource, categorical, prepared))
+
+        # Observed-edge uncertainty failures are fixed after excluding clauses
+        # whose semantics are governed by an any-of/all-of requirement group.
+        for c in active:
+            if c.id in grouped_clause_ids or c.resource_name not in observed_resources:
+                continue
+            for ev in evidence_list:
+                if ev.resource_name != c.resource_name:
+                    continue
+                uspec = compiled.uncertainty.get(c.resource_name)
+                if ev.missing and c.hard and c.missing_policy == "fail_closed":
+                    observed_uncertainty.append(ViolationRecord(e.to_phase, e.transition_id, c.resource_name, -1.0, ev.source, ev.confidence, "missing_evidence"))
+                if uspec and uspec.min_confidence > 0 and ev.confidence < uspec.min_confidence and c.hard:
+                    margin = (ev.confidence - uspec.min_confidence) / max(abs(uspec.min_confidence), 1e-9)
+                    observed_uncertainty.append(ViolationRecord(e.to_phase, e.transition_id, c.resource_name if c.resource_name == "map_confidence" else "map_confidence", margin, ev.source, ev.confidence, "low_confidence" if uspec.missing_policy != "inconclusive_if_low_confidence" else "inconclusive_low_confidence"))
+
+        unobserved = tuple(
+            c for c in active
+            if c.id not in grouped_clause_ids
+            and c.resource_name not in observed_resources
+            and c.hard and c.missing_policy == "fail_closed"
+        )
+        return CompiledTransitionProgram(
+            transition_id=str(e.transition_id), from_phase=str(e.from_phase), to_phase=str(e.to_phase), action=str(e.action),
+            active_clauses=active, active_groups=active_groups_for_edge,
+            grouped_clause_ids=grouped_clause_ids, observed_resources=frozenset(observed_resources),
+            updates=tuple(updates), unobserved_fail_closed_clauses=unobserved,
+            observed_uncertainty_violations=tuple(observed_uncertainty), static_failure=static_failure,
+        )
+
+    def _apply_compiled_transition_program(
+        self,
+        label: SearchLabel,
+        e: CandidateTransition,
+        compiled: CompiledContract,
+        program: CompiledTransitionProgram,
+    ):
+        """Apply a V13 transition program with exact V12 typed semantics."""
+        # Lifecycle remains label-dependent. In the normal enabled-automaton
+        # search label.phase == e.from_phase, but retaining the historical check
+        # keeps the compiled path exact under unexpected inputs.
+        if not self.automaton.legal(label.phase, e.action, e.to_phase) or not e.tests.legal_lifecycle:
+            return False, label.resource_ledger, None, [ViolationRecord(label.phase, e.transition_id, "lifecycle", -1.0, "service_automaton", 1.0, "illegal_lifecycle")]
+        if program.static_failure:
+            return False, label.resource_ledger, None, list(program.static_failure)
+        if self.config.no_typed_resource_ledger:
+            # The V13 publication path never uses scalar-ledger ablation for this
+            # optimization; preserve exact legacy semantics by fallback.
+            return self._try_expand(label, e, compiled, program.active_clauses, program.active_groups, None)
+
+        new_ledger = dict(label.resource_ledger)
+        for op in program.updates:
+            ev = op.evidence
+            if op.resource_name not in new_ledger:
+                new_ledger[op.resource_name] = MissingEvidence(op.resource_name, phase=e.to_phase)
+            if op.categorical and op.clauses_for_resource:
+                for c in op.clauses_for_resource:
+                    new_ledger[op.resource_name] = update_value(new_ledger.get(op.resource_name), op.prepared_value, op.resource_type, evidence=ev, clause=c)
+            else:
+                new_ledger[op.resource_name] = update_value(new_ledger.get(op.resource_name), op.prepared_value, op.resource_type, evidence=ev)
+
+        violations: List[ViolationRecord] = list(program.observed_uncertainty_violations)
+        for c in program.unobserved_fail_closed_clauses:
+            if is_missing(new_ledger.get(c.resource_name)) and (e.to_phase in c.phase_scope or e.from_phase in c.phase_scope or "all" in c.phase_scope):
+                violations.append(ViolationRecord(e.to_phase, e.transition_id, c.resource_name, -1.0, c.source, 0.0, "missing_evidence"))
+        if violations:
+            return False, new_ledger, None, violations
+
+        ok, margins, failed = satisfy_all(new_ledger, program.active_clauses, program.active_groups, self.registry)
+        if not ok:
+            for name in failed:
+                c = next((x for x in program.active_clauses if x.resource_name == name or x.id == name), None)
+                violations.append(ViolationRecord(e.to_phase, e.transition_id, name, signed_margin(new_ledger, c, self.registry) if c else -1.0, c.source if c else "capability_contract", c.confidence if c else e.map_confidence, "resource_or_interface"))
+            return False, new_ledger, None, violations
+        step = LedgerStep(e.transition_id, e.to_phase, e.action, dict(new_ledger), margins, [ev.__dict__ for ev in e.resource_evidence])
+        return True, new_ledger, step, []
+
+    def _try_expand_with_compiled_transition_program(
+        self,
+        label: SearchLabel,
+        e: CandidateTransition,
+        compiled: CompiledContract,
+        clauses: Sequence,
+        groups: Sequence,
+        pred: Optional[TransitionPrediction],
+        cache: CompiledTransitionProgramCache,
+    ):
+        """Lazy compile/apply wrapper for V13 diagnostic replay.
+
+        Cache keys are transition ids because every compiled ingredient is fixed
+        by the one request's contract/predictions/config.  Unlike V12, the cache
+        is *ledger agnostic*: the same program may be applied to many replay
+        ledgers, so useful reuse does not require primary/replay state overlap.
+        """
+        if self.config.no_typed_resource_ledger:
+            cache.fallbacks += 1
+            return self._try_expand(label, e, compiled, clauses, groups, pred)
+        cache.applications += 1
+        tid = str(e.transition_id)
+        if tid in cache.programs:
+            program = cache.programs[tid]
+            cache.hits += 1
+        else:
+            cache.misses += 1
+            try:
+                program = self._compile_transition_program(e, compiled, clauses, groups, pred)
+                cache.compiles += 1
+            except Exception:
+                program = None
+                cache.fallbacks += 1
+            cache.programs[tid] = program
+        if program is None:
+            return self._try_expand(label, e, compiled, clauses, groups, pred)
+        if program.static_failure:
+            cache.static_failures += 1
+        return self._apply_compiled_transition_program(label, e, compiled, program)
 
     def _try_expand_with_semantic_cache(
         self,

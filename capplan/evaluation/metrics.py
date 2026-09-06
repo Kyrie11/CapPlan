@@ -480,6 +480,17 @@ def diagnostic_semantic_cache_metric_mean(episodes: List[Dict[str, Any]], key: s
     return _mean([float(e.get(key, 0.0) or 0.0) for e in episodes])
 
 
+def diagnostic_compiled_program_reuse_rate(episodes: List[Dict[str, Any]]) -> float:
+    hits = sum(int(e.get("diagnostic_compiled_program_hits", 0) or 0) for e in episodes)
+    misses = sum(int(e.get("diagnostic_compiled_program_misses", 0) or 0) for e in episodes)
+    denom = hits + misses
+    return float(hits / denom) if denom else 0.0
+
+
+def diagnostic_compiled_program_metric_mean(episodes: List[Dict[str, Any]], key: str) -> float:
+    return _mean([float(e.get(key, 0.0) or 0.0) for e in episodes])
+
+
 def planning_latency_mean_ms(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("planning_latency_ms", 0.0)) for e in episodes if e.get("planning_latency_ms") is not None])
 
@@ -604,6 +615,14 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "DiagnosticSemanticCacheMissesMean": diagnostic_semantic_cache_metric_mean(episodes, "diagnostic_semantic_cache_misses"),
         "DiagnosticSemanticCacheEntriesMean": diagnostic_semantic_cache_metric_mean(episodes, "diagnostic_semantic_cache_entries"),
         "DiagnosticSemanticCachePrimaryStoresMean": diagnostic_semantic_cache_metric_mean(episodes, "diagnostic_semantic_cache_primary_stores"),
+        "DiagnosticCompiledProgramReuseRate": diagnostic_compiled_program_reuse_rate(episodes),
+        "DiagnosticCompiledProgramEntriesMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_entries"),
+        "DiagnosticCompiledProgramHitsMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_hits"),
+        "DiagnosticCompiledProgramMissesMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_misses"),
+        "DiagnosticCompiledProgramCompilesMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_compiles"),
+        "DiagnosticCompiledProgramApplicationsMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_applications"),
+        "DiagnosticCompiledProgramFallbacksMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_fallbacks"),
+        "DiagnosticCompiledProgramStaticFailuresMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_static_failures"),
         "PlannerLatency_ms_mean": planning_latency_mean_ms(episodes),
         "PlannerLatency_ms_p95": planning_latency_p95_ms(episodes),
     }

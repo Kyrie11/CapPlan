@@ -1138,3 +1138,139 @@ The legacy static learned ordering is classified separately: repeated timing can
 - Only a V12-full `GO` freezes the exact symbolic backbone and makes **Capability-Query Heterogeneous Polyline Transformer (CQ-HPT)** the next main learned-algorithm version.
 
 CQ-HPT must be derived from the frozen capability program: compiled phase/resource/group state queries lower-level heterogeneous pedestrian/polyline, PUDO/interface, vehicle, legality, provenance, and dynamic-agent evidence. HGT/polyline/KNN/query/context-reuse primitives are not contributions in isolation. The network may estimate evidence reliability, dynamic availability, calibrated uncertainty, soft ordering, or amortized kernel proposals; exact `Allow/Update/Sat` and the capability kernel retain hard authority.
+
+## V12-fast seed13 decision — SEDR is exact but falsified as the diagnosis-runtime closure
+
+**Date:** 2026-09-06  
+**Decision:** `STOP` under the preregistered V12-fast gate. The result package is attribution-valid on the deterministic `256` episodes / `2048` passenger requests. All semantic, typed-search and exact-diagnosis-equivalence gates pass; only the repeated runtime-closure gate fails.
+
+### Reliability / exactness
+
+Full V12 keeps `PCDecisionF1=1`, FAR=FRR=`0`, and is exactly identical to the V11 reference at the passenger-decision, primary TSBS-expansion, skeleton, certificate-signature and **full certificate JSON** levels. T5 is retained (`phase/resource/source macro-F1 ~= 0.832/0.665/0.630`, certificate exact `~=0.768`). `DiagnosticReplayRescueRate=0`. This is not a wiring/runtime-collapse result; it can be used for mechanism attribution.
+
+The core typed mechanism also remains strong. Relative to V2, mean expansions are `18.879 -> 4.222` (`~77.6%` reduction). Relative to structural-only, `13.155 -> 4.222`, with a positive episode-clustered paired CI. V12 therefore provides no evidence to reopen passenger-complete semantics, typed capability algebra, capability-projected backward viability or the SN-CPK acceptance representation.
+
+### SEDR mechanism result — exact but negative
+
+V12's Shared Executable-Semantics Diagnostic Replay is semantically exact, but its reuse premise is weak in the actual failure-replay workload:
+
+- exact semantic-cache hit rate: `~4.19%`;
+- primary stores: `~10.39/request`;
+- replay hits: `~1.36/request`;
+- replay misses: `~31.08/request`;
+- diagnostic replay executes on `~34.13%` of requests.
+
+The structural interpretation is important: primary search is success/viability directed, whereas exact failure explanation must visit a substantially different state/ledger support. Exact `(state, ledger, edge)` memoization therefore rarely transfers enough work from primary search to diagnostic replay.
+
+Three counterbalanced serial timing repeats confirm that this is not a fixed-order artifact:
+
+- V11 reference mean: `38.578 ms/request`;
+- V12 mean: `40.147 ms/request`;
+- `V11 - V12 = -1.569 ms/request`;
+- episode-clustered 95% CI `[-2.499, -0.629] ms`.
+
+V12 is therefore reliably **slower** than V11. Against repeated V2 (`17.871 ms`), V12 is `~2.246x`, so the historical total cold-latency gate also fails.
+
+**RETIRE V12 SEDR as an optimization mechanism.** Keep it only as an exact negative control showing that state-level primary/replay memoization is the wrong abstraction for this hot path. Do not create another exact-state-cache variant.
+
+### Exact rejection remains a frozen semantic requirement
+
+Disabling exact proof-on-demand leaves primary decisions and expansions unchanged but reduces T5 by approximately:
+
+- phase macro-F1: `-0.269`;
+- resource macro-F1: `-0.179`;
+- source macro-F1: `-0.179`;
+- exact certificate: `-0.080`.
+
+Thus the negative V12 runtime result does **not** justify deleting exact rejection. It separates two objects:
+
+1. the **semantic requirement** — verifier-aligned exact rejection under the same executable passenger program — remains frozen;
+2. the current no-kernel replay / shared-state memoization are replaceable implementations.
+
+Future reports must separate **primary-decision latency**, **conditional exact-rejection overhead**, and **end-to-end latency**.
+
+### Legacy transition-static learned guidance
+
+The repeated V12 crossover classifies the historical static guidance as `KEEP_OPTIONAL`: it reduces expansions `4.222 -> 3.956` and, in this repeated run, is about `1.265 ms/request` faster than V12 full (95% CI `[-2.197,-0.362]` for legacy-minus-full). Because its sign changed across earlier V10/V11 timing contexts and the effect is small, it remains **secondary** rather than a paper contribution or hard backbone component. V13 continues the repeated crossover control.
+
+### Freeze decision after V12
+
+Continue to freeze the semantic hierarchy:
+
+`Passenger-Complete Planning -> Compiled Passenger Capability Program -> Evidence-Grounded Typed Service Semantics -> Forward Consumed Ledger × Capability-Projected Backward Executable Preconditions -> Verifier-Aligned Typed Safe-Budget Search -> Passenger-Complete Execution OR Exact Executable Rejection`.
+
+Continue to freeze the three paper contributions at the semantic level:
+
+1. Passenger-Complete Planning;
+2. Capability-Compiled Quotient Executable Semantics;
+3. Verifier-Aligned Exact Rejection and Counterfactual Benchmark.
+
+Do **not** make CQ-HPT the V13 mainline yet. V12's preregistered STOP branch permits exactly one diagnosis-representation contingency before learned raw-evidence modeling. The STOP is still in exact rejection extraction, not in scene representation learning.
+
+## V13 — Capability-Compiled Diagnostic Transition Programs (CDTP)
+
+**Status:** implemented next candidate; one final selector-preserving exact-diagnosis contingency. No retraining is required. V11 SN-CPK acceptance semantics remain unchanged.
+
+### Motivation: compile the reusable object V12 did not cache
+
+For a fixed passenger request, the exact transition evaluator can be written
+
+`E_Psi(R,e) = _try_expand(R,e; Psi)`.
+
+V12 cached the full result keyed by an exact incoming ledger. That key almost never repeated between primary search and diagnosis. V13 instead compiles only the part invariant to the incoming ledger:
+
+`Gamma_e^Psi = CompileTransition(Psi, e, prediction, SearchConfig)`.
+
+`Gamma_e^Psi` contains:
+
+- active phase-scoped clauses and requirement groups;
+- registered typed evidence/update operators;
+- conservative evidence values and uncertainty checks;
+- lifecycle-independent spatial/topological/interface/dynamic hard failures;
+- fail-closed observation conditions.
+
+Application to an arbitrary replay ledger still executes the exact registered typed update, requirement-group satisfaction, signed-margin construction and violation records:
+
+`Apply(Gamma_e^Psi, R) == E_Psi(R,e)`.
+
+The cache key is therefore only the request-local `transition_id`, not `(state, ledger, edge)`. The same compiled transition program may be applied to many diagnostic replay ledgers.
+
+### Authority and exactness
+
+CDTP is not learned, does not change `Allow/Update/Sat`, does not alter the SN-CPK acceptance frontier, and does not change the canonical certificate selector. It is enabled **only for proof-on-demand diagnostic replay** in V13 full. Unsupported/unusual cases fall back to the historical exact `_try_expand` path and are counted; the promotion gate requires zero fallback on the fast selection subset.
+
+Historical controls:
+
+- `v11_reference_runtime`: exact V11 no-cache proof replay;
+- `v12_reference_runtime`: exact V12 state/ledger cache negative control;
+- `no_compiled_diagnostic_transition_program`: direct V13 causal control, identical to V11 replay;
+- `v2_reference_runtime`;
+- `no_typed_viability`;
+- `no_lazy_diagnostic_replay`;
+- `v13_legacy_static_guidance`: secondary repeated crossover only.
+
+### V13-fast preregistration
+
+GO requires all of:
+
+1. `PCDecisionF1>=0.99`, FAR=FRR=`0`;
+2. zero V13/V11 passenger-decision and primary-expansion mismatch;
+3. zero V13/V11 skeleton mismatch, certificate-signature mismatch and **full certificate JSON mismatch**;
+4. all four T5 metrics `>= V2-0.01`;
+5. typed viability beats structural-only with positive episode-clustered expansion CI; typed pruning fires; kernel is complete;
+6. CDTP actually compiles and reuses programs: positive compile count, positive reuse, applications greater than compiles, and zero fallback on the selection subset;
+7. exact rejection still leaves primary decisions/expansions unchanged, materially restores T5, and rescue rate remains `0`;
+8. in three counterbalanced serial timing blocks, V13 is faster than the direct `no_compiled_diagnostic_transition_program` control with positive episode-clustered CI lower bound;
+9. repeated V13 end-to-end latency is `<=2x` repeated V2, with zero decision mismatch.
+
+### Hard stop after this contingency
+
+If V13-fast is `STOP`, **do not create V14 as another diagnostic cache/program micro-optimization**. At that point the evidence chain is sufficient to freeze the symbolic semantic backbone even if explanation runtime remains a separately reported systems cost. Preserve exact replay as the reference implementation, report primary-decision and explanation latency separately, and move the next **algorithmic** mainline to CQ-HPT under exact symbolic authority.
+
+If V13-fast is `GO`, run the 997-episode V13 full confirmation. Only full GO promotes CDTP from an implementation candidate. Whether CDTP GO or STOP, it is not intended to become a fourth headline paper contribution.
+
+### CQ-HPT remains the planned learned mainline, not the current V13 mechanism
+
+A future CQ-HPT must be motivated by the passenger capability program's need to retrieve lower-level heterogeneous service evidence, not by the existence of Transformer backbones. Its query is the compiled phase / active clause-group / forward residual / kernel state; keys/values are raw pedestrian polylines, entrance/frontage, curb/PUDO/interface geometry, raw elevation primitives, dynamic agents/occupancy, stop legality and provenance/confidence. The learned outputs are reliability, dynamics, calibrated uncertainty, soft ordering or amortized proposals. Exact `Allow/Update/Sat` retain hard authority.
+
+HGT, heterogeneous driving graphs, polyline Transformers, KNN relative-pose attention, query-centric context reuse, sparse interaction graphs and goal-conditioned planning queries are all prior architectural ingredients; none is a contribution in isolation. CQ-HPT must demonstrate that **capability-program-conditioned evidence routing** itself provides incremental value.
