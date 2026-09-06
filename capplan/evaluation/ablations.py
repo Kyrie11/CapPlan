@@ -57,6 +57,11 @@ ABLATION_FLAGS = {
     "v9_reference_runtime": {"v9_reference_runtime": True},
     "no_semnaive_delta_propagation": {"no_semnaive_delta_propagation": True},
     "no_packed_frontier_dominance": {"no_packed_frontier_dominance": True},
+    # V11 exact-backbone closure and exploratory native-quotient controls.
+    "v10_reference_runtime": {"v10_reference_runtime": True},
+    "v11_legacy_static_guidance": {"v11_legacy_static_guidance": True},
+    "v11_native_quotient_experimental": {"v11_native_quotient_experimental": True},
+    "v11_native_no_fused": {"v11_native_quotient_experimental": True, "no_fused_frontier_insertion": True},
 }
 
 MAIN_ABLATIONS = [

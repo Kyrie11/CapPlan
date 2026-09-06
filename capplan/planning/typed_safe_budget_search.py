@@ -31,6 +31,7 @@ from capplan.planning.direct_capability_precondition_kernel import build_direct_
 from capplan.planning.incremental_capability_precondition_kernel import build_incremental_acceptance_kernel
 from capplan.planning.capability_projected_precondition_kernel import build_capability_projected_acceptance_kernel
 from capplan.planning.semnaive_capability_projected_kernel import build_semnaive_capability_projected_acceptance_kernel
+from capplan.planning.native_capability_projected_kernel import build_native_capability_projected_acceptance_kernel
 from capplan.semantics.capability_compiler import CompiledContract, UncertaintySpec
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
 from capplan.semantics.service_automaton import ServiceAutomaton
@@ -89,6 +90,9 @@ class SearchConfig:
     # V10: exact V9 semantics with semi-naive delta propagation and an optional
     # packed implementation of the same capability-projected dominance order.
     use_semnaive_projected_acceptance_kernel: bool = False
+    # V11: compose directly in the capability-induced quotient coordinates.
+    use_native_projected_acceptance_kernel: bool = False
+    native_fused_frontier_insertion: bool = True
     semnaive_delta_propagation: bool = True
     packed_frontier_dominance: bool = True
     capability_projection: bool = True
@@ -172,11 +176,22 @@ class TypedSafeBudgetSearch:
                     or self.config.use_incremental_acceptance_kernel
                     or self.config.use_capability_projected_acceptance_kernel
                     or self.config.use_semnaive_projected_acceptance_kernel
+                    or self.config.use_native_projected_acceptance_kernel
                 ),
             )
         precondition_antichain: CapabilityPreconditionAntichain | None = None
         if viability_kernel is not None and self.config.use_precondition_antichain and self.config.viability_typed_pruning:
-            if self.config.use_semnaive_projected_acceptance_kernel:
+            if self.config.use_native_projected_acceptance_kernel:
+                precondition_antichain = build_native_capability_projected_acceptance_kernel(
+                    viability_kernel, compiled, predictions, self.registry,
+                    no_conservative_margins=self.config.no_conservative_margins,
+                    default_beta=self.config.beta,
+                    max_frontier_per_state=self.config.viability_max_paths_per_state,
+                    max_depth=self.config.viability_max_depth,
+                    use_capability_projection=self.config.capability_projection,
+                    use_fused_frontier_insertion=self.config.native_fused_frontier_insertion,
+                )
+            elif self.config.use_semnaive_projected_acceptance_kernel:
                 precondition_antichain = build_semnaive_capability_projected_acceptance_kernel(
                     viability_kernel, compiled, predictions, self.registry,
                     no_conservative_margins=self.config.no_conservative_margins,
@@ -318,6 +333,10 @@ class TypedSafeBudgetSearch:
                     "frontier_mask_rejects": (precondition_antichain.frontier_mask_rejects if precondition_antichain is not None else 0),
                     "frontier_packed_fastpath": (precondition_antichain.frontier_packed_fastpath if precondition_antichain is not None else 0),
                     "frontier_packed_fallbacks": (precondition_antichain.frontier_packed_fallbacks if precondition_antichain is not None else 0),
+                    "native_projected_compositions": (precondition_antichain.native_projected_compositions if precondition_antichain is not None else 0),
+                    "native_projected_materializations": (precondition_antichain.native_projected_materializations if precondition_antichain is not None else 0),
+                    "native_projected_fallbacks": (precondition_antichain.native_projected_fallbacks if precondition_antichain is not None else 0),
+                    "fused_frontier_passes": (precondition_antichain.fused_frontier_passes if precondition_antichain is not None else 0),
                     "precondition_build_ms": (precondition_antichain.precondition_build_ms if precondition_antichain is not None else 0.0),
                     "viability_kernel": ({
                         "n_states": viability_kernel.n_states,
@@ -512,6 +531,10 @@ class TypedSafeBudgetSearch:
             "frontier_mask_rejects": (precondition_antichain.frontier_mask_rejects if precondition_antichain is not None else 0),
             "frontier_packed_fastpath": (precondition_antichain.frontier_packed_fastpath if precondition_antichain is not None else 0),
             "frontier_packed_fallbacks": (precondition_antichain.frontier_packed_fallbacks if precondition_antichain is not None else 0),
+            "native_projected_compositions": (precondition_antichain.native_projected_compositions if precondition_antichain is not None else 0),
+            "native_projected_materializations": (precondition_antichain.native_projected_materializations if precondition_antichain is not None else 0),
+            "native_projected_fallbacks": (precondition_antichain.native_projected_fallbacks if precondition_antichain is not None else 0),
+            "fused_frontier_passes": (precondition_antichain.fused_frontier_passes if precondition_antichain is not None else 0),
             "precondition_build_ms": (precondition_antichain.precondition_build_ms if precondition_antichain is not None else 0.0),
             "viability_kernel": ({
                 "n_states": viability_kernel.n_states,

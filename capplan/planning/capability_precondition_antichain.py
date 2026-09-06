@@ -113,6 +113,13 @@ class CapabilityPreconditionAntichain:
     frontier_mask_rejects: int = 0
     frontier_packed_fastpath: int = 0
     frontier_packed_fallbacks: int = 0
+    # V11 native quotient-kernel instrumentation.  V11 composes directly in
+    # the capability-projected coordinates instead of allocating a full
+    # SuffixEffectSummary and then packing it for every fixed-point candidate.
+    native_projected_compositions: int = 0
+    native_projected_materializations: int = 0
+    native_projected_fallbacks: int = 0
+    fused_frontier_passes: int = 0
     precondition_build_ms: float = 0.0
 
     def state_summaries(self, state: State) -> Tuple[SuffixEffectSummary, ...]:

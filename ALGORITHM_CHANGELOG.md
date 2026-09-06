@@ -918,3 +918,96 @@ GO requires all of:
 8. lazy replay preserves primary decisions/expansions, materially improves T5, fires on failures, and rescue rate remains zero.
 
 Only `v10_fast_gate.json: status=GO` permits the 997-episode V10 confirmatory run. A genuine heterogeneous evidence network remains a later, separately attributable layer; it is not allowed to mask an unresolved exact-kernel construction bottleneck.
+
+## V10-fast seed13 decision — exact mechanisms GO, preregistered runtime still STOP
+
+**Date:** 2026-09-05  
+**Decision:** `STOP` under the preregistered V10-fast gate.  The experiment is attribution-valid on the fixed 256-episode / 2048-request mechanism-selection subset.  All semantic/search/mechanism checks pass; the sole failing check is the previously frozen `mean latency <= 2x V2` condition.
+
+### Reliability and exactness
+
+All ten V10 variants cover the same request universe and report `algorithm_attribution_ready=true` without warnings.  Full V10 has `PCDecisionF1=1`, FAR=FRR=`0`, and has zero request-level passenger-decision and TSBS-expansion mismatch versus the exact V9 reference.  T5 exactly retains the V2 reference (`phase/resource/source macro-F1 = 0.82969/0.66456/0.63013`, certificate exact `0.76749`).  The run therefore supports causal mechanism attribution; it is not a V1-style runtime collapse.
+
+The promoted passenger-specific typed backward mechanism remains strong: V2 `18.879 -> V10 3.956` mean expansions (about `79.05%`), and structural-only `12.159 -> 3.956`, with a positive episode-clustered paired CI.
+
+### Semi-naive delta propagation is promoted
+
+Holding passenger decisions, request-level expansions, packed dominance, capability projection, and diagnostic policy fixed, disabling semi-naive delta propagation increases mean latency from about `45.91` to `53.82 ms/request`.  The paired saving is about `7.90 ms/request` with a positive clustered 95% CI.  It also increases fixed-point candidates/dominance work.  Semi-naive differential propagation is therefore retained as an exact construction mechanism.
+
+### Packed exact dominance is promoted
+
+Holding the semi-naive worklist and all passenger/search semantics fixed, restoring the V9 object comparator increases mean latency to about `54.39 ms/request`.  Full packed dominance saves about `8.48 ms/request` with a positive clustered 95% CI, exercises the exact fast path, and produces zero passenger/expansion mismatch.  Packed dominance is therefore retained as an implementation of the same capability-projected partial order, not as a new feasibility relaxation.
+
+### Lazy exact proof remains mandatory
+
+Disabling proof-on-demand replay leaves primary passenger decisions and expansions unchanged but degrades phase/resource/source/exact diagnosis by approximately `0.267/0.179/0.179/0.079`.  `DiagnosticReplayRescueRate=0`.  Exact proof-on-demand remains part of the semantic backbone despite its runtime cost; a faster but diagnostically lossy reverse-rejection abstraction is not reintroduced.
+
+### Why V10 still STOPs
+
+Full V10 latency is about `45.91 ms/request`; the paired historical V2 reference is about `21.47 ms/request`, so the frozen bound is about `42.93 ms`.  Full V10 misses it by about `2.98 ms` (`~2.14x V2`).  V10 nevertheless beats V9 (~`72.45 ms`) and V5 (~`132.61 ms`) with positive paired clustered CIs.
+
+A new causal finding determines the next version.  The historical transition-static learned feasibility guidance reduces expansions only from `4.222 -> 3.956` (about `0.266/request`) but **increases** paired wall-clock latency by about `3.87 ms/request`, 95% CI approximately `[2.22,5.52] ms`.  The exact same V10 kernel with that guidance disabled runs at about `42.04 ms/request`, already below the contemporaneous `2x V2` threshold, while keeping `PCDecisionF1=1`, FAR=FRR=`0` and equal/slightly better T5.
+
+Therefore:
+
+- **PROMOTE / freeze:** Passenger-Complete semantics; Capability-as-Typed-Feasibility; evidence-grounded hard authority; conservative typed margins; passenger-specific typed backward viability; capability projection; semi-naive delta propagation; packed exact dominance; proof-on-demand exact diagnosis.
+- **RETIRE from the default exact backbone:** the legacy transition-static learned feasibility prior.  It remains only as a historical causal control.
+- **REMAIN RETIRED:** completion-value head; V3 ECF single-trace ranker; V4 continuation priority / independent-resource CCE as main novelty; V5 suffix replay as final representation; V6 enumerate-then-compress; V7 reverse rejection antichain; neural overwrite of hard evidence.
+- **DO NOT yet promote CQ-HPT under the V10 preregistration.** V10 is formally STOP.  First run a minimal V11 confirmation that removes the now-demonstrated net-negative learned component and rechecks the cold runtime bound in an opposite variant order.
+
+## V11 — Lean SN-CPK Backbone Closure + Exploratory Native Quotient Branch
+
+**Status:** implemented next candidate.  V11-A is the final confirmatory exact-backbone closure before the heterogeneous learned encoder.  V11-B is an exploratory exact representation branch and cannot determine the V11-A GO/STOP decision.  No retraining is required for the first V11 experiment.
+
+### V11-A confirmatory design
+
+V11-A deliberately introduces **no new hard passenger semantics** and no new learned model.  It is the already validated V10 stack:
+
+`evidence-grounded typed semantics + capability projection + semi-naive SN-CPK + packed exact dominance + typed TSBS + proof-on-demand exact diagnosis`,
+
+with the transition-static learned feasibility guidance removed from the default queue priority.
+
+This is the minimum scientifically sufficient intervention because V10-fast directly identified that guidance as a net wall-clock regression.  Historical `v10_reference_runtime` restores the exact V10 policy (`lambda_learned_feasibility=0.2`) on the same SN-CPK; `v11_legacy_static_guidance` is a second explicit causal control.
+
+V11 fast also repeats a focused `V2 -> V10 -> V11` timing suite in an opposite order.  The exact-backbone freeze therefore cannot depend on one fixed ablation ordering or transient warm-up state.
+
+### V11-A preregistration
+
+GO requires all of:
+
+1. `PCDecisionF1>=0.99`, FAR=FRR=`0`, and zero passenger-decision mismatch versus V10;
+2. all four T5 macro/exact metrics `>= V2-0.01`;
+3. typed V11 beats structural-only in paired expansions with episode-cluster 95% CI lower bound `>0`, typed pruning fires, and the fast subset has no incomplete hard-pruning states;
+4. the legacy static guidance has zero passenger-decision mismatch, reduces a small number of expansions, **but V11 without it is faster with a positive paired clustered latency CI**.  If the net-latency regression does not replicate, the retirement decision is revisited rather than assumed;
+5. V11 beats historical V10 and V5 latency with positive clustered CIs;
+6. V11 mean latency is `<=2x V2` in both the primary suite and the opposite-order timing recheck;
+7. proof-on-demand preserves primary decisions/expansions, improves at least one preregistered T5 metric by `>=0.02` without degrading the others, replay fires on failures, and rescue rate remains `0`.
+
+Only `v11_fast_gate.json: status=GO` permits the 997-episode V11 confirmation and then makes CQ-HPT the next **main learned algorithm version**.
+
+### V11-B exploratory native quotient composition
+
+V10 still pays object-construction overhead because a candidate is first materialized as a `SuffixEffectSummary` and then packed into capability-projected dominance coordinates.  V11 includes an optional `v11_native_quotient_experimental` branch that compiles each valid edge once and performs semi-naive fixed-point composition directly in the passenger-induced quotient coordinates:
+
+- numeric typed effects are normalized so “smaller is no worse”; cumulative/upper/lower/probabilistic composition uses the registered forward algebra;
+- required-observation, active-clause and active-group conditions are integer masks;
+- categorical/interface effects retain the same conservative predicate ordering;
+- only final nondominated frontier elements are materialized back into the historical summary object consumed by TSBS;
+- unsupported/unusual representations fail open to the exact V10 SN-CPK builder rather than approximating passenger feasibility;
+- an optional fused frontier traversal performs both dominance directions in one pass.
+
+This branch is **not** a V11 headline mechanism.  It is promoted only if it has zero decision/expansion mismatch against V11-A, no fallback on the selection subset, and a positive paired clustered wall-clock gain.  Otherwise it is stopped/revised without blocking V11-A or changing the paper method.
+
+### What follows a V11-A GO
+
+After V11-A GO and the 997-episode confirmation, freeze the exact passenger/service backbone.  The next learned version should then be a genuine **Capability-Query Heterogeneous Polyline Transformer (CQ-HPT)** rather than vanilla HGT.  Its distinguishing task is to use the compiled capability/search state as a query over lower-level heterogeneous service evidence for reliability, dynamics, calibrated uncertainty, soft ordering, or amortized kernel proposals.  Exact `Allow/Update/Sat` and the capability kernel retain hard authority.  Final verifier targets such as slope/width/clearance must not be fed back as inputs merely to predict themselves.
+
+### V11 implementation validation before server experiment
+
+- `python -m compileall -q capplan scripts`: PASS.
+- V10/V11 focused regression: `9/9 PASS`.
+- Full repository split validation: `114/114 + 108/108 + 52/52 = 274/274 PASS`.
+- `run_v11_fast_experiments.sh`, `run_v11_full_experiments.sh`, and `pack_v11_results.sh`: Bash syntax PASS.
+- `assess_v11_fast.py` and `summarize_v11_results.py`: Python compile PASS.
+
+These are implementation/regression checks only; V11 remains an unpromoted candidate until the preregistered server fast experiment is run.
