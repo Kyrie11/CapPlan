@@ -62,6 +62,12 @@ ABLATION_FLAGS = {
     "v11_legacy_static_guidance": {"v11_legacy_static_guidance": True},
     "v11_native_quotient_experimental": {"v11_native_quotient_experimental": True},
     "v11_native_no_fused": {"v11_native_quotient_experimental": True, "no_fused_frontier_insertion": True},
+    # V12 exact-diagnosis closure controls. Full V12 shares exact forward
+    # transition semantics with proof-on-demand replay. The V11 reference/no-
+    # cache control preserves the historical full restart exactly.
+    "v11_reference_runtime": {"v11_reference_runtime": True, "no_shared_diagnostic_semantic_cache": True},
+    "no_shared_diagnostic_semantic_cache": {"no_shared_diagnostic_semantic_cache": True},
+    "v12_legacy_static_guidance": {"v12_legacy_static_guidance": True},
 }
 
 MAIN_ABLATIONS = [

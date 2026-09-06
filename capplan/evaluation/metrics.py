@@ -470,6 +470,15 @@ def diagnostic_replay_expansions_mean(episodes: List[Dict[str, Any]]) -> float:
 def diagnostic_replay_rescue_rate(episodes: List[Dict[str, Any]]) -> float:
     return _mean([1.0 if e.get("diagnostic_replay_rescued_plan", False) else 0.0 for e in episodes])
 
+def diagnostic_semantic_cache_hit_rate(episodes: List[Dict[str, Any]]) -> float:
+    hits = sum(int(e.get("diagnostic_semantic_cache_hits", 0) or 0) for e in episodes)
+    misses = sum(int(e.get("diagnostic_semantic_cache_misses", 0) or 0) for e in episodes)
+    denom = hits + misses
+    return float(hits / denom) if denom else 0.0
+
+def diagnostic_semantic_cache_metric_mean(episodes: List[Dict[str, Any]], key: str) -> float:
+    return _mean([float(e.get(key, 0.0) or 0.0) for e in episodes])
+
 
 def planning_latency_mean_ms(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("planning_latency_ms", 0.0)) for e in episodes if e.get("planning_latency_ms") is not None])
@@ -590,6 +599,11 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "DiagnosticReplayRate": diagnostic_replay_rate(episodes),
         "DiagnosticReplayExpansionsMean": diagnostic_replay_expansions_mean(episodes),
         "DiagnosticReplayRescueRate": diagnostic_replay_rescue_rate(episodes),
+        "DiagnosticSemanticCacheHitRate": diagnostic_semantic_cache_hit_rate(episodes),
+        "DiagnosticSemanticCacheHitsMean": diagnostic_semantic_cache_metric_mean(episodes, "diagnostic_semantic_cache_hits"),
+        "DiagnosticSemanticCacheMissesMean": diagnostic_semantic_cache_metric_mean(episodes, "diagnostic_semantic_cache_misses"),
+        "DiagnosticSemanticCacheEntriesMean": diagnostic_semantic_cache_metric_mean(episodes, "diagnostic_semantic_cache_entries"),
+        "DiagnosticSemanticCachePrimaryStoresMean": diagnostic_semantic_cache_metric_mean(episodes, "diagnostic_semantic_cache_primary_stores"),
         "PlannerLatency_ms_mean": planning_latency_mean_ms(episodes),
         "PlannerLatency_ms_p95": planning_latency_p95_ms(episodes),
     }

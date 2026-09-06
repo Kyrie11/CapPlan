@@ -128,6 +128,28 @@ class SearchLabel:
         return {"anchor": self.anchor, "phase": self.phase, "resource_ledger": self.resource_ledger, "cost": self.cost}
 
 
+@dataclass
+class ExactTransitionSemanticCache:
+    """Request-local memo for exact forward transition semantics (V12).
+
+    The key contains the exact typed forward ledger signature, service state and
+    transition id.  A cache entry is therefore valid only inside one compiled
+    passenger request, where the contract, predictions, evidence and search
+    semantics are fixed.  V12 uses the primary search in ``populate`` mode and
+    the proof-on-demand replay in ``reuse`` mode.  Reuse never changes search
+    ordering, dominance, certificate selection, or hard authority: a miss simply
+    executes the historical ``_try_expand`` path and stores that exact result.
+    """
+    entries: Dict[Tuple[Any, ...], Tuple[bool, Dict[str, Any], Optional[LedgerStep], Tuple[ViolationRecord, ...]]] = field(default_factory=dict)
+    hits: int = 0
+    misses: int = 0
+    stores: int = 0
+    primary_stores: int = 0
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+
 class TypedSafeBudgetSearch:
     def __init__(self, automaton: ServiceAutomaton, registry: ResourceRegistry = DEFAULT_REGISTRY, config: SearchConfig | None = None, frontier_ranker: Any | None = None) -> None:
         self.automaton = automaton
@@ -146,6 +168,8 @@ class TypedSafeBudgetSearch:
         predictions: Dict[str, TransitionPrediction] | None = None,
         initial_anchor: str = "origin",
         initial_phase: str = "origin",
+        transition_semantic_cache: ExactTransitionSemanticCache | None = None,
+        transition_semantic_cache_mode: str = "off",
     ):
         predictions = predictions or {}
         clauses = [] if (compiled.soft_only or self.config.soft_only_capability) else compiled.clauses
@@ -338,6 +362,11 @@ class TypedSafeBudgetSearch:
                     "native_projected_fallbacks": (precondition_antichain.native_projected_fallbacks if precondition_antichain is not None else 0),
                     "fused_frontier_passes": (precondition_antichain.fused_frontier_passes if precondition_antichain is not None else 0),
                     "precondition_build_ms": (precondition_antichain.precondition_build_ms if precondition_antichain is not None else 0.0),
+                    "transition_semantic_cache_entries": (len(transition_semantic_cache) if transition_semantic_cache is not None else 0),
+                    "transition_semantic_cache_hits": (transition_semantic_cache.hits if transition_semantic_cache is not None else 0),
+                    "transition_semantic_cache_misses": (transition_semantic_cache.misses if transition_semantic_cache is not None else 0),
+                    "transition_semantic_cache_stores": (transition_semantic_cache.stores if transition_semantic_cache is not None else 0),
+                    "transition_semantic_cache_primary_stores": (transition_semantic_cache.primary_stores if transition_semantic_cache is not None else 0),
                     "viability_kernel": ({
                         "n_states": viability_kernel.n_states,
                         "n_valid_edges": viability_kernel.n_valid_edges,
@@ -366,7 +395,10 @@ class TypedSafeBudgetSearch:
                 candidates = list(outgoing.get((label.anchor, label.phase), []))
             pushable = []
             for e in candidates:
-                ok, new_ledger, step, vios = self._try_expand(label, e, compiled, clauses, groups, predictions.get(e.transition_id))
+                ok, new_ledger, step, vios = self._try_expand_with_semantic_cache(
+                    label, e, compiled, clauses, groups, predictions.get(e.transition_id),
+                    transition_semantic_cache, transition_semantic_cache_mode,
+                )
                 if not ok:
                     violations.extend(vios)
                     continue
@@ -551,6 +583,63 @@ class TypedSafeBudgetSearch:
                 "iterations": continuation_envelope.iterations,
             } if continuation_envelope is not None else None),
         }
+
+    def _try_expand_with_semantic_cache(
+        self,
+        label: SearchLabel,
+        e: CandidateTransition,
+        compiled: CompiledContract,
+        clauses: Sequence,
+        groups: Sequence,
+        pred: Optional[TransitionPrediction],
+        cache: ExactTransitionSemanticCache | None,
+        mode: str,
+    ):
+        """Execute or exactly reuse one forward semantic transition.
+
+        ``populate`` deliberately does not consult the cache: primary-search
+        behavior and timing remain the historical V11 path, apart from storing
+        exact results for a possible later diagnostic replay.  ``reuse`` looks
+        up the same state/ledger/edge tuple and falls back to ``_try_expand`` on
+        a miss.  Because the request-local contract/predictions are fixed, this
+        is semantic memoization rather than an approximate learned shortcut.
+        """
+        mode = str(mode or "off").lower()
+        if cache is None or mode == "off":
+            return self._try_expand(label, e, compiled, clauses, groups, pred)
+        key = (
+            str(label.anchor), str(label.phase),
+            self._ledger_signature(label.resource_ledger),
+            str(e.transition_id),
+        )
+        if mode == "reuse":
+            cached = cache.entries.get(key)
+            if cached is not None:
+                cache.hits += 1
+                ok, ledger, step, vios = cached
+                return bool(ok), dict(ledger), self._clone_ledger_step(step), list(vios)
+            cache.misses += 1
+        result = self._try_expand(label, e, compiled, clauses, groups, pred)
+        ok, ledger, step, vios = result
+        # First writer wins. The function is deterministic under the fixed
+        # request semantics, and keeping the primary result makes equivalence
+        # auditing straightforward.
+        if key not in cache.entries:
+            cache.entries[key] = (bool(ok), dict(ledger), self._clone_ledger_step(step), tuple(vios))
+            cache.stores += 1
+            if mode == "populate":
+                cache.primary_stores += 1
+        return result
+
+    @staticmethod
+    def _clone_ledger_step(step: Optional[LedgerStep]) -> Optional[LedgerStep]:
+        if step is None:
+            return None
+        return LedgerStep(
+            str(step.transition_id), str(step.phase), str(step.action),
+            dict(step.resource_state), dict(step.margins),
+            [dict(x) for x in step.evidence],
+        )
 
     def _try_expand(self, label: SearchLabel, e: CandidateTransition, compiled: CompiledContract, clauses: Sequence, groups: Sequence, pred: Optional[TransitionPrediction]):
         # 1. Legal lifecycle.

@@ -1011,3 +1011,130 @@ After V11-A GO and the 997-episode confirmation, freeze the exact passenger/serv
 - `assess_v11_fast.py` and `summarize_v11_results.py`: Python compile PASS.
 
 These are implementation/regression checks only; V11 remains an unpromoted candidate until the preregistered server fast experiment is run.
+
+## V11-fast seed13 decision — semantic/search line remains frozen; exact diagnosis becomes the new runtime bottleneck
+
+**Date:** 2026-09-06  
+**Decision:** `STOP` under the preregistered V11-A gate. The run is attribution-valid for the fixed `256` episodes / `2048` passenger requests and is sufficiently complete to support mechanism decisions. The STOP is not a passenger-correctness or typed-search failure; it is a repeated cold-runtime failure, plus a non-replication of the preregistered legacy-guidance retirement claim.
+
+### Reliability boundary
+
+All ten main V11 variants cover the same request universe, report `algorithm_attribution_ready=true` without warnings, and complete without runtime collapse. Full V11 preserves `PCDecisionF1=1`, FAR=FRR=`0`. The repeated timing recheck independently confirms that V11 remains outside the frozen `<=2x V2` cold-latency envelope. Therefore the overall V11 STOP and the exact/typed/lazy-proof mechanism conclusions are reliable.
+
+One narrower V10-era claim is **not** stable enough to retain: the micro-latency effect of the legacy transition-static learned feasibility prior changes sign across V10/V11 runs. V10 had suggested that disabling the prior saves about `3.87 ms/request`; in V11 the contemporaneous paired run instead makes the legacy-prior variant about `1.84 ms/request` faster than no-guidance. V11 did not include a dedicated repeated crossover for this pair. Consequently the prior is reclassified from `RETIRE` to **SECONDARY / INCONCLUSIVE**. It cannot be a contribution or a default-authority mechanism; a counterbalanced repeated timing control is required before any keep/retire statement.
+
+### Reliable V11 evidence
+
+- Full V11 hard decision: `PCDecisionF1=1`, FAR=FRR=`0`, with `104 TP / 0 FP / 0 FN / 1944 TN` on the fast subset.
+- Full V11 versus V2: `18.879 -> 4.222` mean expansions (`~77.6%` reduction), paired episode-cluster CI strictly positive.
+- Structural-only versus full typed viability: `13.155 -> 4.222` mean expansions, again with a strictly positive clustered CI. Passenger-specific typed backward viability therefore remains causally distinct from structural reachability.
+- Full V11 T5 is essentially the V2 reference (`phase/resource/source macro-F1 ~= 0.832/0.665/0.630`, exact certificate ~= `0.768`).
+- Disabling lazy exact diagnosis keeps primary decisions and expansions identical but loses roughly `0.269/0.179/0.179/0.080` on phase/resource/source/exact diagnosis. `DiagnosticReplayRescueRate=0`. Exact rejection extraction remains a semantic requirement, not optional logging.
+- The exploratory native quotient branch has zero decision/expansion mismatch but its `~1.57 ms/request` mean gain has a clustered CI crossing zero; fused insertion is also non-beneficial. **Current V11 native quotient representation is STOP/REVISE and is not promoted.**
+
+### New dominant bottleneck
+
+V11 separates the remaining runtime cost more sharply than V10. With exact proof-on-demand disabled, the same V11 acceptance/search backbone is about `29.25 ms/request`, already inside the historical `2x V2` envelope. Enabling exact diagnostic replay raises total mean latency to roughly `37.9 ms/request`; replay executes on about `34%` of requests and is essential for the T5 fidelity above.
+
+Therefore the dominant unresolved algorithm/runtime question is no longer whether the capability-projected accepting fixed point is semantically correct. It is:
+
+> **How can CapPlan recover the verifier-aligned exact rejection certificate without recomputing a large prefix of the same forward executable semantics?**
+
+This also explains why CQ-HPT is not yet allowed to become the next mainline: adding a learned heterogeneous encoder would mix a new representation/training problem with an unresolved exact-diagnosis hot path.
+
+### Promotion / freeze after V11-fast
+
+- **FREEZE / core:** Passenger-Complete terminal semantics.
+- **FREEZE / core:** phase-scoped Capability-as-Typed-Feasibility and non-substitutable typed algebra.
+- **FREEZE:** evidence-grounded hard authority; learned prediction may not overwrite available provenance-tracked hard evidence.
+- **RETAIN:** conservative typed margins and lifecycle/service automaton.
+- **PROMOTE / main planning mechanism:** passenger-specific typed path-coupled backward viability.
+- **PROMOTE / main representation principle:** capability-induced observational quotient over executable preconditions.
+- **PROMOTE / exact construction:** semi-naive delta propagation.
+- **RETAIN exact implementation:** packed capability-projected dominance; important for runtime, not a standalone paper contribution.
+- **FREEZE semantic requirement:** verifier-aligned exact rejection extraction / proof-on-demand.
+- **SECONDARY / INCONCLUSIVE:** legacy transition-static learned ordering; keep only as a repeated crossover control until its net latency sign is stable.
+- **STOP current form:** V11 native quotient composition and fused insertion.
+- **REMAIN RETIRED:** V3 single-trace ECF ranker, V4 continuation priority / independent-resource CCE as headline novelty, V5 query-time suffix replay as final representation, V6 enumerate-then-compress, V7 reverse rejection antichain, completion-value head, and neural overwrite of hard evidence.
+
+The semantic hierarchy remains frozen:
+
+`Passenger-Complete Planning -> Compiled Passenger Capability Program -> Evidence-Grounded Typed Service Semantics -> Forward Consumed Ledger × Capability-Projected Backward Executable Preconditions -> Proof-on-Demand Typed Safe-Budget Search -> Passenger-Complete Execution OR Exact Executable Rejection`.
+
+The three paper contributions remain frozen at the semantic level. C3 should not be tied to the implementation detail "rerun a complete no-kernel search"; its stable object is **verifier-aligned exact rejection** under the same executable semantics.
+
+## V12 — Shared Executable-Semantics Diagnostic Replay (SEDR)
+
+**Status:** implemented next exact-backbone closure candidate. No retraining is required. CQ-HPT remains gated on V12 fast + full confirmation.
+
+### Motivation
+
+V8--V11 intentionally use exact no-kernel forward replay for failure diagnosis because V6/V7 demonstrated that acceptance-preserving dominance and diagnosis-preserving semantics are not interchangeable. That design recovered certificate fidelity, but V11 shows that the replay is now the main residual runtime term.
+
+V12 does **not** reintroduce a lossy reverse rejection frontier. Instead it observes that the primary search and diagnostic replay invoke exactly the same deterministic executable transition semantics for many state/ledger/edge tuples. Under one fixed request, the compiled contract, transition evidence, learned predictions, uncertainty policy and resource registry are fixed. For a search label `ell` and transition `e`, define the request-local semantic key
+
+`kappa(ell,e) = (anchor, phase, Sig(R_ell), transition_id)`.
+
+The exact evaluation
+
+`E_Psi(kappa) = _try_expand(ell,e; Psi)`
+
+contains the `Allow` result, updated typed ledger, ledger step, and concrete violation records. V12 stores primary-search evaluations and lets proof-on-demand replay reuse them when the exact same executable state/edge is revisited. A cache miss executes the historical `_try_expand` path and stores that exact result.
+
+### Exactness property
+
+For a fixed request `(Psi, transitions, predictions, SearchConfig)`, `_try_expand` depends on the service state, typed forward ledger and chosen transition; it does not use a learned approximation of the answer. Replacing a repeated call by its previously computed exact result therefore preserves:
+
+- every successor ledger and hard rejection;
+- diagnostic search ordering and dominance;
+- diagnostic expansion count;
+- the complete violation multiset generated by the replay;
+- the canonical certificate selected from those violations.
+
+V12's main causal control compares full V12 against `v11_reference_runtime` / `no_shared_diagnostic_semantic_cache` and requires zero decision, expansion, skeleton, certificate-signature, and full-certificate mismatch. If any mismatch occurs, V12 is STOP regardless of timing.
+
+The memo is strictly **request local**. It is not a cross-passenger scene cache and therefore cannot exploit the benchmark's eight same-scene counterfactual contracts to game cold single-request latency.
+
+### New instrumentation
+
+V12 reports:
+
+- diagnostic semantic cache hits / misses / entries / primary stores;
+- exact diagnostic replay rate / expansions / rescue rate;
+- the unchanged SN-CPK construction counters and typed-pruning counters;
+- repeated counterbalanced timing rather than a single fixed ablation order.
+
+### V12 controls
+
+- `full`: V11 SN-CPK + exact proof-on-demand + shared exact semantic replay;
+- `v11_reference_runtime` / `no_shared_diagnostic_semantic_cache`: exact historical V11 full replay with no new memo;
+- `v2_reference_runtime`;
+- `no_typed_viability` and `no_viability_kernel`;
+- `no_lazy_diagnostic_replay`;
+- `v12_legacy_static_guidance`: repeated timing control only, not a contribution.
+
+The fast script additionally runs three counterbalanced serial timing orders and aggregates latency per request across repeats before episode-cluster bootstrap. This is required because the V10/V11 legacy-guidance micro-latency sign was not stable.
+
+### V12-fast preregistration
+
+GO requires all of:
+
+1. `PCDecisionF1>=0.99`, FAR=FRR=`0`;
+2. zero V12/V11 decision and primary-expansion mismatch;
+3. zero V12/V11 skeleton mismatch, canonical certificate-signature mismatch, and full certificate JSON mismatch;
+4. all four T5 metrics `>= V2-0.01`;
+5. typed V12 beats structural-only in paired expansions with episode-cluster CI lower bound `>0`, typed pruning fires, and the fast kernel is complete;
+6. shared exact semantic reuse is actually active (positive primary stores and replay cache hits) and `DiagnosticReplayRescueRate=0`;
+7. proof-on-demand still preserves primary decisions/expansions and materially restores T5 versus `no_lazy_diagnostic_replay`;
+8. in three counterbalanced repeated timing blocks, V12 is faster than exact V11 no-cache with positive episode-clustered CI lower bound;
+9. repeated V12 cold latency is `<=2x` the repeated V2 reference, with zero decision mismatch across timing repeats.
+
+The legacy static learned ordering is classified separately: repeated timing can mark it `KEEP_OPTIONAL`, `RETIRE_DEFAULT`, or `INCONCLUSIVE_SECONDARY`, but this cannot rescue a failed V12 gate and never becomes a headline paper mechanism.
+
+### What follows V12
+
+- If V12-fast is `STOP`, **do not start CQ-HPT**. The next contingency is a selector-preserving conditional diagnostic-precondition formulation with exact replay fallback; do not revive the V7 reverse-rejection antichain.
+- If V12-fast is `GO`, run the 997-episode V12 full confirmation with the same exactness and repeated-timing requirements.
+- Only a V12-full `GO` freezes the exact symbolic backbone and makes **Capability-Query Heterogeneous Polyline Transformer (CQ-HPT)** the next main learned-algorithm version.
+
+CQ-HPT must be derived from the frozen capability program: compiled phase/resource/group state queries lower-level heterogeneous pedestrian/polyline, PUDO/interface, vehicle, legality, provenance, and dynamic-agent evidence. HGT/polyline/KNN/query/context-reuse primitives are not contributions in isolation. The network may estimate evidence reliability, dynamic availability, calibrated uncertainty, soft ordering, or amortized kernel proposals; exact `Allow/Update/Sat` and the capability kernel retain hard authority.
