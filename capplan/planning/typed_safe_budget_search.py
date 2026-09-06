@@ -119,6 +119,13 @@ class SearchConfig:
     no_conservative_margins: bool = False
     no_completion_value_guidance: bool = False
     soft_only_capability: bool = False
+    # V15: use the exact max-min continuation robustness already available from
+    # the capability-projected acceptance antichain as a *soft queue-ordering*
+    # signal.  It is evaluated only after hard local feasibility, backward
+    # viability, and label dominance.  Incomplete kernels return no score and
+    # therefore fail open to the frozen exact ordering.
+    use_exact_robustness_ordering: bool = False
+    exact_robustness_count_only: bool = False
 
 
 @dataclass
@@ -313,6 +320,9 @@ class TypedSafeBudgetSearch:
         precondition_proof_envelope_hits = 0
         precondition_rejection_checks = 0
         precondition_rejection_hits = 0
+        exact_robustness_checks = 0
+        exact_robustness_scored = 0
+        exact_robustness_missing = 0
         while pq and expansions < self.config.max_expansions:
             _, _, label = heapq.heappop(pq)
             expansions += 1
@@ -346,6 +356,12 @@ class TypedSafeBudgetSearch:
                     "precondition_proof_envelope_hits": precondition_proof_envelope_hits,
                     "precondition_rejection_checks": precondition_rejection_checks,
                     "precondition_rejection_hits": precondition_rejection_hits,
+            "exact_robustness_checks": exact_robustness_checks,
+            "exact_robustness_scored": exact_robustness_scored,
+            "exact_robustness_missing": exact_robustness_missing,
+                    "exact_robustness_checks": exact_robustness_checks,
+                    "exact_robustness_scored": exact_robustness_scored,
+                    "exact_robustness_missing": exact_robustness_missing,
                     "precondition_raw_suffixes": (precondition_antichain.raw_total if precondition_antichain is not None else 0),
                     "precondition_antichain_size": (precondition_antichain.antichain_total if precondition_antichain is not None else 0),
                     "precondition_raw_proofs": (precondition_antichain.proof_raw_total if precondition_antichain is not None else 0),
@@ -525,34 +541,57 @@ class TypedSafeBudgetSearch:
                     continue
                 labels = [l for l in labels if not dominates(d_new, l.as_dominance_dict(), self.registry)]
                 labels.append(new_label)
+                teacher = None
+                need_exact_robustness = bool(
+                    precondition_antichain is not None
+                    and (self.config.use_exact_robustness_ordering or frontier_trace_callback is not None)
+                )
+                if need_exact_robustness:
+                    teacher = evaluate_precondition_teacher_target(
+                        (new_label.anchor, new_label.phase), new_label.resource_ledger,
+                        compiled, precondition_antichain, self.registry,
+                    )
+                    if self.config.use_exact_robustness_ordering:
+                        exact_robustness_checks += int(teacher.checked_summaries)
+                        if teacher.robust_margin is None:
+                            exact_robustness_missing += 1
+                        else:
+                            exact_robustness_scored += 1
                 if frontier_trace_callback is not None:
-                    teacher = None
-                    if precondition_antichain is not None:
-                        teacher = evaluate_precondition_teacher_target(
-                            (new_label.anchor, new_label.phase), new_label.resource_ledger,
-                            compiled, precondition_antichain, self.registry,
-                        )
                     frontier_trace_callback(
                         parent_label=label, successor_label=new_label, transition=e,
                         prediction=predictions.get(e.transition_id), compiled=compiled,
                         teacher=teacher,
                     )
-                pushable.append((new_label, e, predictions.get(e.transition_id), continuation))
+                pushable.append((new_label, e, predictions.get(e.transition_id), continuation, teacher))
 
-            # V3 scores the sibling frontier in one batch. The raw pairwise ranker
-            # score is converted to a within-frontier softmax prior; a single feasible
-            # successor therefore receives prior=1 and incurs no learned penalty.
+            # Learned V3/V14 and exact V15 signals all affect ordering only after
+            # hard semantics and dominance. V15 intentionally uses the same
+            # sibling-softmax interface as CQ-HPT so the only changed factor is
+            # the source of the ordering score.
             frontier_priors = [1.0 for _ in pushable]
-            if self.frontier_ranker is not None and pushable:
+            raw_scores = None
+            if self.config.use_exact_robustness_ordering and pushable:
+                if self.config.exact_robustness_count_only:
+                    raw_scores = [
+                        math.log1p(max(0, int(t.viable_summary_count))) if t is not None else 0.0
+                        for _, _, _, _, t in pushable
+                    ]
+                else:
+                    raw_scores = [
+                        max(0.0, float(t.robust_margin)) if (t is not None and t.robust_margin is not None) else 0.0
+                        for _, _, _, _, t in pushable
+                    ]
+            elif self.frontier_ranker is not None and pushable:
                 raw_scores = self.frontier_ranker.score_successors(
-                    [(nl, edge) for nl, edge, _, _ in pushable], compiled, self.registry
+                    [(nl, edge) for nl, edge, _, _, _ in pushable], compiled, self.registry
                 )
-                if raw_scores:
-                    m = max(raw_scores)
-                    exps = [math.exp(max(-40.0, min(40.0, float(v) - m))) for v in raw_scores]
-                    z = max(sum(exps), 1e-12)
-                    frontier_priors = [max(1e-6, float(v) / z) for v in exps]
-            for (new_label, e, pred, continuation), frontier_prior in zip(pushable, frontier_priors):
+            if raw_scores:
+                m = max(raw_scores)
+                exps = [math.exp(max(-40.0, min(40.0, float(v) - m))) for v in raw_scores]
+                z = max(sum(exps), 1e-12)
+                frontier_priors = [max(1e-6, float(v) / z) for v in exps]
+            for (new_label, e, pred, continuation, _teacher), frontier_prior in zip(pushable, frontier_priors):
                 heapq.heappush(
                     pq,
                     (self._priority(new_label, pred, frontier_prior=frontier_prior, continuation=continuation), next(counter), new_label),
@@ -577,6 +616,9 @@ class TypedSafeBudgetSearch:
             "precondition_proof_envelope_hits": precondition_proof_envelope_hits,
             "precondition_rejection_checks": precondition_rejection_checks,
             "precondition_rejection_hits": precondition_rejection_hits,
+            "exact_robustness_checks": exact_robustness_checks,
+            "exact_robustness_scored": exact_robustness_scored,
+            "exact_robustness_missing": exact_robustness_missing,
             "precondition_raw_suffixes": (precondition_antichain.raw_total if precondition_antichain is not None else 0),
             "precondition_antichain_size": (precondition_antichain.antichain_total if precondition_antichain is not None else 0),
             "precondition_raw_proofs": (precondition_antichain.proof_raw_total if precondition_antichain is not None else 0),

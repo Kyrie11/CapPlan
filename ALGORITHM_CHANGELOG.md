@@ -1434,3 +1434,131 @@ Four counterbalanced serial repeats compare full CQ-HPT with exact no-learning u
 - If all fast gates pass: run the 997-episode full confirmatory suite. Only full GO promotes CQ-HPT as CapPlan's principal learning mechanism.
 
 CQ-HPT is explicitly **not** the reason the paper exists. The paper's conceptual novelty remains Passenger-Complete Planning; its central algorithmic novelty remains Capability-Compiled Quotient Executable Semantics. CQ-HPT is justified only if executable capability state is experimentally shown to require state/passenger-dependent routing of heterogeneous evidence.
+
+## V14-fast seed13 decision — CQ-HPT teacher is learnable, capability-conditioned routing is not necessary
+
+**Date:** 2026-09-06  
+**Decision:** `STOP` under the preregistered V14 necessity gate. The 256-episode / 2048-request package is attribution-valid and preserves exact passenger semantics, but CQ-HPT fails both the causal routing-necessity gate and the operational-net-gain gate.
+
+### Reliability
+
+All six primary variants contain the same 2048 unique passenger requests from the same 256 deterministic episodes, with complete request-level pairing and no runtime/attribution warnings. Full CQ-HPT preserves `PCDecisionF1=1`, FAR=FRR=`0`, `DiagnosticReplayRescueRate=0`, and exact full-certificate JSON versus the frozen exact SN-CPK control. The result is therefore a valid algorithmic negative result rather than a V1-style runtime collapse.
+
+### Preregistered V14 outcome
+
+- Full CQ-HPT vs exact no-learning: `+0.23584` expansion/request in favor of CQ-HPT; episode-clustered 95% CI `[0.05077, 0.45459]`.
+- Full vs legacy static guidance: `-0.03027` expansion/request; CI `[-0.05566,-0.00977]`. CQ-HPT is significantly worse than the surviving historical static ordering baseline.
+- Full vs late fusion: **exactly `0.0` expansion difference**, CI `[0,0]`. Therefore the experiment does not support the V14 causal claim that passenger capability must change *which heterogeneous evidence is retrieved* rather than entering only after routing.
+- Full vs neutral query: only `+0.00342` expansion/request; CI lower bound `0`, so the preregistered strict-positivity criterion fails.
+- Full vs query-only: `+0.07959` expansion/request with positive CI, so heterogeneous evidence contains a small residual ordering signal beyond the query tower, but this does not rescue capability-conditioned routing necessity.
+- Four counterbalanced timing repeats: exact `~=32.25 ms/request`, CQ-HPT `~=1667.83 ms/request`; exact-minus-CQHPT `~-1635.58 ms`, CI `[-1679.51,-1589.42]`. The operational gate fails decisively.
+
+The V14 validation teacher itself is learnable (full pairwise accuracy `~=0.908`, top-1 teacher agreement `~=0.933`), but full and late-fusion validation metrics are identical. The evidence supports retaining the **exact multi-path teacher semantics**, not the CQ-HPT architecture.
+
+### Runtime caveat that does not change STOP
+
+V14 instrumentation reports only about `1.3 ms/request` for context encoding and `4.2 ms/request` for scored CQ-HPT inference, while total primary-decision time is about `1.62 s/request`. Code audit identifies uninstrumented request preparation as the dominant implementation cost: every passenger request repeatedly scans, groups and distance-sorts the full evidence bank for every transition. This means `1.62 s` should not be interpreted as an intrinsic lower bound for Transformers.
+
+This caveat **does not change V14 STOP**, because the causal mechanism already fails independently of latency: full equals late fusion in expansions and loses to legacy static guidance. Optimizing evidence-token caching may be useful for historical reproducibility, but CQ-HPT is retired from the mainline rather than receiving another architecture-rescue version.
+
+### Promotion / retirement after V14
+
+**Freeze / retain**
+
+- Passenger-Complete terminal semantics;
+- Capability-as-Typed-Feasibility with phase-scoped non-substitutable algebra;
+- evidence-grounded hard authority and conservative margins;
+- lifecycle/service automaton;
+- forward typed consumed ledger;
+- capability-projected SN-CPK backward executable-precondition kernel;
+- semi-naive differential propagation + packed exact dominance;
+- Typed Safe-Budget Search;
+- proof-on-demand verifier-aligned exact rejection;
+- the exact multi-path continuation-robustness target introduced for V14 training.
+
+**Retire from the mainline**
+
+- CQ-HPT as a principal search router;
+- capability-conditioned heterogeneous evidence routing as a claimed contribution under current evidence;
+- any attempt to rescue V14 merely by increasing Transformer capacity or optimizing KNN/token-selection code.
+
+**Secondary baseline only**
+
+- legacy static learned edge/feasibility ordering. It remains a strong comparator because it is cheap and slightly better than CQ-HPT in expansions, but it is not elevated to a paper contribution.
+
+The three paper contributions remain unchanged:
+
+1. Passenger-Complete Planning;
+2. Capability-Compiled Quotient Executable Semantics;
+3. Verifier-Aligned Exact Rejection and Counterfactual Benchmark.
+
+## V15 — Exact Capability Robustness Potential (ECRP)
+
+**Status:** implemented as the post-V14 necessity test. No network training is required. **Not promoted.** V15 asks whether the exact semantic object that successfully supervised V14 should be used directly for queue ordering instead of being approximated by an expensive neural router.
+
+### Core object
+
+For a hard-feasible, typed-viable successor label `ell` with state `s_ell`, forward ledger `R_ell`, and exact capability-projected acceptance antichain `A_acc^Psi(s_ell)`, define
+
+`rho_Psi(ell) = max_{phi in A_acc^Psi(s_ell), Sat(phi(R_ell),Psi)} min_{c in Psi_hard} margin_c(phi(R_ell))`.
+
+This is the same exact multi-path max-min capability margin used as the V14 teacher. It answers: among all exact executable continuations represented by the capability quotient, how robust can the best continuation remain at its weakest hard capability clause?
+
+### Authority boundary
+
+ECRP is evaluated **only after**:
+
+`exact local Allow/Update -> exact SN-CPK viability -> exact label dominance`.
+
+It then affects sibling queue order only. It cannot make an infeasible transition feasible, cannot modify `Allow/Update/Sat`, cannot overwrite authoritative evidence, and cannot alter exact proof-on-demand certificate semantics. If the projected kernel is incomplete, the robustness target is absent and V15 fails open to the frozen exact ordering.
+
+### Why this is the correct post-V14 question
+
+V14 established that approximating this exact target with capability-conditioned evidence routing is unnecessary in the current compressed frontier. The exact target is nevertheless already present in the frozen semantic backbone. V15 therefore tests a simpler hypothesis:
+
+> Does the capability quotient itself contain a useful exact continuation potential that improves search with positive *net* operational value?
+
+This treats ECRP as a corollary/ordering mechanism of C2, not as a fourth contribution.
+
+### Causal controls
+
+1. `ecrp_full`: exact max-min capability robustness ordering;
+2. `exact_no_ordering`: frozen V14 exact SN-CPK ordering;
+3. `summary_count_only`: scans the same exact antichain and uses only the number of viable summaries, discarding typed margins;
+4. `legacy_static`: historical cheap learned edge-validity + transition-static feasibility ordering.
+
+`ecrp_full` and `summary_count_only` have matched exact-antichain scanning overhead. Their difference isolates whether **typed robustness semantics**, rather than generic continuation multiplicity, provides the gain.
+
+### V15-fast preregistration
+
+Run only the deterministic 256-episode test subset first. GO requires all of:
+
+**Semantic authority**
+
+- `PCDecisionF1>=0.99`, FAR=FRR=`0`;
+- zero passenger-decision mismatch vs exact no-ordering;
+- zero full certificate JSON mismatch vs exact no-ordering;
+- all four T5 metrics `>= exact - 0.01`.
+
+**Typed-robustness-specific search gain**
+
+ECRP must reduce paired expansions with episode-clustered 95% CI lower bound `>0` against **all three**:
+
+- exact no-ordering;
+- legacy static;
+- summary-count-only.
+
+The gate also requires positive ECRP summary checks and scored successors.
+
+**Operational net gain**
+
+Four counterbalanced serial repeats compare ECRP with exact no-ordering. ECRP must reduce primary-decision wall-clock with episode-clustered 95% CI lower bound `>0`, while preserving exact decisions.
+
+### Decision rule
+
+- If ECRP fails exact or count-only: the exact robustness target is useful as analysis/teacher semantics but not a promoted queue-ordering mechanism.
+- If ECRP beats exact/count but not legacy: retain legacy only as the practical secondary ordering baseline; do not inflate ECRP into novelty.
+- If expansions improve but latency does not: STOP. The exact frontier is already too small for another ordering term to justify itself operationally.
+- Only if all fast gates pass should the 997-episode V15 full confirmatory run be executed.
+
+If V15 STOPs, **freeze search ordering** and stop creating new ranking/router mechanisms. The next algorithmic learning work should move to lower-level evidence/calibration or amortized proposals that solve a demonstrably unresolved problem, while the exact capability semantics retain hard authority. Method-specific nuPlan closed-loop integration should then become a higher-priority publication task.
