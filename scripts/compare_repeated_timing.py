@@ -4,8 +4,9 @@
 Each --reference directory is paired with the --candidate directory at the same
 position. Per-request latency is averaged across repeats first, so the final
 confidence interval is not dominated by treating repeated executions of the same
-request as independent samples. This is used by V12 for micro-latency claims
-whose sign changed between the V10 and V11 one-pass experiments.
+request as independent samples. The latency key is configurable so later versions can distinguish primary-decision
+latency from conditional explanation/end-to-end latency without changing the
+paired clustering protocol.
 """
 from __future__ import annotations
 import argparse, json
@@ -29,6 +30,7 @@ def main():
     ap.add_argument('--output', required=True)
     ap.add_argument('--bootstrap', type=int, default=10000)
     ap.add_argument('--seed', type=int, default=13)
+    ap.add_argument('--latency-key', default='planning_latency_ms')
     a=ap.parse_args()
     if len(a.reference)!=len(a.candidate):
         raise RuntimeError('reference/candidate repeat counts differ')
@@ -43,11 +45,11 @@ def main():
         dlat=[]; dexp=[]; dm=0; em=0
         for k in keys:
             rr,cc=r[k],c[k]
-            dl=float(rr.get('planning_latency_ms',0))-float(cc.get('planning_latency_ms',0))
+            dl=float(rr.get(a.latency_key,0))-float(cc.get(a.latency_key,0))
             de=float(rr.get('search_expansions',0))-float(cc.get('search_expansions',0))
             per_req_lat.setdefault(k,[]).append(dl); per_req_exp.setdefault(k,[]).append(de)
-            per_req_ref_lat.setdefault(k,[]).append(float(rr.get('planning_latency_ms',0)))
-            per_req_cand_lat.setdefault(k,[]).append(float(cc.get('planning_latency_ms',0)))
+            per_req_ref_lat.setdefault(k,[]).append(float(rr.get(a.latency_key,0)))
+            per_req_cand_lat.setdefault(k,[]).append(float(cc.get(a.latency_key,0)))
             dm += int(bool(rr.get('passenger_complete'))!=bool(cc.get('passenger_complete')))
             em += int(abs(de)>1e-12)
             dlat.append(dl); dexp.append(de)
@@ -70,7 +72,7 @@ def main():
     boot_lat=np.asarray([rng.choice(ep_lat,size=len(ep_lat),replace=True).mean() for _ in range(a.bootstrap)])
     boot_exp=np.asarray([rng.choice(ep_exp,size=len(ep_exp),replace=True).mean() for _ in range(a.bootstrap)])
     result={
-        'repeats':len(refs),'paired_requests':len(keys),'paired_episodes':len(episodes),
+        'latency_key':a.latency_key,'repeats':len(refs),'paired_requests':len(keys),'paired_episodes':len(episodes),
         'decision_mismatch_count_max_over_repeats':decision_mismatch,
         'expansion_mismatch_count_max_over_repeats':expansion_mismatch,
         'reference_latency_mean_ms':float(np.mean(list(req_ref_lat.values()))),

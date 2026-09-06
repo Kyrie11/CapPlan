@@ -491,6 +491,14 @@ def diagnostic_compiled_program_metric_mean(episodes: List[Dict[str, Any]], key:
     return _mean([float(e.get(key, 0.0) or 0.0) for e in episodes])
 
 
+def _latency_metric_mean(episodes: List[Dict[str, Any]], key: str) -> float:
+    return _mean([float(e.get(key, 0.0) or 0.0) for e in episodes])
+
+
+def _latency_metric_p95(episodes: List[Dict[str, Any]], key: str) -> float:
+    return _percentile([float(e.get(key, 0.0) or 0.0) for e in episodes], 0.95)
+
+
 def planning_latency_mean_ms(episodes: List[Dict[str, Any]]) -> float:
     return _mean([float(e.get("planning_latency_ms", 0.0)) for e in episodes if e.get("planning_latency_ms") is not None])
 
@@ -623,6 +631,16 @@ def compute_all_metrics(episodes: List[Dict[str, Any]], counterfactual_pairs: Li
         "DiagnosticCompiledProgramApplicationsMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_applications"),
         "DiagnosticCompiledProgramFallbacksMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_fallbacks"),
         "DiagnosticCompiledProgramStaticFailuresMean": diagnostic_compiled_program_metric_mean(episodes, "diagnostic_compiled_program_static_failures"),
+        "PrimaryDecisionLatency_ms_mean": _latency_metric_mean(episodes, "primary_decision_latency_ms"),
+        "PrimaryDecisionLatency_ms_p95": _latency_metric_p95(episodes, "primary_decision_latency_ms"),
+        "ExactRejectionOverhead_ms_mean": _latency_metric_mean(episodes, "exact_rejection_overhead_ms"),
+        "ExactRejectionOverhead_ms_p95": _latency_metric_p95(episodes, "exact_rejection_overhead_ms"),
+        "EndToEndInternalLatency_ms_mean": _latency_metric_mean(episodes, "end_to_end_internal_latency_ms"),
+        "CQHPTContextEncode_ms_mean": _latency_metric_mean(episodes, "cqhpt_context_encode_ms"),
+        "CQHPTInference_ms_mean": _latency_metric_mean(episodes, "cqhpt_inference_ms"),
+        "CQHPTInferenceCalls_mean": _construction_metric_mean(episodes, "cqhpt_inference_calls"),
+        "CQHPTScoredSuccessors_mean": _construction_metric_mean(episodes, "cqhpt_scored_successors"),
+        "CQHPTAttentionEntropy_mean": _latency_metric_mean(episodes, "cqhpt_attention_entropy"),
         "PlannerLatency_ms_mean": planning_latency_mean_ms(episodes),
         "PlannerLatency_ms_p95": planning_latency_p95_ms(episodes),
     }

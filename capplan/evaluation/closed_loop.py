@@ -69,6 +69,9 @@ def result_to_episode_metrics(
     return {
         "episode_id": metadata.get("episode_id"),
         "passenger_id": contract.passenger_id,
+        "passenger_profile": (contract.metadata.get("profile_name") if isinstance(getattr(contract, "metadata", None), dict) else None),
+        "counterfactual_axis": (contract.metadata.get("counterfactual_axis") if isinstance(getattr(contract, "metadata", None), dict) else None),
+        "is_base_profile": bool((contract.metadata.get("counterfactual_axis") in (None, "", "base")) if isinstance(getattr(contract, "metadata", None), dict) else False),
         "collision": bool(traj.get("collision", False)),
         "drivable_area": bool(traj.get("drivable_area", True)),
         "traffic_safe": traffic_safe,
@@ -139,6 +142,14 @@ def result_to_episode_metrics(
         "diagnostic_compiled_program_applications": int(result.diagnostics.get("diagnostic_compiled_program_applications", 0) or 0),
         "diagnostic_compiled_program_fallbacks": int(result.diagnostics.get("diagnostic_compiled_program_fallbacks", 0) or 0),
         "diagnostic_compiled_program_static_failures": int(result.diagnostics.get("diagnostic_compiled_program_static_failures", 0) or 0),
+        "primary_decision_latency_ms": float(result.diagnostics.get("primary_decision_latency_ms", 0.0) or 0.0),
+        "exact_rejection_overhead_ms": float(result.diagnostics.get("exact_rejection_overhead_ms", 0.0) or 0.0),
+        "end_to_end_internal_latency_ms": float(result.diagnostics.get("end_to_end_internal_latency_ms", 0.0) or 0.0),
+        "cqhpt_context_encode_ms": float(result.diagnostics.get("cqhpt_context_encode_ms", 0.0) or 0.0),
+        "cqhpt_inference_ms": float(result.diagnostics.get("cqhpt_inference_ms", 0.0) or 0.0),
+        "cqhpt_inference_calls": int(result.diagnostics.get("cqhpt_inference_calls", 0) or 0),
+        "cqhpt_scored_successors": int(result.diagnostics.get("cqhpt_scored_successors", 0) or 0),
+        "cqhpt_attention_entropy": float(result.diagnostics.get("cqhpt_attention_entropy", 0.0) or 0.0),
         "phase_accepted": phase_accepted,
         "vehicle_safe": traffic_safe,
         "capability_satisfied": capability_satisfied,
@@ -220,6 +231,13 @@ class ClosedLoopRunner:
         requests_by_episode: Dict[str, List[Dict[str, Any]]] = {}
         for r in service_requests:
             requests_by_episode.setdefault(r.get("episode_id"), []).append(r)
+        cqhpt_cache_by_episode = {}
+        cqhpt_cache_path = dataset_dir / "cqhpt_evidence_cache.jsonl"
+        if cqhpt_cache_path.exists():
+            for row in read_jsonl(cqhpt_cache_path):
+                eid = str(row.get("episode_id") or "")
+                if eid in selected:
+                    cqhpt_cache_by_episode[eid] = row
         vehicle_metrics_path = dataset_dir / "nuplan_vehicle_metrics.jsonl"
         vehicle_metrics_by_episode = {}
         if vehicle_metrics_path.exists():
@@ -227,7 +245,7 @@ class ClosedLoopRunner:
                 eid = str(row.get("episode_id") or row.get("scenario_id") or "")
                 if eid in selected:
                     vehicle_metrics_by_episode[eid] = row
-        return {"scenes": scenes, "episodes": episodes, "entrances": entrances, "pudos": pudos_by_episode, "vehicles": vehicles_by_episode, "contracts": contracts_by_episode, "transitions": transitions_by_episode, "oracle_certs": oracle_certs, "skeletons": skeletons, "counterfactual_pairs": counterfactual_pairs, "service_requests": requests_by_episode, "vehicle_metrics": vehicle_metrics_by_episode}
+        return {"scenes": scenes, "episodes": episodes, "entrances": entrances, "pudos": pudos_by_episode, "vehicles": vehicles_by_episode, "contracts": contracts_by_episode, "transitions": transitions_by_episode, "oracle_certs": oracle_certs, "skeletons": skeletons, "counterfactual_pairs": counterfactual_pairs, "service_requests": requests_by_episode, "vehicle_metrics": vehicle_metrics_by_episode, "cqhpt_evidence_cache": cqhpt_cache_by_episode}
 
     @staticmethod
     def _graph_for_episode(dataset_dir: Path, episode_id: str, transitions: List[Any]) -> AccessibilityGraph:
@@ -280,7 +298,7 @@ class ClosedLoopRunner:
             scene = data["scenes"].get(eid, {})
             requests = data.get("service_requests", {}).get(eid, [])
             request_by_profile = {str(r.get("passenger_profile_id")): r for r in requests}
-            trip_context_base = {**meta, "route_corridor": scene.get("route_corridor", meta.get("metadata", {}).get("route_corridor", {})), **(meta.get("metadata") or {}), **(scene.get("metadata") or {})}
+            trip_context_base = {**meta, "route_corridor": scene.get("route_corridor", meta.get("metadata", {}).get("route_corridor", {})), "scene_record": scene, **(meta.get("metadata") or {}), **(scene.get("metadata") or {})}
             for contract in data["contracts"].get(eid, []):
                 profile_key = str(contract.passenger_id).split(":")[-1]
                 request = request_by_profile.get(profile_key) or (requests[0] if requests else {})
@@ -289,6 +307,8 @@ class ClosedLoopRunner:
                 trip_context = {**trip_context_base, "service_request": request, "request_time_s": request.get("request_time_s", trip_context_base.get("request_time_s")), "origin_entrance_id": request.get("origin_entrance_id", trip_context_base.get("origin_entrance_id")), "destination_entrance_id": request.get("destination_entrance_id", trip_context_base.get("destination_entrance_id"))}
                 if eid in data.get("vehicle_metrics", {}):
                     trip_context["nuplan_vehicle_metrics"] = data["vehicle_metrics"][eid]
+                if eid in data.get("cqhpt_evidence_cache", {}):
+                    trip_context["cqhpt_evidence_bank"] = data["cqhpt_evidence_cache"][eid]
                 plan_t0 = time.perf_counter()
                 result = self.planner.plan(eid, contract, graph, pudo, vehicle, transitions=transitions, trip_context=trip_context)
                 planning_latency_ms = (time.perf_counter() - plan_t0) * 1000.0
@@ -349,7 +369,16 @@ class ClosedLoopRunner:
             bool(self.config.no_typed_resource_ledger),
         ])
         version_upper = str(self.config.algorithm_version).upper()
-        if version_upper.startswith("V11") and self.config.v11_native_quotient_experimental and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime and not self.config.v8_reference_runtime and not self.config.v9_reference_runtime and not self.config.v10_reference_runtime:
+        if version_upper.startswith("V14") and not self.config.no_viability_kernel and not self.config.v2_reference_runtime:
+            if self.config.cqhpt_checkpoint and not self.config.no_cqhpt:
+                frontier_guidance_policy = "cqhpt_capability_query_guided_semnaive_projected_acceptance_v14"
+            elif self.config.v14_legacy_static_guidance:
+                frontier_guidance_policy = "historical_edge_plus_static_learned_ordering_v14_control"
+            else:
+                frontier_guidance_policy = "exact_no_learned_ordering_semnaive_projected_acceptance_v14"
+        elif version_upper.startswith("V13") and not self.config.no_viability_kernel and not self.config.v2_reference_runtime:
+            frontier_guidance_policy = "semnaive_capability_projected_acceptance_lazy_exact_proof_v13"
+        elif version_upper.startswith("V11") and self.config.v11_native_quotient_experimental and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime and not self.config.v8_reference_runtime and not self.config.v9_reference_runtime and not self.config.v10_reference_runtime:
             frontier_guidance_policy = "native_capability_projected_acceptance_experimental_v11"
         elif version_upper.startswith("V11") and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime and not self.config.v8_reference_runtime and not self.config.v9_reference_runtime:
             frontier_guidance_policy = "lean_semnaive_capability_projected_acceptance_lazy_exact_proof_v11"
@@ -379,35 +408,36 @@ class ClosedLoopRunner:
             "frontier_ranker_checkpoint": str(self.config.frontier_ranker_checkpoint) if self.config.frontier_ranker_checkpoint else None,
             "continuation_envelope_enabled": bool(str(self.config.algorithm_version).upper().startswith("V4") and not self.config.no_continuation_envelope and not self.config.v2_reference_runtime),
             "continuation_pruning_enabled": bool(str(self.config.algorithm_version).upper().startswith("V4") and not self.config.no_continuation_envelope and not self.config.no_continuation_pruning and not self.config.v2_reference_runtime),
-            "capability_viability_kernel_enabled": bool(any(str(self.config.algorithm_version).upper().startswith(v) for v in ("V5","V6","V7","V8","V9","V10","V11","V12")) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime),
-            "typed_viability_pruning_enabled": bool(any(str(self.config.algorithm_version).upper().startswith(v) for v in ("V5","V6","V7","V8","V9","V10","V11","V12")) and not self.config.no_viability_kernel and not self.config.no_typed_viability and not self.config.v2_reference_runtime),
-            "precondition_antichain_enabled": bool(any(str(self.config.algorithm_version).upper().startswith(v) for v in ("V6","V7","V8","V9","V10","V11","V12")) and not self.config.no_viability_kernel and not self.config.no_precondition_antichain and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
-            "viability_proof_envelope_enabled": bool((str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7") or ((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12")) and self.config.v7_reference_runtime)) and not self.config.no_viability_kernel and not self.config.no_viability_proof_envelope and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
-            "direct_precondition_compilation_enabled": bool(any(str(self.config.algorithm_version).upper().startswith(v) for v in ("V7","V8","V9","V10","V11","V12")) and not self.config.no_viability_kernel and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
-            "incremental_acceptance_compilation_enabled": bool((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12")) and not self.config.no_viability_kernel and not self.config.v7_reference_runtime and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
-            "capability_projection_enabled": bool((str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12")) and not self.config.v8_reference_runtime and not self.config.no_capability_projection and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime),
-            "frontier_signature_index_enabled": bool((str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12")) and not self.config.v8_reference_runtime and not self.config.no_frontier_signature_index and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime),
+            "capability_viability_kernel_enabled": bool(any(str(self.config.algorithm_version).upper().startswith(v) for v in ("V5","V6","V7","V8","V9","V10","V11","V12","V13","V14")) and not self.config.no_viability_kernel and not self.config.v2_reference_runtime),
+            "typed_viability_pruning_enabled": bool(any(str(self.config.algorithm_version).upper().startswith(v) for v in ("V5","V6","V7","V8","V9","V10","V11","V12","V13","V14")) and not self.config.no_viability_kernel and not self.config.no_typed_viability and not self.config.v2_reference_runtime),
+            "precondition_antichain_enabled": bool(any(str(self.config.algorithm_version).upper().startswith(v) for v in ("V6","V7","V8","V9","V10","V11","V12","V13","V14")) and not self.config.no_viability_kernel and not self.config.no_precondition_antichain and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "viability_proof_envelope_enabled": bool((str(self.config.algorithm_version).upper().startswith("V6") or str(self.config.algorithm_version).upper().startswith("V7") or ((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14")) and self.config.v7_reference_runtime)) and not self.config.no_viability_kernel and not self.config.no_viability_proof_envelope and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "direct_precondition_compilation_enabled": bool(any(str(self.config.algorithm_version).upper().startswith(v) for v in ("V7","V8","V9","V10","V11","V12","V13","V14")) and not self.config.no_viability_kernel and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "incremental_acceptance_compilation_enabled": bool((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14")) and not self.config.no_viability_kernel and not self.config.v7_reference_runtime and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "capability_projection_enabled": bool((str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14")) and not self.config.v8_reference_runtime and not self.config.no_capability_projection and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime),
+            "frontier_signature_index_enabled": bool((str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14")) and not self.config.v8_reference_runtime and not self.config.no_frontier_signature_index and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime),
             "semnaive_projected_kernel_enabled": bool(
-                (str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12"))
+                (str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14"))
                 and not self.config.v9_reference_runtime and not self.config.v11_native_quotient_experimental
                 and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime
                 and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime and not self.config.v8_reference_runtime
             ),
             "semnaive_delta_propagation_enabled": bool(
-                (str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12"))
+                (str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14"))
                 and not self.config.v9_reference_runtime and not self.config.v11_native_quotient_experimental
                 and not self.config.no_semnaive_delta_propagation
             ),
             "packed_frontier_dominance_enabled": bool(
-                (str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12"))
+                (str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14"))
                 and not self.config.v9_reference_runtime and not self.config.v11_native_quotient_experimental
                 and not self.config.no_packed_frontier_dominance
             ),
             "native_projected_kernel_enabled": bool(str(self.config.algorithm_version).upper().startswith("V11") and self.config.v11_native_quotient_experimental and not self.config.v10_reference_runtime and not self.config.no_viability_kernel and not self.config.v2_reference_runtime and not self.config.v5_reference_runtime and not self.config.v6_reference_runtime and not self.config.v7_reference_runtime and not self.config.v8_reference_runtime and not self.config.v9_reference_runtime),
             "native_fused_frontier_insertion_enabled": bool(str(self.config.algorithm_version).upper().startswith("V11") and self.config.v11_native_quotient_experimental and not self.config.v10_reference_runtime and not self.config.no_fused_frontier_insertion),
             "legacy_static_learned_guidance_enabled": bool((not self.config.no_learned_feasibility_guidance) and (
-                (not str(self.config.algorithm_version).upper().startswith(("V11", "V12")))
+                (not str(self.config.algorithm_version).upper().startswith(("V11", "V12", "V13", "V14")))
                 or self.config.v11_legacy_static_guidance or self.config.v12_legacy_static_guidance
+                or self.config.v13_legacy_static_guidance or self.config.v14_legacy_static_guidance
                 or self.config.v10_reference_runtime or self.config.v9_reference_runtime or self.config.v8_reference_runtime
                 or self.config.v7_reference_runtime or self.config.v6_reference_runtime or self.config.v5_reference_runtime
                 or self.config.v2_reference_runtime
@@ -421,19 +451,25 @@ class ClosedLoopRunner:
                 and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime
                 and not self.config.no_lazy_diagnostic_replay and not self.config.no_viability_kernel
             ),
-            "lazy_exact_diagnostic_replay_enabled": bool((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12")) and not self.config.no_lazy_diagnostic_replay and not self.config.no_viability_kernel and not self.config.v7_reference_runtime and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
-            "rejection_antichain_enabled": bool((str(self.config.algorithm_version).upper().startswith("V7") or ((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12")) and self.config.v7_reference_runtime)) and not self.config.no_viability_kernel and not self.config.no_rejection_kernel and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "lazy_exact_diagnostic_replay_enabled": bool((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14")) and not self.config.no_lazy_diagnostic_replay and not self.config.no_viability_kernel and not self.config.v7_reference_runtime and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
+            "rejection_antichain_enabled": bool((str(self.config.algorithm_version).upper().startswith("V7") or ((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14")) and self.config.v7_reference_runtime)) and not self.config.no_viability_kernel and not self.config.no_rejection_kernel and not self.config.v6_reference_runtime and not self.config.v5_reference_runtime and not self.config.v2_reference_runtime),
             "proof_carrying_viability_certificates": bool(
                 (
                     str(self.config.algorithm_version).upper().startswith("V5")
                     or (str(self.config.algorithm_version).upper().startswith("V6") and not self.config.no_viability_proof_envelope)
                     or (str(self.config.algorithm_version).upper().startswith("V7") and not self.config.no_rejection_kernel)
-                    or ((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12")) and not self.config.no_lazy_diagnostic_replay)
+                    or ((str(self.config.algorithm_version).upper().startswith("V8") or str(self.config.algorithm_version).upper().startswith("V9") or str(self.config.algorithm_version).upper().startswith("V10") or str(self.config.algorithm_version).upper().startswith("V11") or str(self.config.algorithm_version).upper().startswith("V12") or str(self.config.algorithm_version).upper().startswith("V13") or str(self.config.algorithm_version).upper().startswith("V14")) and not self.config.no_lazy_diagnostic_replay)
                 )
                 and not self.config.no_viability_kernel
                 and not self.config.generic_viability_certificates
                 and not self.config.v2_reference_runtime
             ),
+            "cqhpt_enabled": bool(version_upper.startswith("V14") and self.config.cqhpt_checkpoint and not self.config.no_cqhpt),
+            "v14_exact_no_learned_ordering": bool(version_upper.startswith("V14") and not self.config.v14_legacy_static_guidance and not (self.config.cqhpt_checkpoint and not self.config.no_cqhpt)),
+            "v14_legacy_edge_validity_ordering_enabled": bool(version_upper.startswith("V14") and self.config.v14_legacy_static_guidance),
+            "cqhpt_checkpoint": (str(self.config.cqhpt_checkpoint) if self.config.cqhpt_checkpoint else None),
+            "compiled_diagnostic_transition_program_enabled": bool(version_upper.startswith("V13") and not self.config.no_compiled_diagnostic_transition_program and not self.config.v12_reference_runtime and not self.config.no_lazy_diagnostic_replay),
+            "runtime_metric_decomposition": "primary_decision + conditional_exact_rejection + end_to_end",
             "vehicle_metric_semantics": vehicle_semantics,
             "publication_integrated_vehicle_closed_loop_ready": integrated_ready,
             "passenger_service_metrics_available": bool(metrics_rows),

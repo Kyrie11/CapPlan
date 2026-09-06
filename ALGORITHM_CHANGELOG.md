@@ -1274,3 +1274,163 @@ If V13-fast is `GO`, run the 997-episode V13 full confirmation. Only full GO pro
 A future CQ-HPT must be motivated by the passenger capability program's need to retrieve lower-level heterogeneous service evidence, not by the existence of Transformer backbones. Its query is the compiled phase / active clause-group / forward residual / kernel state; keys/values are raw pedestrian polylines, entrance/frontage, curb/PUDO/interface geometry, raw elevation primitives, dynamic agents/occupancy, stop legality and provenance/confidence. The learned outputs are reliability, dynamics, calibrated uncertainty, soft ordering or amortized proposals. Exact `Allow/Update/Sat` retain hard authority.
 
 HGT, heterogeneous driving graphs, polyline Transformers, KNN relative-pose attention, query-centric context reuse, sparse interaction graphs and goal-conditioned planning queries are all prior architectural ingredients; none is a contribution in isolation. CQ-HPT must demonstrate that **capability-program-conditioned evidence routing** itself provides incremental value.
+
+## V13-fast seed13 decision — CDTP is exact and reusable, but not a runtime mechanism
+
+**Date:** 2026-09-06  
+**Decision:** `STOP` under the preregistered V13-fast gate. The deterministic `256`-episode / `2048`-request suite is attribution-valid. CDTP is semantically exact and heavily reused, but the repeated causal timing gain is statistically unresolved and the historical `<=2x V2` end-to-end gate remains closed.
+
+### Reliability and exactness
+
+V13 full preserves `PCDecisionF1=1`, FAR=FRR=`0`, and is exactly equivalent to V11 at every registered semantic output used by the gate:
+
+- passenger-decision mismatch: `0 / 2048`;
+- primary expansion mismatch: `0 / 2048`;
+- skeleton mismatch: `0 / 2048`;
+- certificate-signature mismatch: `0 / 2048`;
+- **full certificate JSON mismatch: `0 / 2048`**;
+- T5 phase/resource/source macro-F1 `~=0.832/0.665/0.630` and certificate exact `~=0.768`;
+- `DiagnosticReplayRescueRate=0`.
+
+The package can therefore be used for mechanism attribution. A reporting-only bug was found in `evaluation_semantics.json`: the version-feature gate stopped at V12 and mislabeled V13 capability-projection / semi-naive / lazy-replay metadata as disabled. Planner configuration, runtime traces, metrics, exactness comparisons and gate computation are unaffected. The next version fixes this metadata bug.
+
+### CDTP mechanism result
+
+The intended reusable object is real:
+
+- compiled-program reuse rate `~=68%`;
+- applications `~=32.4/request`;
+- compiles `~=10.3/request`;
+- fallback count `=0`.
+
+Thus ledger-independent partial evaluation of a fixed passenger transition is a valid exact representation. However, the preregistered causal timing test does **not** support promotion as an algorithmic runtime mechanism:
+
+- repeated no-program reference `~=38.196 ms/request`;
+- repeated V13 `~=37.928 ms/request`;
+- reference-minus-V13 `~=+0.268 ms/request`;
+- episode-clustered 95% CI `[-0.553, 1.100] ms` crosses zero;
+- repeated V13 / V2 `~=2.15x`.
+
+**RETIRE CDTP as a promoted runtime mechanism.** Preserve it only as exact engineering evidence that transition-level partial evaluation is reusable but not operationally decisive in this workload. Do not create another cache/program/rejection-antichain variant.
+
+### Symbolic freeze after V13
+
+V13 closes the preregistered symbolic-runtime contingency sequence. The following are now frozen unless a later independent-verifier/full closed-loop experiment exposes a soundness contradiction:
+
+- Passenger-Complete terminal semantics;
+- phase-scoped non-substitutable capability algebra;
+- evidence-grounded hard authority and conservative typed semantics;
+- lifecycle/service automaton;
+- typed path-coupled backward viability;
+- capability-induced observational quotient;
+- semi-naive exact projected fixed-point construction;
+- packed exact dominance;
+- verifier-aligned exact rejection as a semantic requirement.
+
+Explanation runtime is now reported separately from primary-decision latency. It is no longer a reason to reopen the semantic/planning backbone.
+
+## V14 — CQ-HPT Necessity Validation: Capability-Query Heterogeneous Polyline Transformer
+
+**Status:** implemented as the first learned mainline after the V13 symbolic freeze. **Not promoted yet.** The purpose of V14 is to test whether capability-program-conditioned heterogeneous evidence routing is actually needed in the frozen CapPlan setting.
+
+### Why V14 is a necessity test rather than an architecture showcase
+
+The exact SN-CPK backbone already averages only about `4.22` expansions/request on the fast test subset, and the historical static learned feasibility prior improves that by only about `0.27` expansion/request. Therefore a larger Transformer used only as a search-ordering module has very little headroom and may add more inference cost than it saves. V14 must be allowed to falsify CQ-HPT.
+
+The paper does **not** gain a new fourth headline contribution merely because CQ-HPT exists. The three semantic contributions remain frozen. If V14 succeeds, CQ-HPT is promoted as the strongest **learning mechanism** serving those contributions.
+
+### Frozen authority boundary
+
+V14 uses the exact V10/V11 SN-CPK acceptance backbone:
+
+`Passenger capability program -> exact local Allow/Update -> capability-projected SN-CPK viability -> typed TSBS acceptance -> exact proof-on-demand rejection`.
+
+CQ-HPT is invoked only on the sibling frontier **after** local hard feasibility, typed backward viability and label dominance have passed. A learned score can therefore change queue order / bounded-search efficiency, but cannot insert an infeasible successor, alter `Allow/Update/Sat`, overwrite authoritative evidence, or change the final certificate semantics.
+
+### CQ-HPT representation
+
+The network query is derived from the executable passenger state rather than a generic learned task token:
+
+- current service phase / action;
+- forward typed ledger observedness and signed residuals;
+- hard active-now / active-future resource requirements;
+- requirement-group counts and lifecycle state;
+- current transition cost/history.
+
+The heterogeneous evidence bank contains lower-level service primitives:
+
+- pedestrian/path polyline geometry and raw elevation primitives;
+- PUDO / curb / stop geometry and provenance;
+- vehicle-interface token;
+- dynamic agent state / occupancy context;
+- route / stop-legality / provenance tokens;
+- candidate-transition structural token.
+
+Verifier-level processed path width, final slope/cross-slope, curb-ramp and step-free truth are deliberately excluded from the raw path-token branch so the network cannot obtain target-equivalent leakage by reading the exact resource it is supposed to reason about.
+
+A compact passenger-independent `cqhpt_evidence_cache.jsonl` is prepared once from the frozen accessibility graph. Evaluation remains on the canonical **test split** and does not reload full graph JSON per request or exploit cross-passenger runtime caching.
+
+### Exact multi-path teacher
+
+V14 deliberately does not revive V3 single-oracle-trace imitation. The teacher is exported at the exact frontier where learned routing is allowed to act. For each hard-feasible, typed-viable successor, the frozen capability-projected acceptance antichain provides all retained executable continuation summaries. The training target is the best achievable worst hard typed margin:
+
+`y(s') = max_{phi in A_acc(s'), Sat(phi(R'),Psi)} min_j margin_j(phi(R'),Psi)`.
+
+This is an exact **multi-path continuation margin**, not a binary label for whether the successor lies on one arbitrarily selected oracle skeleton. Dominated exact summaries cannot improve the target under the registered monotone typed order. The target is training-only and never enters hard planning.
+
+### Matched-capacity causal controls
+
+V14 trains four architecture-matched modes:
+
+1. `full`: passenger capability query participates in heterogeneous evidence routing;
+2. `late_fusion`: the same attention stack routes evidence with a passenger-neutral structural query; passenger capability enters only the final scoring head;
+3. `neutral_query`: capability-specific query fields are masked for both routing and scoring;
+4. `query_only`: the capability/query tower is retained but heterogeneous evidence is removed.
+
+Additional planner controls:
+
+5. `exact_no_learning`: frozen SN-CPK with both historical learned edge-validity and transition-static feasibility ordering disabled;
+6. `legacy_static`: historical learned edge-validity + transition-static feasibility ordering restored as the legacy comparator.
+
+The full/late/neutral modes have the same token encoder, cross-attention stack, hidden size and scoring-head capacity. The causal difference is whether the **compiled capability state changes what evidence is routed**.
+
+### V14-fast preregistration
+
+CQ-HPT is promoted only if all gates pass on the deterministic `256`-episode test subset:
+
+**Semantic authority**
+
+- `PCDecisionF1>=0.99`, FAR=FRR=`0`;
+- zero passenger-decision mismatch vs exact no-learning;
+- zero full-certificate JSON mismatch vs exact no-learning;
+- all four T5 metrics `>= exact_no_learning - 0.01`.
+
+**Capability-routing necessity**
+
+Full CQ-HPT must reduce paired TSBS expansions with episode-clustered 95% CI lower bound `>0` against **every** control:
+
+- exact no-learning;
+- legacy static guidance;
+- late fusion;
+- neutral query;
+- query only.
+
+This deliberately makes `full > late_fusion` the core evidence that capability state must participate in evidence routing rather than merely final fusion, and `full > query_only` the evidence that heterogeneous raw evidence is necessary.
+
+**Operational net gain**
+
+Four counterbalanced serial repeats compare full CQ-HPT with exact no-learning using **primary-decision latency**. Full CQ-HPT must be faster on average with episode-clustered 95% CI lower bound `>0`, and decisions must remain exact. A Transformer that only saves expansions but increases primary wall-clock is not promoted.
+
+**Teacher learnability**
+
+- full validation pairwise accuracy `>=0.60`;
+- full is not materially worse than neutral-query or late-fusion teacher accuracy.
+
+### Decision rules after V14
+
+- If `full ~= late_fusion/neutral_query`: capability-conditioned routing is unproven. Do **not** retain CQ-HPT merely for novelty.
+- If `full ~= query_only`: raw heterogeneous evidence is not needed for this task; do not retain the evidence Transformer.
+- If expansion gates pass but primary latency fails: current search-ordering role has no operational value. Keep the frozen exact semantic backbone and consider a smaller router or a different learned target; do not weaken hard authority.
+- If all fast gates pass: run the 997-episode full confirmatory suite. Only full GO promotes CQ-HPT as CapPlan's principal learning mechanism.
+
+CQ-HPT is explicitly **not** the reason the paper exists. The paper's conceptual novelty remains Passenger-Complete Planning; its central algorithmic novelty remains Capability-Compiled Quotient Executable Semantics. CQ-HPT is justified only if executable capability state is experimentally shown to require state/passenger-dependent routing of heterogeneous evidence.

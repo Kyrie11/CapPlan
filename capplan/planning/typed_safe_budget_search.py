@@ -31,6 +31,7 @@ from capplan.planning.capability_precondition_antichain import (
     evaluate_precondition_antichain,
     evaluate_proof_precondition_antichain,
     evaluate_rejection_precondition_antichain,
+    evaluate_precondition_teacher_target,
 )
 from capplan.planning.direct_capability_precondition_kernel import build_direct_dual_precondition_kernel
 from capplan.planning.incremental_capability_precondition_kernel import build_incremental_acceptance_kernel
@@ -176,6 +177,7 @@ class TypedSafeBudgetSearch:
         transition_semantic_cache: ExactTransitionSemanticCache | None = None,
         transition_semantic_cache_mode: str = "off",
         compiled_transition_program_cache: CompiledTransitionProgramCache | None = None,
+        frontier_trace_callback: Any | None = None,
     ):
         predictions = predictions or {}
         clauses = [] if (compiled.soft_only or self.config.soft_only_capability) else compiled.clauses
@@ -523,6 +525,18 @@ class TypedSafeBudgetSearch:
                     continue
                 labels = [l for l in labels if not dominates(d_new, l.as_dominance_dict(), self.registry)]
                 labels.append(new_label)
+                if frontier_trace_callback is not None:
+                    teacher = None
+                    if precondition_antichain is not None:
+                        teacher = evaluate_precondition_teacher_target(
+                            (new_label.anchor, new_label.phase), new_label.resource_ledger,
+                            compiled, precondition_antichain, self.registry,
+                        )
+                    frontier_trace_callback(
+                        parent_label=label, successor_label=new_label, transition=e,
+                        prediction=predictions.get(e.transition_id), compiled=compiled,
+                        teacher=teacher,
+                    )
                 pushable.append((new_label, e, predictions.get(e.transition_id), continuation))
 
             # V3 scores the sibling frontier in one batch. The raw pairwise ranker

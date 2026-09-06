@@ -702,3 +702,62 @@ def evaluate_precondition_antichain(
             return AntichainDecision(True, None, checked)
         best = better_violation(best, vio)
     return AntichainDecision(False, best, checked)
+
+@dataclass(frozen=True)
+class CapabilityTeacherDecision:
+    """Training-only exact continuation target for learned search guidance.
+
+    ``robust_margin`` is the best (maximum) minimum hard-clause/group margin
+    achievable by any acceptance summary retained in the exact capability
+    quotient. Dominated summaries cannot improve this monotone max-min target,
+    so it is well-defined on the frozen antichain representation. It never
+    participates in hard planning decisions.
+    """
+    viable: bool
+    robust_margin: float | None
+    viable_summary_count: int
+    checked_summaries: int
+
+
+def evaluate_precondition_teacher_target(
+    state: State,
+    ledger: Mapping[str, Any],
+    compiled: CompiledContract,
+    antichain: CapabilityPreconditionAntichain,
+    registry: ResourceRegistry = DEFAULT_REGISTRY,
+) -> CapabilityTeacherDecision:
+    """Return an exact multi-summary teacher target for CQ-HPT training.
+
+    This is deliberately not a shortest-path/single-skeleton label. For every
+    exact acceptance summary that is executable from ``ledger``, it applies the
+    same typed algebra and computes the minimum returned capability margin; the
+    target is the best such minimum margin. This avoids V3's single-trace
+    imitation failure mode while keeping the learned module subordinate to the
+    exact executable semantics.
+    """
+    summaries = antichain.state_summaries(state)
+    if not antichain.state_complete(state):
+        return CapabilityTeacherDecision(True, None, 0, 0)
+    if not summaries:
+        return CapabilityTeacherDecision(False, None, 0, 0)
+    best_margin: float | None = None
+    viable_count = 0
+    checked = 0
+    for summary in summaries:
+        checked += 1
+        # Exact prefix-observation preconditions.
+        missing_required = any(
+            is_missing(ledger.get(name, MissingEvidence(name, reason="not_observed")))
+            for name in summary.required_observed
+        )
+        if missing_required:
+            continue
+        combined = _combine_effect(ledger, summary, registry)
+        ok, margins, _ = satisfy_all(combined, compiled.clauses, compiled.groups, registry)
+        if not ok:
+            continue
+        viable_count += 1
+        vals = [float(v) for v in margins.values() if isinstance(v, (int, float))]
+        margin = min(vals) if vals else 0.0
+        best_margin = margin if best_margin is None else max(best_margin, margin)
+    return CapabilityTeacherDecision(viable_count > 0, best_margin, viable_count, checked)
