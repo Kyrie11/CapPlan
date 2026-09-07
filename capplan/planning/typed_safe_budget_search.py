@@ -321,8 +321,13 @@ class TypedSafeBudgetSearch:
         precondition_rejection_checks = 0
         precondition_rejection_hits = 0
         exact_robustness_checks = 0
+        exact_robustness_logical_checks = 0
         exact_robustness_scored = 0
         exact_robustness_missing = 0
+        exact_robustness_group_adjusted = 0
+        exact_robustness_group_rescued = 0
+        exact_robustness_cache_hits = 0
+        exact_robustness_cache: Dict[Tuple[Any, ...], Any] = {}
         while pq and expansions < self.config.max_expansions:
             _, _, label = heapq.heappop(pq)
             expansions += 1
@@ -356,12 +361,13 @@ class TypedSafeBudgetSearch:
                     "precondition_proof_envelope_hits": precondition_proof_envelope_hits,
                     "precondition_rejection_checks": precondition_rejection_checks,
                     "precondition_rejection_hits": precondition_rejection_hits,
-            "exact_robustness_checks": exact_robustness_checks,
-            "exact_robustness_scored": exact_robustness_scored,
-            "exact_robustness_missing": exact_robustness_missing,
                     "exact_robustness_checks": exact_robustness_checks,
+                    "exact_robustness_logical_checks": exact_robustness_logical_checks,
                     "exact_robustness_scored": exact_robustness_scored,
                     "exact_robustness_missing": exact_robustness_missing,
+                    "exact_robustness_group_adjusted": exact_robustness_group_adjusted,
+                    "exact_robustness_group_rescued": exact_robustness_group_rescued,
+                    "exact_robustness_cache_hits": exact_robustness_cache_hits,
                     "precondition_raw_suffixes": (precondition_antichain.raw_total if precondition_antichain is not None else 0),
                     "precondition_antichain_size": (precondition_antichain.antichain_total if precondition_antichain is not None else 0),
                     "precondition_raw_proofs": (precondition_antichain.proof_raw_total if precondition_antichain is not None else 0),
@@ -547,12 +553,29 @@ class TypedSafeBudgetSearch:
                     and (self.config.use_exact_robustness_ordering or frontier_trace_callback is not None)
                 )
                 if need_exact_robustness:
-                    teacher = evaluate_precondition_teacher_target(
-                        (new_label.anchor, new_label.phase), new_label.resource_ledger,
-                        compiled, precondition_antichain, self.registry,
+                    teacher_key = (
+                        (new_label.anchor, new_label.phase),
+                        self._ledger_signature(new_label.resource_ledger),
                     )
+                    teacher = exact_robustness_cache.get(teacher_key)
+                    teacher_evaluated = teacher is None
+                    if teacher_evaluated:
+                        teacher = evaluate_precondition_teacher_target(
+                            (new_label.anchor, new_label.phase), new_label.resource_ledger,
+                            compiled, precondition_antichain, self.registry,
+                        )
+                        exact_robustness_cache[teacher_key] = teacher
+                    else:
+                        exact_robustness_cache_hits += 1
                     if self.config.use_exact_robustness_ordering:
-                        exact_robustness_checks += int(teacher.checked_summaries)
+                        # Logical checks count how much exact summary information
+                        # the ordering consumes; physical checks count only actual
+                        # teacher evaluations after request-local memoization.
+                        exact_robustness_logical_checks += int(teacher.checked_summaries)
+                        if teacher_evaluated:
+                            exact_robustness_checks += int(teacher.checked_summaries)
+                            exact_robustness_group_adjusted += int(getattr(teacher, "group_adjusted_summaries", 0))
+                            exact_robustness_group_rescued += int(getattr(teacher, "group_rescued_summaries", 0))
                         if teacher.robust_margin is None:
                             exact_robustness_missing += 1
                         else:
@@ -617,8 +640,12 @@ class TypedSafeBudgetSearch:
             "precondition_rejection_checks": precondition_rejection_checks,
             "precondition_rejection_hits": precondition_rejection_hits,
             "exact_robustness_checks": exact_robustness_checks,
+            "exact_robustness_logical_checks": exact_robustness_logical_checks,
             "exact_robustness_scored": exact_robustness_scored,
             "exact_robustness_missing": exact_robustness_missing,
+            "exact_robustness_group_adjusted": exact_robustness_group_adjusted,
+            "exact_robustness_group_rescued": exact_robustness_group_rescued,
+            "exact_robustness_cache_hits": exact_robustness_cache_hits,
             "precondition_raw_suffixes": (precondition_antichain.raw_total if precondition_antichain is not None else 0),
             "precondition_antichain_size": (precondition_antichain.antichain_total if precondition_antichain is not None else 0),
             "precondition_raw_proofs": (precondition_antichain.proof_raw_total if precondition_antichain is not None else 0),

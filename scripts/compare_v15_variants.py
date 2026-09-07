@@ -7,6 +7,23 @@ import numpy as np
 
 def rows(d): return [json.loads(x) for x in (Path(d)/'episode_metrics.jsonl').read_text().splitlines() if x.strip()]
 
+def axis_of(row):
+    axis=row.get('counterfactual_axis')
+    if axis not in (None,'','None'):
+        return str(axis)
+    suffix=str(row.get('passenger_id','')).split(':')[-1]
+    mapping={
+        'basic_service_complete':'base',
+        'cf_access_distance_strict':'access_distance',
+        'cf_step_free_required':'step_free',
+        'cf_min_width_strict':'min_width',
+        'cf_ramp_or_lift_required':'ramp_lift',
+        'cf_door_side_clearance_strict':'door_side_clearance',
+        'cf_ride_motion_strict':'ride_motion',
+        'cf_confidence_strict':'confidence',
+    }
+    return mapping.get(suffix,suffix or 'base')
+
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--reference',required=True); ap.add_argument('--candidate',required=True); ap.add_argument('--output',required=True); ap.add_argument('--bootstrap',type=int,default=10000); ap.add_argument('--seed',type=int,default=13); a=ap.parse_args()
     r={(x['episode_id'],x['passenger_id']):x for x in rows(a.reference)}; c={(x['episode_id'],x['passenger_id']):x for x in rows(a.candidate)}; keys=sorted(set(r)&set(c))
@@ -25,10 +42,10 @@ def main():
     # Diagnostic-only mechanism localization.  This never enters the GO gate,
     # but shows whether a capability-conditioned router helps particular
     # counterfactual capability axes rather than only aggregate easy cases.
-    axes=sorted({str(c[k].get('counterfactual_axis') or 'base') for k in keys})
+    axes=sorted({axis_of(c[k]) for k in keys})
     by_axis={}
     for axis in axes:
-        kk=[k for k in keys if str(c[k].get('counterfactual_axis') or 'base')==axis]
+        kk=[k for k in keys if axis_of(c[k])==axis]
         if not kk: continue
         by_axis[axis]={
             'requests':len(kk),

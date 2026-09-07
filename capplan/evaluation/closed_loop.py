@@ -21,6 +21,25 @@ def _cert_key(c: Dict[str, Any]) -> Tuple[str, str]:
     return c.get("episode_id"), c.get("passenger_id")
 
 
+def _counterfactual_axis(contract) -> str:
+    """Return a stable axis label even for older frozen contract metadata."""
+    meta = contract.metadata if isinstance(getattr(contract, "metadata", None), dict) else {}
+    axis = meta.get("counterfactual_axis")
+    if axis not in (None, "", "None"):
+        return str(axis)
+    suffix = str(getattr(contract, "passenger_id", "")).split(":")[-1]
+    return {
+        "basic_service_complete": "base",
+        "cf_access_distance_strict": "access_distance",
+        "cf_step_free_required": "step_free",
+        "cf_min_width_strict": "min_width",
+        "cf_ramp_or_lift_required": "ramp_lift",
+        "cf_door_side_clearance_strict": "door_side_clearance",
+        "cf_ride_motion_strict": "ride_motion",
+        "cf_confidence_strict": "confidence",
+    }.get(suffix, suffix or "unknown")
+
+
 def result_to_episode_metrics(
     result, metadata: Dict[str, Any], contract,
     oracle_certificate: Dict[str, Any] | None = None,
@@ -70,8 +89,8 @@ def result_to_episode_metrics(
         "episode_id": metadata.get("episode_id"),
         "passenger_id": contract.passenger_id,
         "passenger_profile": (contract.metadata.get("profile_name") if isinstance(getattr(contract, "metadata", None), dict) else None),
-        "counterfactual_axis": (contract.metadata.get("counterfactual_axis") if isinstance(getattr(contract, "metadata", None), dict) else None),
-        "is_base_profile": bool((contract.metadata.get("counterfactual_axis") in (None, "", "base")) if isinstance(getattr(contract, "metadata", None), dict) else False),
+        "counterfactual_axis": _counterfactual_axis(contract),
+        "is_base_profile": _counterfactual_axis(contract) == "base",
         "collision": bool(traj.get("collision", False)),
         "drivable_area": bool(traj.get("drivable_area", True)),
         "traffic_safe": traffic_safe,
@@ -103,8 +122,12 @@ def result_to_episode_metrics(
         "precondition_rejection_checks": int(result.diagnostics.get("precondition_rejection_checks", 0) or 0),
         "precondition_rejection_hits": int(result.diagnostics.get("precondition_rejection_hits", 0) or 0),
         "exact_robustness_checks": int(result.diagnostics.get("exact_robustness_checks", 0) or 0),
+        "exact_robustness_logical_checks": int(result.diagnostics.get("exact_robustness_logical_checks", 0) or 0),
         "exact_robustness_scored": int(result.diagnostics.get("exact_robustness_scored", 0) or 0),
         "exact_robustness_missing": int(result.diagnostics.get("exact_robustness_missing", 0) or 0),
+        "exact_robustness_group_adjusted": int(result.diagnostics.get("exact_robustness_group_adjusted", 0) or 0),
+        "exact_robustness_group_rescued": int(result.diagnostics.get("exact_robustness_group_rescued", 0) or 0),
+        "exact_robustness_cache_hits": int(result.diagnostics.get("exact_robustness_cache_hits", 0) or 0),
         "precondition_raw_suffixes": int(result.diagnostics.get("precondition_raw_suffixes", 0) or 0),
         "precondition_antichain_size": int(result.diagnostics.get("precondition_antichain_size", 0) or 0),
         "precondition_raw_proofs": int(result.diagnostics.get("precondition_raw_proofs", 0) or 0),
@@ -480,6 +503,7 @@ class ClosedLoopRunner:
             "v15_exact_robustness_ordering_enabled": bool(version_upper.startswith("V15") and not self.config.no_exact_robustness_ordering and not self.config.v15_legacy_static_guidance),
             "v15_exact_robustness_count_only": bool(version_upper.startswith("V15") and self.config.exact_robustness_count_only),
             "v15_exact_no_ordering": bool(version_upper.startswith("V15") and self.config.no_exact_robustness_ordering and not self.config.v15_legacy_static_guidance),
+            "v15_robustness_group_semantics": ("requirement_group_aware_v2" if version_upper.startswith("V15") else None),
             "v14_exact_no_learned_ordering": bool(version_upper.startswith("V14") and not self.config.v14_legacy_static_guidance and not (self.config.cqhpt_checkpoint and not self.config.no_cqhpt)),
             "v14_legacy_edge_validity_ordering_enabled": bool(version_upper.startswith("V14") and self.config.v14_legacy_static_guidance),
             "cqhpt_checkpoint": (str(self.config.cqhpt_checkpoint) if self.config.cqhpt_checkpoint else None),

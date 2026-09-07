@@ -55,3 +55,41 @@ def test_v15_exact_and_legacy_controls_are_causally_separated():
     assert not legacy.searcher.config.use_exact_robustness_ordering
     assert legacy.searcher.config.lambda_edge_validity > 0.0
     assert legacy.searcher.config.lambda_learned_feasibility > 0.0
+
+from capplan.data.schemas import CapabilityClause, CapabilityContract, RequirementGroup
+from capplan.planning.capability_precondition_antichain import _hard_semantic_robustness_margin
+
+
+def test_v15r_robustness_respects_any_of_as_one_semantic_hard_unit():
+    clauses=[
+        CapabilityClause('ramp',['board'],'requires',True,'categorical',clause_id='ramp'),
+        CapabilityClause('lift',['board'],'requires',True,'categorical',clause_id='lift'),
+        CapabilityClause('door_width_m',['board'],'>=',0.8,'lower',clause_id='door'),
+    ]
+    contract=CapabilityContract('p',clauses,groups=[RequirementGroup('boarding',['board'],'any_of',['ramp','lift'],hard=True)])
+    compiled=CapabilityCompiler().compile(contract)
+    ok,semantic,flat=_hard_semantic_robustness_margin({'ramp':True,'lift':False,'door_width_m':0.9},compiled)
+    assert ok
+    assert semantic is not None and semantic >= 0.0
+    assert flat is not None and flat < 0.0
+
+
+def test_v15r_robustness_all_of_still_uses_worst_member():
+    clauses=[
+        CapabilityClause('ramp',['board'],'requires',True,'categorical',clause_id='ramp'),
+        CapabilityClause('lift',['board'],'requires',True,'categorical',clause_id='lift'),
+    ]
+    contract=CapabilityContract('p',clauses,groups=[RequirementGroup('both',['board'],'all_of',['ramp','lift'],hard=True)])
+    compiled=CapabilityCompiler().compile(contract)
+    ok,semantic,flat=_hard_semantic_robustness_margin({'ramp':True,'lift':False},compiled)
+    assert not ok
+    assert semantic == -1.0 and flat == -1.0
+
+
+def test_v15r_counterfactual_axis_falls_back_to_frozen_profile_id():
+    from types import SimpleNamespace
+    from capplan.evaluation.closed_loop import _counterfactual_axis
+    contract=SimpleNamespace(passenger_id='episode42:cf_ramp_or_lift_required', metadata={})
+    assert _counterfactual_axis(contract) == 'ramp_lift'
+    base=SimpleNamespace(passenger_id='episode42:basic_service_complete', metadata={})
+    assert _counterfactual_axis(base) == 'base'

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Preregistered V15 Exact Capability Robustness Potential (ECRP) gate."""
+"""Preregistered V15R group-semantic ECRP repair gate (thresholds unchanged)."""
 from __future__ import annotations
 import argparse,json
 from pathlib import Path
@@ -13,7 +13,7 @@ def main():
     for x in ['full','exact','legacy','count_only']: ap.add_argument(f'--{x.replace("_","-")}',dest=x,required=True)
     for x in ['full_exact','full_legacy','full_count','exactness','repeat_primary']: ap.add_argument(f'--{x.replace("_","-")}',dest=x,required=True)
     ap.add_argument('--output',required=True); a=ap.parse_args()
-    full,exact,legacy,count=map(met,[a.full,a.exact,a.legacy,a.count_only])
+    full,exact,legacy,count=map(met,[a.full,a.exact,a.legacy,a.count_only]); full_sem=load(Path(a.full)/'evaluation_semantics.json')
     comps={n:load(getattr(a,n)) for n in ['full_exact','full_legacy','full_count']}; ex=load(a.exactness); rep=load(a.repeat_primary)
     c={}
     c['pc_f1']=float(full.get('PCDecisionF1',0))>=0.99; c['far_zero']=abs(float(full.get('PCFalseAcceptRate',1)))<1e-12; c['frr_zero']=abs(float(full.get('PCFalseRejectRate',1)))<1e-12
@@ -28,7 +28,8 @@ def main():
     c['repeat_decisions_exact']=int(rep.get('decision_mismatch_count_max_over_repeats',1))==0
     c['robustness_scored']=float(full.get('ECRP_scored_successors_mean',0))>0
     c['robustness_checks']=float(full.get('ECRP_summary_checks_mean',0))>0
-    semantic=['pc_f1','far_zero','frr_zero','decision_exact','certificate_json_exact']+[f't5::{k}' for k in T5]
+    c['group_semantics_registered']=str(full_sem.get('v15_robustness_group_semantics',''))=='requirement_group_aware_v2'
+    semantic=['pc_f1','far_zero','frr_zero','decision_exact','certificate_json_exact','group_semantics_registered']+[f't5::{k}' for k in T5]
     causal=['full_exact_mean','full_exact_ci','full_legacy_mean','full_legacy_ci','full_count_mean','full_count_ci','robustness_scored','robustness_checks']
     operational=['primary_latency_beats_exact_mean','primary_latency_beats_exact_ci','repeat_decisions_exact']
     gates={'semantic_authority':all(c[k] for k in semantic),'typed_robustness_specific_gain':all(c[k] for k in causal),'operational_net_gain':all(c[k] for k in operational)}
@@ -40,7 +41,7 @@ def main():
              'full_vs_count':'Does typed robustness add value beyond merely counting executable continuation summaries at matched antichain-scan overhead?',
              'latency':'Does the small exact-ordering improvement have positive operational value on an already compressed frontier?'
          },
-         'next_if_go':'Run 997-episode V15 full confirmatory. ECRP may be promoted as a search-ordering corollary of C2, not as a new headline contribution, only if full confirms net latency and typed-specific gain.',
-         'next_if_stop':'Do not add another search-ordering mechanism. Freeze the exact SN-CPK backbone and shift remaining learning work to lower-level evidence/calibration or method-specific vehicle closed loop.'}
+         'next_if_go':'Run 997-episode V15R full confirmatory. ECRP may be promoted as a search-ordering corollary of C2, not as a new headline contribution, only if full confirms net latency and typed-specific gain.',
+         'next_if_stop':'Freeze search ordering after the repaired V15R test; do not add another search-ordering mechanism. Freeze the exact SN-CPK backbone and shift remaining learning work to lower-level evidence/calibration or method-specific vehicle closed loop.'}
     Path(a.output).write_text(json.dumps(out,indent=2,ensure_ascii=False)); print(json.dumps(out,indent=2,ensure_ascii=False))
 if __name__=='__main__': main()

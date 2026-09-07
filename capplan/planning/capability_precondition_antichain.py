@@ -35,9 +35,11 @@ from capplan.semantics.typed_resource_algebra import (
     PredicateState,
     active_clauses,
     active_groups,
+    best_group_margin,
     conservative_value,
     is_missing,
     neutral_value,
+    satisfy,
     satisfy_all,
     signed_margin,
     update_value,
@@ -705,18 +707,86 @@ def evaluate_precondition_antichain(
 
 @dataclass(frozen=True)
 class CapabilityTeacherDecision:
-    """Training-only exact continuation target for learned search guidance.
+    """Exact continuation target for non-authoritative search guidance.
 
-    ``robust_margin`` is the best (maximum) minimum hard-clause/group margin
+    ``robust_margin`` is the best (maximum) minimum *semantic hard-unit* margin
     achievable by any acceptance summary retained in the exact capability
-    quotient. Dominated summaries cannot improve this monotone max-min target,
-    so it is well-defined on the frozen antichain representation. It never
-    participates in hard planning decisions.
+    quotient.  A semantic hard unit is either an ungrouped hard clause or a
+    hard requirement group.  Requirement-group margins respect their Boolean
+    logic: ``any_of`` uses the best member margin, ``all_of`` uses the worst,
+    and ``not`` reverses the best member margin.  This is crucial: taking the
+    flat minimum over every atomic member of a satisfied ``any_of`` group would
+    incorrectly penalize unchosen alternatives (for example, a usable ramp
+    together with an unavailable lift).
+
+    The target never participates in hard planning decisions.  The diagnostic
+    counters below make the V15 scientific repair auditable without changing
+    ``Allow``/``Update``/``Sat``.
     """
     viable: bool
     robust_margin: float | None
     viable_summary_count: int
     checked_summaries: int
+    group_adjusted_summaries: int = 0
+    group_rescued_summaries: int = 0
+
+
+def _hard_semantic_robustness_margin(
+    resource_state: Mapping[str, Any],
+    compiled: CompiledContract,
+    registry: ResourceRegistry = DEFAULT_REGISTRY,
+) -> Tuple[bool, float | None, float | None]:
+    """Evaluate the hard contract as logical semantic units.
+
+    Returns ``(ok, semantic_margin, flat_atomic_margin)``.  The third value is
+    retained only to audit the historical V15 bug: it is the minimum margin one
+    would obtain by flattening members of hard requirement groups.
+    """
+    clauses_by_id = {c.id: c for c in compiled.clauses}
+    hard_groups = [g for g in compiled.groups if g.hard]
+    grouped_ids = {cid for g in hard_groups for cid in g.clause_ids}
+    semantic_margins: List[float] = []
+    flat_atomic_margins: List[float] = []
+    ok_all = True
+
+    for clause in compiled.clauses:
+        if (not clause.hard) or clause.id in grouped_ids:
+            continue
+        ok = satisfy(resource_state, clause, registry, optional=False)
+        margin = float(signed_margin(resource_state, clause, registry))
+        semantic_margins.append(margin)
+        flat_atomic_margins.append(margin)
+        ok_all = ok_all and bool(ok)
+
+    for group in hard_groups:
+        member_ok: List[bool] = []
+        member_margin: List[float] = []
+        for cid in group.clause_ids:
+            clause = clauses_by_id.get(cid)
+            if clause is None:
+                member_ok.append(False)
+                member_margin.append(-1.0)
+                continue
+            member_ok.append(bool(satisfy(resource_state, clause, registry, optional=False)))
+            member_margin.append(float(signed_margin(resource_state, clause, registry)))
+        if group.logic == "all_of":
+            gok = all(member_ok)
+        elif group.logic == "any_of":
+            gok = any(member_ok)
+        elif group.logic == "not":
+            gok = not any(member_ok)
+        else:  # schema validation should make this unreachable
+            raise ValueError(group.logic)
+        # Reuse the canonical typed-resource helper so quantitative guidance
+        # cannot drift from the requirement-group logic used elsewhere.
+        gmargin = best_group_margin(resource_state, group, clauses_by_id, registry)
+        ok_all = ok_all and bool(gok)
+        semantic_margins.append(float(gmargin))
+        flat_atomic_margins.extend(member_margin)
+
+    semantic = min(semantic_margins) if semantic_margins else (0.0 if ok_all else None)
+    flat = min(flat_atomic_margins) if flat_atomic_margins else semantic
+    return bool(ok_all), (float(semantic) if semantic is not None else None), (float(flat) if flat is not None else None)
 
 
 def evaluate_precondition_teacher_target(
@@ -737,12 +807,14 @@ def evaluate_precondition_teacher_target(
     """
     summaries = antichain.state_summaries(state)
     if not antichain.state_complete(state):
-        return CapabilityTeacherDecision(True, None, 0, 0)
+        return CapabilityTeacherDecision(True, None, 0, 0, 0, 0)
     if not summaries:
-        return CapabilityTeacherDecision(False, None, 0, 0)
+        return CapabilityTeacherDecision(False, None, 0, 0, 0, 0)
     best_margin: float | None = None
     viable_count = 0
     checked = 0
+    group_adjusted = 0
+    group_rescued = 0
     for summary in summaries:
         checked += 1
         # Exact prefix-observation preconditions.
@@ -753,11 +825,16 @@ def evaluate_precondition_teacher_target(
         if missing_required:
             continue
         combined = _combine_effect(ledger, summary, registry)
-        ok, margins, _ = satisfy_all(combined, compiled.clauses, compiled.groups, registry)
+        ok, margin, flat_margin = _hard_semantic_robustness_margin(combined, compiled, registry)
         if not ok:
             continue
         viable_count += 1
-        vals = [float(v) for v in margins.values() if isinstance(v, (int, float))]
-        margin = min(vals) if vals else 0.0
+        margin = 0.0 if margin is None else float(margin)
+        if flat_margin is not None and abs(float(flat_margin) - margin) > 1e-12:
+            group_adjusted += 1
+            if float(flat_margin) < 0.0 <= margin:
+                group_rescued += 1
         best_margin = margin if best_margin is None else max(best_margin, margin)
-    return CapabilityTeacherDecision(viable_count > 0, best_margin, viable_count, checked)
+    return CapabilityTeacherDecision(
+        viable_count > 0, best_margin, viable_count, checked, group_adjusted, group_rescued
+    )

@@ -1514,7 +1514,7 @@ It then affects sibling queue order only. It cannot make an infeasible transitio
 
 ### Why this is the correct post-V14 question
 
-V14 established that approximating this exact target with capability-conditioned evidence routing is unnecessary in the current compressed frontier. The exact target is nevertheless already present in the frozen semantic backbone. V15 therefore tests a simpler hypothesis:
+V14 did not justify promoting capability-conditioned evidence routing in the current compressed frontier: the implemented router lost the operational/causal gates. The exact target used in that run is nevertheless already present in the frozen semantic backbone. V15 therefore tested a simpler hypothesis (later subjected to the V15R group-semantics repair below):
 
 > Does the capability quotient itself contain a useful exact continuation potential that improves search with positive *net* operational value?
 
@@ -1562,3 +1562,59 @@ Four counterbalanced serial repeats compare ECRP with exact no-ordering. ECRP mu
 - Only if all fast gates pass should the 997-episode V15 full confirmatory run be executed.
 
 If V15 STOPs, **freeze search ordering** and stop creating new ranking/router mechanisms. The next algorithmic learning work should move to lower-level evidence/calibration or amortized proposals that solve a demonstrably unresolved problem, while the exact capability semantics retain hard authority. Method-specific nuPlan closed-loop integration should then become a higher-priority publication task.
+
+## V15-fast seed13 scientific audit — attribution reliable, typed-robustness conclusion not yet adjudicated
+
+**Date:** 2026-09-07  
+**Decision:** the uploaded V15-fast run is runtime/attribution valid, but the V15 ECRP hypothesis fails a post-run **scientific-semantics audit**. Therefore the observed preregistered `STOP` is valid for the *implemented* V15 scorer, but it must **not** be interpreted as evidence that logically correct typed continuation robustness is unnecessary.
+
+### What is reliable in the uploaded V15 run
+
+- 256 deterministic episodes / 2048 paired passenger requests are complete across ECRP, exact, count-only and legacy-static variants.
+- `algorithm_attribution_ready=true`, with no attribution warnings.
+- ECRP preserves `PCDecisionF1=1`, FAR=FRR=`0`, exact passenger decisions and exact failure-certificate JSON versus the frozen SN-CPK control.
+- Four counterbalanced serial repeats are stable: ECRP saves about `0.112` expansion/request vs exact but is about `2.12 ms/request` slower in primary-decision latency.
+- ECRP loses significantly to both legacy static ordering and summary-count-only in expansions under the implemented scorer.
+
+### Scientific-semantics bug found after the run
+
+The V15 teacher claimed to compute the minimum margin over **hard semantic requirements**, but implementation flattened every atomic margin returned by `satisfy_all()`. For a hard `any_of` group such as `ramp OR lift`, `satisfy_all()` correctly accepts the group when one option is satisfied, while still returning a negative atomic margin for an unchosen option. V15 then took the flat minimum and could assign a negative robustness to an actually feasible continuation; queue code subsequently clipped that value to zero.
+
+This violates the intended definition of the ECRP semantic unit. Requirement groups must be aggregated before the global minimum:
+
+- `all_of`: minimum member margin;
+- `any_of`: maximum member margin;
+- `not`: negative maximum member margin.
+
+Only ungrouped hard clauses and hard groups then participate in the outer minimum. Existing successful benchmark plans contain concrete examples where a boarding `any_of` group is satisfied while one unchosen member has margin `-1`, so this is not a purely hypothetical edge case.
+
+### V15R — Group-Semantic ECRP attribution repair
+
+V15R is **not V16** and does not reopen search-router design. It repairs the quantitative semantics of the already preregistered V15 object and reruns the same gate.
+
+Changes:
+
+1. group-aware hard robustness evaluation consistent with `Sat`;
+2. audit counters for summaries changed/rescued by group aggregation;
+3. request-local exact-robustness memoization (engineering-only; no hard semantics change);
+4. counterfactual-axis labels are recovered at the evaluation source from passenger profile IDs when older frozen contract metadata lacks `counterfactual_axis`, with the comparison script retaining the same fallback;
+5. request-local ECRP memoization is instrumented with separate *physical* summary checks, logical summary checks, and cache hits so an optimization cannot make the scientific overhead diagnostic misleading;
+6. duplicate V15 diagnostic dictionary keys in the success-return path were removed;
+7. `evaluation_semantics.json` records `v15_robustness_group_semantics=requirement_group_aware_v2`, and the gate refuses to adjudicate ECRP without that marker;
+8. the repair output namespace defaults to `v15r_*` to prevent old V15 artifacts from being silently reused.
+
+### Preregistration remains unchanged
+
+V15R may be promoted only if group-aware ECRP beats exact no-ordering, legacy static, and summary-count-only with paired episode-clustered expansion CI lower bound `>0`, **and** beats exact in four counterbalanced primary-decision timing repeats with latency-delta CI lower bound `>0`, while preserving exact decisions/certificates/T5.
+
+If repaired V15R STOPs, freeze search ordering and do not create another router/ranker version. Move the mainline to publication-critical closed-loop/generalization and to learned lower-level evidence/calibration only where an unresolved inference problem is demonstrated.
+
+### Amendment to the V14 negative claim after the V15 scientific audit
+
+The group-semantics bug was inherited from the V14 teacher implementation. Therefore the strongest previous wording -- that V14 *proved capability-conditioned evidence routing is unnecessary in principle* -- is too strong. The defensible conclusion is narrower:
+
+- V14 **validly STOPped CQ-HPT-as-implemented** under its preregistered controls: it lost to legacy static ordering and had severe negative operational value;
+- the matched-capacity `full == late_fusion` result is still a valid observation for the trained target used in that run;
+- however, because that target flattened `any_of` member margins instead of aggregating the logical group first, V14 is not a universal impossibility result for capability-conditioned routing under a corrected semantic target.
+
+CQ-HPT remains retired from the mainline. This amendment does **not** justify a V14 retraining rescue, because the exact frontier remains extremely small and the architecture already failed the operational criterion. A learned router may be reconsidered only for a future independently demonstrated unresolved inference problem (for example lower-level dynamic evidence/calibration), not to rescue search ordering.

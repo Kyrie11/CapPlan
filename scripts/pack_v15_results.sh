@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-CAP_HOME="${CAP_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"; V15_ROOT="${V15_ROOT:?set V15_ROOT}"; OUT_ZIP="${OUT_ZIP:-$CAP_HOME/outputs/eval/capplan_v15_results.zip}"
+CAP_HOME="${CAP_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"; V15_ROOT="${V15_ROOT:?set V15_ROOT}"; OUT_ZIP="${OUT_ZIP:-$CAP_HOME/outputs/eval/capplan_v15r_results.zip}"
 python - "$V15_ROOT" "$OUT_ZIP" <<'PY'
 from pathlib import Path
 import sys,zipfile

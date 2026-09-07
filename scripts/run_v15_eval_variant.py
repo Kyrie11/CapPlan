@@ -15,7 +15,7 @@ def main():
     ap.add_argument('--episode_limit',type=int,default=0); ap.add_argument('--episode_seed',type=int,default=13); ap.add_argument('--show_progress',action='store_true')
     a=ap.parse_args(); legacy=a.mode=='legacy_static'; exact=a.mode=='exact'; count=a.mode=='count_only'
     cfg=PlannerConfig(
-        algorithm_version='V15', evidence_grounded_runtime=True, casa_mode='learned', casa_checkpoint=a.casa_checkpoint,
+        algorithm_version='V15R', evidence_grounded_runtime=True, casa_mode='learned', casa_checkpoint=a.casa_checkpoint,
         casa_device='auto', trajectory_mode='mock_strict', no_completion_value_guidance=True,
         exact_robustness_weight=float(a.robustness_weight),
         no_exact_robustness_ordering=bool(exact or legacy), exact_robustness_count_only=bool(count),
