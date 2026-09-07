@@ -136,6 +136,11 @@ class PlannerConfig:
     no_exact_robustness_ordering: bool = False
     exact_robustness_count_only: bool = False
     v15_legacy_static_guidance: bool = False
+    # V16: threshold-parametric capability-program partial evaluation.
+    # ``full_contract_key`` is a matched-control that keeps numeric thresholds
+    # in the cache key and therefore cannot obtain cross-counterfactual reuse.
+    use_parametric_capability_kernel: bool = False
+    parametric_kernel_full_contract_key: bool = False
     # Control that replays the exact V5 path-by-path typed viability in the V6/V7
     # codebase.  It isolates representation/runtime changes from mechanism gain.
     v5_reference_runtime: bool = False
@@ -177,6 +182,7 @@ class CapPlanPlanner:
         is_v13 = version.startswith("V13")
         is_v14 = version.startswith("V14")
         is_v15 = version.startswith("V15")
+        is_v16 = version.startswith("V16")
         # V3 removes the empirically redundant completion-value head and replaces
         # V2's transition-static typed-feasibility prior with a learned local
         # frontier ranker.  V4 retired that ranker and tested a relaxed suffix
@@ -187,21 +193,21 @@ class CapPlanPlanner:
         # envelope, retaining V5 as an exact representation control. V7 removes
         # enumerate-then-compress and separates existential acceptance dominance
         # from diagnostic rejection dominance.
-        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and self.config.v2_reference_runtime)
-        use_v5_reference = bool((is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and (not use_v2_reference) and self.config.v5_reference_runtime)
-        use_v6_reference = bool((is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and (not use_v2_reference) and (not use_v5_reference) and self.config.v6_reference_runtime)
-        use_v7_reference = bool((is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and self.config.v7_reference_runtime)
-        use_v8_reference = bool((is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and self.config.v8_reference_runtime)
-        use_v9_reference = bool((is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and self.config.v9_reference_runtime)
-        use_v10_reference = bool((is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and self.config.v10_reference_runtime)
-        use_v11_reference = bool((is_v12 or is_v13 or is_v14 or is_v15) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and (not use_v10_reference) and self.config.v11_reference_runtime)
+        use_v2_reference = bool((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and self.config.v2_reference_runtime)
+        use_v5_reference = bool((is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and (not use_v2_reference) and self.config.v5_reference_runtime)
+        use_v6_reference = bool((is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and (not use_v2_reference) and (not use_v5_reference) and self.config.v6_reference_runtime)
+        use_v7_reference = bool((is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and self.config.v7_reference_runtime)
+        use_v8_reference = bool((is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and self.config.v8_reference_runtime)
+        use_v9_reference = bool((is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and self.config.v9_reference_runtime)
+        use_v10_reference = bool((is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and self.config.v10_reference_runtime)
+        use_v11_reference = bool((is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and (not use_v10_reference) and self.config.v11_reference_runtime)
         use_v12_reference = bool(is_v13 and (not use_v2_reference) and (not use_v5_reference) and (not use_v6_reference) and (not use_v7_reference) and (not use_v8_reference) and (not use_v9_reference) and (not use_v10_reference) and (not use_v11_reference) and self.config.v12_reference_runtime)
         frontier_ranker = None
         if is_v3 and (not use_v2_reference) and (not self.config.no_frontier_ranker) and self.config.frontier_ranker_checkpoint:
             frontier_ranker = FrontierRanker(self.config.frontier_ranker_checkpoint, device=self.config.frontier_ranker_device)
         if is_v14 and (not use_v2_reference) and (not self.config.no_cqhpt) and self.config.cqhpt_checkpoint:
             frontier_ranker = CQHPTGuide(self.config.cqhpt_checkpoint, device=self.config.cqhpt_device)
-        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and not use_v2_reference)
+        no_value = self.config.no_completion_value_guidance or ((is_v3 or is_v4 or is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and not use_v2_reference)
         if is_v3 and not use_v2_reference:
             lambda_static = 0.0
         elif is_v11 and not use_v2_reference:
@@ -228,6 +234,10 @@ class CapPlanPlanner:
             # V15 contains no neural search router. The legacy static learned
             # prior is retained only as a historical causal control.
             lambda_static = 0.20 if self.config.v15_legacy_static_guidance else 0.0
+        elif is_v16 and not use_v2_reference:
+            # V16 changes only exact kernel compilation/reuse; queue ordering is
+            # the frozen exact no-learning order.
+            lambda_static = 0.0
         else:
             lambda_static = 0.0 if self.config.no_learned_feasibility_guidance else 0.20
         # V1--V13 retained a passenger-independent learned edge-validity queue
@@ -235,12 +245,16 @@ class CapPlanPlanner:
         # beats an exact/no-learning ordering baseline.  V14 therefore removes it
         # from full and all matched CQ controls; the historical legacy control
         # restores it together with the old static feasibility prior.
-        lambda_edge = (0.25 if self.config.v14_legacy_static_guidance else 0.0) if (is_v14 and not use_v2_reference) else ((0.25 if self.config.v15_legacy_static_guidance else 0.0) if (is_v15 and not use_v2_reference) else 0.25)
+        lambda_edge = (
+            (0.25 if self.config.v14_legacy_static_guidance else 0.0) if (is_v14 and not use_v2_reference)
+            else ((0.25 if self.config.v15_legacy_static_guidance else 0.0) if (is_v15 and not use_v2_reference)
+                  else (0.0 if (is_v16 and not use_v2_reference) else 0.25))
+        )
         use_continuation = bool(is_v4 and (not use_v2_reference) and (not self.config.no_continuation_envelope))
-        use_viability = bool((is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and (not use_v2_reference) and (not self.config.no_viability_kernel))
+        use_viability = bool((is_v5 or is_v6 or is_v7 or is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and (not use_v2_reference) and (not self.config.no_viability_kernel))
         use_direct_dual = bool(
             ((is_v7 and not use_v5_reference and not use_v6_reference)
-             or ((is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15) and use_v7_reference))
+             or ((is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16) and use_v7_reference))
             and use_viability
         )
         use_incremental_acceptance = bool(
@@ -288,6 +302,13 @@ class CapPlanPlanner:
                 and (not use_v8_reference) and (not use_v9_reference)
                 and (not use_v10_reference) and (not use_v11_reference)
             )
+            or (
+                is_v16
+                and (not use_v2_reference) and (not use_v5_reference)
+                and (not use_v6_reference) and (not use_v7_reference)
+                and (not use_v8_reference) and (not use_v9_reference)
+                and (not use_v10_reference) and (not use_v11_reference)
+            )
         ) and use_viability
         use_native_projected_acceptance = bool(
             is_v11 and self.config.v11_native_quotient_experimental
@@ -306,6 +327,7 @@ class CapPlanPlanner:
             or (is_v13 and use_viability and (not use_v5_reference))
             or (is_v14 and use_viability and (not use_v5_reference))
             or (is_v15 and use_viability and (not use_v5_reference))
+            or (is_v16 and use_viability and (not use_v5_reference))
         ) and (not self.config.no_precondition_antichain)
         # V8 deliberately removes eager rejection/proof frontiers.  Its
         # certificate is generated on demand by exact forward replay.  V7
@@ -332,6 +354,8 @@ class CapPlanPlanner:
                 ),
                 use_exact_robustness_ordering=bool(is_v15 and not self.config.no_exact_robustness_ordering and not self.config.v15_legacy_static_guidance),
                 exact_robustness_count_only=bool(is_v15 and self.config.exact_robustness_count_only),
+                use_parametric_capability_kernel=bool(is_v16 and self.config.use_parametric_capability_kernel),
+                parametric_kernel_full_contract_key=bool(is_v16 and self.config.parametric_kernel_full_contract_key),
                 use_continuation_envelope=use_continuation,
                 continuation_pruning=bool(use_continuation and (not self.config.no_continuation_pruning)),
                 lambda_continuation_cost=(0.0 if (not use_continuation or self.config.no_continuation_priority) else float(self.config.continuation_cost_weight)),
@@ -359,7 +383,7 @@ class CapPlanPlanner:
             frontier_ranker=frontier_ranker,
         )
         self._v8_lazy_diagnostic_replay = bool(
-            (is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15)
+            (is_v8 or is_v9 or is_v10 or is_v11 or is_v12 or is_v13 or is_v14 or is_v15 or is_v16)
             and (use_incremental_acceptance or use_capability_projected_acceptance or use_semnaive_projected_acceptance or use_native_projected_acceptance)
             and (not self.config.no_lazy_diagnostic_replay)
         )

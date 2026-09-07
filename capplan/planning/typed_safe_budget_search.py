@@ -4,6 +4,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -38,6 +39,10 @@ from capplan.planning.incremental_capability_precondition_kernel import build_in
 from capplan.planning.capability_projected_precondition_kernel import build_capability_projected_acceptance_kernel
 from capplan.planning.semnaive_capability_projected_kernel import build_semnaive_capability_projected_acceptance_kernel
 from capplan.planning.native_capability_projected_kernel import build_native_capability_projected_acceptance_kernel
+from capplan.planning.parametric_capability_kernel import (
+    ParametricKernelCache, annotate_cache_miss, capability_program_shape,
+    executable_graph_signature, reused_antichain, stable_shape_id,
+)
 from capplan.semantics.capability_compiler import CompiledContract, UncertaintySpec
 from capplan.semantics.resource_registry import DEFAULT_REGISTRY, ResourceRegistry
 from capplan.semantics.service_automaton import ServiceAutomaton
@@ -126,6 +131,12 @@ class SearchConfig:
     # therefore fail open to the frozen exact ordering.
     use_exact_robustness_ordering: bool = False
     exact_robustness_count_only: bool = False
+    # V16: partially evaluate the passenger capability program into a
+    # threshold-parametric exact SN-CPK.  Purely numerical monotone thresholds
+    # are query parameters; structural lifecycle/typed/group/uncertainty
+    # semantics remain in the compiled kernel key.
+    use_parametric_capability_kernel: bool = False
+    parametric_kernel_full_contract_key: bool = False
 
 
 @dataclass
@@ -172,6 +183,7 @@ class TypedSafeBudgetSearch:
         # successor under the symbolic typed contract, so it cannot change hard
         # feasibility.
         self.frontier_ranker = frontier_ranker
+        self._parametric_kernel_cache = ParametricKernelCache()
 
     def search(
         self,
@@ -231,17 +243,66 @@ class TypedSafeBudgetSearch:
                     use_fused_frontier_insertion=self.config.native_fused_frontier_insertion,
                 )
             elif self.config.use_semnaive_projected_acceptance_kernel:
-                precondition_antichain = build_semnaive_capability_projected_acceptance_kernel(
-                    viability_kernel, compiled, predictions, self.registry,
-                    no_conservative_margins=self.config.no_conservative_margins,
-                    default_beta=self.config.beta,
-                    max_frontier_per_state=self.config.viability_max_paths_per_state,
-                    max_depth=self.config.viability_max_depth,
-                    use_capability_projection=self.config.capability_projection,
-                    use_signature_index=self.config.frontier_signature_index,
-                    use_delta_propagation=self.config.semnaive_delta_propagation,
-                    use_packed_dominance=self.config.packed_frontier_dominance,
-                )
+                if self.config.use_parametric_capability_kernel:
+                    self._parametric_kernel_cache.reset_episode(episode_id)
+                    t_lookup = time.perf_counter()
+                    shape, thresholds_erased = capability_program_shape(
+                        compiled,
+                        erase_numeric_thresholds=not self.config.parametric_kernel_full_contract_key,
+                    )
+                    shape_id = stable_shape_id(shape)
+                    graph_sig = executable_graph_signature(viability_kernel, predictions)
+                    key = (
+                        shape, graph_sig, bool(self.config.no_conservative_margins),
+                        round(float(self.config.beta), 12),
+                        int(self.config.viability_max_paths_per_state),
+                        int(self.config.viability_max_depth),
+                        bool(self.config.capability_projection),
+                        bool(self.config.frontier_signature_index),
+                        bool(self.config.semnaive_delta_propagation),
+                        bool(self.config.packed_frontier_dominance),
+                    )
+                    entry = self._parametric_kernel_cache.lookup(key)
+                    lookup_ms = (time.perf_counter() - t_lookup) * 1000.0
+                    if entry is not None:
+                        precondition_antichain = reused_antichain(
+                            entry, lookup_ms=lookup_ms,
+                            cache_entries=len(self._parametric_kernel_cache.entries),
+                        )
+                    else:
+                        precondition_antichain = build_semnaive_capability_projected_acceptance_kernel(
+                            viability_kernel, compiled, predictions, self.registry,
+                            no_conservative_margins=self.config.no_conservative_margins,
+                            default_beta=self.config.beta,
+                            max_frontier_per_state=self.config.viability_max_paths_per_state,
+                            max_depth=self.config.viability_max_depth,
+                            use_capability_projection=self.config.capability_projection,
+                            use_signature_index=self.config.frontier_signature_index,
+                            use_delta_propagation=self.config.semnaive_delta_propagation,
+                            use_packed_dominance=self.config.packed_frontier_dominance,
+                        )
+                        source_build_ms = annotate_cache_miss(
+                            precondition_antichain, thresholds_erased=thresholds_erased,
+                            shape_id=shape_id,
+                            cache_entries=len(self._parametric_kernel_cache.entries) + 1,
+                            lookup_ms=lookup_ms,
+                        )
+                        self._parametric_kernel_cache.store(
+                            key, precondition_antichain, thresholds_erased=thresholds_erased,
+                            shape_id=shape_id, source_build_ms=source_build_ms,
+                        )
+                else:
+                    precondition_antichain = build_semnaive_capability_projected_acceptance_kernel(
+                        viability_kernel, compiled, predictions, self.registry,
+                        no_conservative_margins=self.config.no_conservative_margins,
+                        default_beta=self.config.beta,
+                        max_frontier_per_state=self.config.viability_max_paths_per_state,
+                        max_depth=self.config.viability_max_depth,
+                        use_capability_projection=self.config.capability_projection,
+                        use_signature_index=self.config.frontier_signature_index,
+                        use_delta_propagation=self.config.semnaive_delta_propagation,
+                        use_packed_dominance=self.config.packed_frontier_dominance,
+                    )
             elif self.config.use_capability_projected_acceptance_kernel:
                 precondition_antichain = build_capability_projected_acceptance_kernel(
                     viability_kernel, compiled, predictions, self.registry,
@@ -392,6 +453,20 @@ class TypedSafeBudgetSearch:
                     "native_projected_fallbacks": (precondition_antichain.native_projected_fallbacks if precondition_antichain is not None else 0),
                     "fused_frontier_passes": (precondition_antichain.fused_frontier_passes if precondition_antichain is not None else 0),
                     "precondition_build_ms": (precondition_antichain.precondition_build_ms if precondition_antichain is not None else 0.0),
+            "parametric_kernel_cache_hit": (precondition_antichain.parametric_kernel_cache_hit if precondition_antichain is not None else 0),
+            "parametric_kernel_cache_miss": (precondition_antichain.parametric_kernel_cache_miss if precondition_antichain is not None else 0),
+            "parametric_kernel_cache_entries": (precondition_antichain.parametric_kernel_cache_entries if precondition_antichain is not None else 0),
+            "parametric_kernel_thresholds_erased": (precondition_antichain.parametric_kernel_thresholds_erased if precondition_antichain is not None else 0),
+            "parametric_kernel_lookup_ms": (precondition_antichain.parametric_kernel_lookup_ms if precondition_antichain is not None else 0.0),
+            "parametric_kernel_source_build_ms": (precondition_antichain.parametric_kernel_source_build_ms if precondition_antichain is not None else 0.0),
+            "parametric_kernel_shape_id": (precondition_antichain.parametric_kernel_shape_id if precondition_antichain is not None else ""),
+                    "parametric_kernel_cache_hit": (precondition_antichain.parametric_kernel_cache_hit if precondition_antichain is not None else 0),
+                    "parametric_kernel_cache_miss": (precondition_antichain.parametric_kernel_cache_miss if precondition_antichain is not None else 0),
+                    "parametric_kernel_cache_entries": (precondition_antichain.parametric_kernel_cache_entries if precondition_antichain is not None else 0),
+                    "parametric_kernel_thresholds_erased": (precondition_antichain.parametric_kernel_thresholds_erased if precondition_antichain is not None else 0),
+                    "parametric_kernel_lookup_ms": (precondition_antichain.parametric_kernel_lookup_ms if precondition_antichain is not None else 0.0),
+                    "parametric_kernel_source_build_ms": (precondition_antichain.parametric_kernel_source_build_ms if precondition_antichain is not None else 0.0),
+                    "parametric_kernel_shape_id": (precondition_antichain.parametric_kernel_shape_id if precondition_antichain is not None else ""),
                     "transition_semantic_cache_entries": (len(transition_semantic_cache) if transition_semantic_cache is not None else 0),
                     "transition_semantic_cache_hits": (transition_semantic_cache.hits if transition_semantic_cache is not None else 0),
                     "transition_semantic_cache_misses": (transition_semantic_cache.misses if transition_semantic_cache is not None else 0),
@@ -670,6 +745,13 @@ class TypedSafeBudgetSearch:
             "native_projected_fallbacks": (precondition_antichain.native_projected_fallbacks if precondition_antichain is not None else 0),
             "fused_frontier_passes": (precondition_antichain.fused_frontier_passes if precondition_antichain is not None else 0),
             "precondition_build_ms": (precondition_antichain.precondition_build_ms if precondition_antichain is not None else 0.0),
+            "parametric_kernel_cache_hit": (precondition_antichain.parametric_kernel_cache_hit if precondition_antichain is not None else 0),
+            "parametric_kernel_cache_miss": (precondition_antichain.parametric_kernel_cache_miss if precondition_antichain is not None else 0),
+            "parametric_kernel_cache_entries": (precondition_antichain.parametric_kernel_cache_entries if precondition_antichain is not None else 0),
+            "parametric_kernel_thresholds_erased": (precondition_antichain.parametric_kernel_thresholds_erased if precondition_antichain is not None else 0),
+            "parametric_kernel_lookup_ms": (precondition_antichain.parametric_kernel_lookup_ms if precondition_antichain is not None else 0.0),
+            "parametric_kernel_source_build_ms": (precondition_antichain.parametric_kernel_source_build_ms if precondition_antichain is not None else 0.0),
+            "parametric_kernel_shape_id": (precondition_antichain.parametric_kernel_shape_id if precondition_antichain is not None else ""),
             "transition_semantic_cache_entries": (len(transition_semantic_cache) if transition_semantic_cache is not None else 0),
             "transition_semantic_cache_hits": (transition_semantic_cache.hits if transition_semantic_cache is not None else 0),
             "transition_semantic_cache_misses": (transition_semantic_cache.misses if transition_semantic_cache is not None else 0),

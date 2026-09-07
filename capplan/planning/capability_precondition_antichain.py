@@ -123,6 +123,14 @@ class CapabilityPreconditionAntichain:
     native_projected_fallbacks: int = 0
     fused_frontier_passes: int = 0
     precondition_build_ms: float = 0.0
+    # V16: threshold-parametric capability-program partial evaluation.
+    parametric_kernel_cache_hit: int = 0
+    parametric_kernel_cache_miss: int = 0
+    parametric_kernel_cache_entries: int = 0
+    parametric_kernel_thresholds_erased: int = 0
+    parametric_kernel_lookup_ms: float = 0.0
+    parametric_kernel_source_build_ms: float = 0.0
+    parametric_kernel_shape_id: str = ""
 
     def state_summaries(self, state: State) -> Tuple[SuffixEffectSummary, ...]:
         return self.summaries.get(state, ())

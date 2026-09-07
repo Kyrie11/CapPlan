@@ -1618,3 +1618,110 @@ The group-semantics bug was inherited from the V14 teacher implementation. There
 - however, because that target flattened `any_of` member margins instead of aggregating the logical group first, V14 is not a universal impossibility result for capability-conditioned routing under a corrected semantic target.
 
 CQ-HPT remains retired from the mainline. This amendment does **not** justify a V14 retraining rescue, because the exact frontier remains extremely small and the architecture already failed the operational criterion. A learned router may be reconsidered only for a future independently demonstrated unresolved inference problem (for example lower-level dynamic evidence/calibration), not to rescue search ordering.
+
+## V15R-fast seed13 decision — group semantics repaired; search-ordering line closes
+
+**Date:** 2026-09-07  
+**Reliability gate:** `PASS`  
+**Scientific gate:** `PASS`  
+**Preregistered decision:** `STOP`
+
+The repaired V15R package contains the complete deterministic 256-episode / 2048-request necessity suite. All variants are request-paired, `algorithm_attribution_ready=true`, passenger decisions and full failure-certificate JSON match the exact SN-CPK reference, and four serial timing repeats preserve identical decisions. The 17 service-skeleton mismatches against exact are equal-cost/equal-length successful alternatives caused only by ordering; they do not alter terminal semantics or optimal cost.
+
+The group-semantics repair is active rather than cosmetic: group-aware ECRP adjusts/rescues about `0.3867` exact continuation summaries per request on average. Thus the V15 `any_of` scientific bug was real and V15R successfully tests the corrected logical object.
+
+### Preregistered outcome
+
+- ECRP vs exact no-ordering: exact `4.22217` -> ECRP `4.10596` expansions/request. Exact-minus-ECRP saving `+0.11621`, episode-clustered 95% CI `[0.00879,0.25635]`: **positive expansion signal**.
+- Legacy static vs ECRP: `3.95605` vs `4.10596`; legacy-minus-ECRP `-0.14990`, CI `[-0.32324,-0.01514]`: ECRP is **significantly worse**.
+- Summary-count-only vs ECRP: `3.95459` vs `4.10596`; count-minus-ECRP `-0.15137`, CI `[-0.32422,-0.02100]`: typed max-min robustness is **not the source of the strongest ordering signal**.
+- Four counterbalanced exact/ECRP timing repeats: exact `30.1429 ms/request`, ECRP `32.4778 ms/request`; exact-minus-ECRP `-2.3349 ms`, CI `[-4.5712,-0.2147]`: **operational net-gain gate fails**.
+
+Therefore V15R closes the search-ordering line. Exact continuation statistics can change expansion order, but the current quotient frontier is already so small that computing stronger ordering statistics costs more than the avoided expansions. `summary_count_only` is retained as an analysis control, not promoted post hoc. The legacy static prior remains a historical comparator, not part of the default exact method.
+
+### Theory promoted after V15R
+
+1. **Semantic authority separation is permanent.** Learned or auxiliary scores may order already executable states but never modify `Allow`, typed `Update`, `Sat`, evidence authority, or exact rejection.
+2. **Executable capability semantics, not architecture depth, is the stable source of gain.** V5--V10 gains came from making backward continuation reasoning typed, passenger-specific, quotient-aware and exact; V14--V15R show that increasingly expressive ordering functions do not survive net operational tests once that quotient is small.
+3. **Requirement groups are first-class semantic units.** Quantitative analysis must aggregate `all_of/any_of/not` before comparing hard margins; atomic flattening is not equivalent to the capability program.
+4. **Current runtime bottleneck moves upstream of search ordering.** In V15R exact no-ordering, SN-CPK construction is about `16.47 ms/request` of `30.23 ms/request` primary-decision latency, while the search itself averages only `4.22` expansions.
+
+Do not create another V16 ranker/router to rescue search ordering.
+
+## V16 — Parametric Capability Kernel (PCK)
+
+**Status:** implemented as the next exact-semantic hypothesis test. **Not promoted until fast + full confirmatory GO.**
+
+### Motivation
+
+The benchmark intentionally evaluates eight same-scene passenger contracts. Several counterfactuals alter only numerical monotone thresholds (for example access-distance budget, minimum width, or ride-motion tolerance) while preserving lifecycle scopes, typed operators, categorical/interface requirements, requirement-group topology, missing-evidence policy, and conservative uncertainty semantics.
+
+The frozen SN-CPK compiler constructs suffix transformers and performs capability-projected dominance from those *structural* semantics and the scene evidence. Purely numerical thresholds of cumulative/upper/lower clauses are consulted only by query-time `Sat`. Rebuilding the same backward transformer fixed point for every threshold-only counterfactual is therefore unnecessary if the structural program shape and hard-valid evidence graph are identical.
+
+### Core factorization
+
+Write the compiled passenger program as
+
+`Psi = (Shape(Psi), theta_num)`
+
+where `Shape(Psi)` retains:
+
+- lifecycle phase scopes;
+- resource kind/operator and hard/soft status;
+- categorical/interface required values;
+- requirement-group logic and membership;
+- missing-evidence policy;
+- beta/min-confidence/max-risk uncertainty semantics;
+- evidence/provenance semantics used by the exact compiler;
+
+and `theta_num` contains only safe numerical monotone thresholds for cumulative/upper/lower clauses.
+
+**Threshold-factorization hypothesis.** For contracts `Psi` and `Psi'` with identical `Shape`, identical evidence-grounded hard-valid transition graph, and the registered associative monotone typed algebra, the exact capability-projected SN-CPK accepting frontier is the same. Different numerical thresholds are applied only when the shared transformer summaries are evaluated by `Sat` against the current forward ledger.
+
+V16 therefore partially evaluates the capability program once per `(episode, hard-valid evidence graph, Shape)` and reuses the exact acceptance kernel across threshold-only passenger counterfactuals.
+
+### Safety boundary
+
+- Categorical/interface thresholds are **never** erased.
+- `any_of/all_of/not` topology is part of the cache key.
+- probabilistic/confidence boundaries are retained structurally in V16 because current compilation can use them as intrinsic evidence-validity conditions.
+- beta, missing policy, min-confidence/max-risk, projection/dominance configuration, and the hard-valid evidence fingerprint are part of the key.
+- any mismatch is a cache miss and falls back to the historical exact SN-CPK build.
+- V16 keeps the frozen exact no-learning queue order and proof-on-demand exact rejection.
+
+Thus a cache error cannot authorize a transition; the confirmatory gate additionally requires zero decision, expansion, skeleton and full-certificate mismatch against exact no-reuse.
+
+### Matched controls
+
+1. `parametric_full`: numerical monotone thresholds erased from the program-shape key;
+2. `exact_no_reuse`: historical exact SN-CPK rebuilt for every passenger;
+3. `full_contract_key_cache`: identical memo machinery but numerical thresholds remain in the key, isolating ordinary caching overhead from capability-program factorization.
+
+### V16-fast preregistration
+
+**Exact semantic equivalence**
+
+- PC-F1 >= 0.99, FAR=FRR=0;
+- decision mismatch = 0;
+- **expansion mismatch = 0** and mean expansion delta = 0;
+- skeleton mismatch = 0;
+- full certificate JSON mismatch = 0.
+
+**Capability-factorization specificity**
+
+- parametric cache hit rate > 0;
+- erased numerical-threshold count > 0;
+- parametric reuse rate > full-contract-key control;
+- parametric primary latency beats full-contract-key control with episode-clustered 95% CI lower bound > 0.
+
+**Operational net gain**
+
+- exact-minus-parametric CPK-build latency > 0 with clustered CI lower > 0;
+- four counterbalanced serial repeats require exact-minus-parametric primary-decision latency > 0 with CI lower > 0;
+- decisions and expansions remain exactly identical in every repeat.
+
+Any failure => `STOP`; do not run 997 full. If V16 STOPs, stop exact-kernel micro-optimization and shift the mainline to method-specific nuPlan execution/generalization and, only after an evidence-gap audit, learning at the uncertain-world -> executable-evidence layer.
+
+### Publication boundary
+
+PCK is not a fourth contribution. If confirmed, it is a compiler consequence of C2: the capability program induces both (i) the passenger-observable suffix quotient and (ii) a threshold-parametric equivalence class over contracts. Generic RCSP caching/preprocessing is not claimed as novel; the claim, if supported, is the exact partial evaluation induced by lifecycle-indexed typed capability-program semantics and validated by same-scene capability counterfactuals.
