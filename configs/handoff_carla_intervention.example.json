@@ -1,0 +1,9 @@
+{
+  "overlay_id": "toy_episode:pickup_recourse:0000",
+  "carla_map": "Town10HD",
+  "calibration_id": "REPLACE_ME",
+  "blocker_blueprint": "static.prop.streetbarrier",
+  "blocker_transform": {"x": 0.0, "y": 0.0, "z": 0.1, "yaw": 0.0},
+  "spawn_after_sim_seconds": 10.0,
+  "duration_sim_seconds": 30.0
+}

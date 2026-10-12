@@ -457,3 +457,14 @@ python scripts/train_casa.py \
   --action_balanced_sampler \
   --save_calibration_report
 ```
+
+## Recourse-preserving handoff motivation experiments (stable entrypoints)
+
+For the 7-step falsification workflow, synthetic smoke tests, real nuPlan+GIS
+geometry screens, causal finite-support controls, canonical/empirical profile
+separation and bounded result packaging see
+[`docs/HANDOFF_FALSIFICATION_SOP_ZH.md`](docs/HANDOFF_FALSIFICATION_SOP_ZH.md).
+The primary scripts are `scripts/run_handoff_funnel.sh` and
+`scripts/run_handoff_sensitivity.sh`. The sidecars are controlled interventions,
+not measured real-world failure incidents or verified vehicle trajectories.
+
