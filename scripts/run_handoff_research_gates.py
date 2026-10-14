@@ -25,7 +25,7 @@ def report(output_dir,review_csv=None):
     pre=_load(root/'gate0_preflight.json') or {}
     site=_load(root/'gate1'/'gate1_selection.json') or {}
     motion=_load(root/'gate2'/'gate2_motion_audit.json') or {}
-    mid=_load(root/'gate3'/'midroute.jsonl.summary.json') or {}
+    mid=_load(root/'gate3'/'midroute.summary.json') or {}
     grid=_load(root/'gate4'/'profile_time_grid.manifest.json') or {}
     review=inspect_review(review_csv) if review_csv and Path(review_csv).is_file() else {}
     bad=(pre.get('overlays') or {}).get('counts',{}).get('invalid_overlay',0)
@@ -83,15 +83,25 @@ def prepare(args):
     dump_json(root/'gate0_preflight.json',info)
     select(args.pairs,root/'gate1',args.per_city)
     chosen=root/'gate1'/'selected_review_pairs.jsonl'
+    from scripts.audit_handoff_evidence_v4 import analyze as evidence_audit
+    evidence_audit(chosen,root/'gate1'/'physical_evidence_v4.json')
     req=root/'gate2'/'motion_requests.jsonl';req.parent.mkdir(exist_ok=True)
     export(chosen,req,False)
     audit(req,args.motion_claims,root/'gate2',log_root=args.log_root)
     if args.dataset_dir:
+        from scripts.sample_unscreened_handoff_controls_v4 import run as sample_unscreened
+        sample_unscreened(args.dataset_dir,root/'gate0_unscreened_episode_controls.jsonl',per_city=20)
         from scripts.select_gate1_anchor_controls import build as controls
         controls(args.dataset_dir,chosen,root/'gate1'/'anchor_control_queue.csv')
         from scripts.audit_handoff_midroute import run
         run(args.dataset_dir,chosen,root/'gate3'/'midroute.jsonl',args.notice_times,
             args.speed_mps,args.ack_s,args.midroute_limit)
+        from scripts.audit_handoff_alternatives_v4 import run as alternative_audit
+        alternative_audit(chosen,args.dataset_dir,root/'gate3'/'alternative_pudos.jsonl',args.midroute_limit)
+    if args.profiles and args.dataset_dir:
+        from scripts.audit_handoff_profile_paths_v4 import run as profile_paths
+        profile_paths(chosen,args.profiles,args.dataset_dir,root/'gate4'/'profile_paths_v4.jsonl',
+                      max_pairs=args.midroute_limit,max_profiles=40)
     if args.profiles:
         r=build(args.overlays,args.profiles,root/'gate4'/'profile_time_grid.jsonl',
             max_sites=args.max_grid_sites,max_profiles=args.max_grid_profiles,
@@ -101,17 +111,23 @@ def prepare(args):
             result=evaluate(root/'gate4'/'profile_time_grid.jsonl',root/'gate4'/'policies',
                             speed_mps=args.speed_mps)
             if result:raise RuntimeError('profile grid policy evaluator reported errors')
-    return report(root,args.review_csv)
+    result=report(root,args.review_csv)
+    from scripts.triage_handoff_science_v4 import triage
+    triage(root,root/'research_triage_v4.json')
+    return result
 
 
 def bundle(root,output):
     root=Path(root).resolve();out=Path(output);out.parent.mkdir(parents=True,exist_ok=True)
-    include=['gate0_preflight.json','research_gate_decision.json','gate1/gate1_selection.json',
+    include=['gate0_unscreened_episode_controls.manifest.json','gate0_preflight.json','research_gate_decision.json','research_triage_v4.json',
+             'gate1/physical_evidence_v4.json','gate1/gate1_selection.json',
              'gate1/site_review_queue.csv','gate1/site_review_queue_REGENERATED_UNREVIEWED.csv',
              'gate1/anchor_control_queue.csv','gate1/anchor_control_queue.manifest.json',
              'gate1/selected_review_pairs.jsonl','gate2/gate2_motion_audit.json',
-             'gate2/motion_requests.manifest.json','gate3/midroute.jsonl.summary.json',
-             'gate4/profile_time_grid.manifest.json','gate4/policies/policy_summary.json']
+             'gate2/motion_requests.manifest.json','gate3/midroute.summary.json',
+             'gate3/alternative_pudos.summary.json',
+             'gate4/profile_time_grid.manifest.json','gate4/profile_paths_v4.summary.json',
+             'gate4/policies/policy_summary.json']
     files=[root/f for f in include if (root/f).is_file()]
     manifest={'scope':'small research evidence bundle; no original nuPlan data or raw trajectory logs',
               'files':{str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in files}}
