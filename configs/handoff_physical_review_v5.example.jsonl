@@ -1,0 +1,1 @@
+{"city":"boston","physical_site_key":"REPLACE_SITE_KEY","reviewer_id":"REPLACE_INDEPENDENT_REVIEWER","source_id":"REPLACE_SOURCE_ID","source_kind":"independent_audit","checked_at_utc":"2026-10-14T00:00:00Z","evidence_uri":"https://example.invalid/replace-with-primary-photo-or-record","fact":"sidewalk_to_curb_continuity","value":"unknown","site_location":{"x":0,"y":0}}

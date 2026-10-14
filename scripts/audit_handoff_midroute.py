@@ -32,7 +32,7 @@ def _graph_distances(graph,cont, target):
     return _shortest_tree(adj,target)[0]
 
 
-def evaluate_pair(pair,graph,notice_s,speed_mps=1.,ack_s=3.,pause_during_ack=False):
+def evaluate_pair(pair,graph,notice_s,speed_mps=1.,ack_s=3.,pause_during_ack=False,precomputed_to_b=None):
     if not all(math.isfinite(x) and x>=0 for x in (notice_s,ack_s,speed_mps)) or speed_mps==0:
         raise ValueError('invalid times or speed')
     path=pair['paths']['origin_to_a'];nodes=path['node_ids'];edges=path['edges']
@@ -41,7 +41,7 @@ def evaluate_pair(pair,graph,notice_s,speed_mps=1.,ack_s=3.,pause_during_ack=Fal
     if abs(sum(lengths)-d_a)>1e-3:raise ValueError('path and pair distance disagree')
     cont=pair['screening_contract']
     b=pair['pedestrian_graph_nodes']['B']
-    to_b=_graph_distances(graph,cont,b)
+    to_b=precomputed_to_b if precomputed_to_b is not None else _graph_distances(graph,cont,b)
     # An acknowledged message cannot teleport the passenger to an earlier
     # position.  If walking continues, acknowledgement uses additional budget.
     action_s=notice_s+ack_s
