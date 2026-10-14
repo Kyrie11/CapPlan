@@ -29,7 +29,7 @@ def load_api():
         raise RuntimeError('CARLA agents package missing: add $CARLA_ROOT/PythonAPI/carla to PYTHONPATH') from e
     return carla,BasicAgent
 
-def choose_waypoints(world,carla,spawn_index):
+def choose_waypoints(world,carla,spawn_index,a_steps=7,b_steps=8):
     spawn=world.get_map().get_spawn_points()
     if not spawn:raise RuntimeError('map has no vehicle spawn points')
     start=spawn[spawn_index%len(spawn)]
@@ -42,7 +42,7 @@ def choose_waypoints(world,carla,spawn_index):
             opts.sort(key=lambda v:(v.road_id,v.lane_id,v.s))
             w=opts[0]
         return w
-    A=advance(road,7);B=advance(A,8)
+    A=advance(road,a_steps);B=advance(A,b_steps)
     if A.transform.location.distance(B.transform.location)<15:raise RuntimeError('candidate A/B too close')
     return start,A,B
 
@@ -66,7 +66,8 @@ def run(args):
         preexisting=[a.id for a in world.get_actors().filter('vehicle.*')]
         result['other_vehicles_at_start']=len(preexisting)
         result['paired_controlled_comparability']=len(preexisting)==0
-        start,A,B=choose_waypoints(world,carla,args.spawn_index)
+        start,A,B=choose_waypoints(world,carla,args.spawn_index,args.a_steps,args.b_steps)
+        result['geometry_parameters']={'spawn_index':args.spawn_index,'a_steps':args.a_steps,'b_steps':args.b_steps,'arrival_radius_m':args.arrival_radius_m}
         result['carla_locations']={'start':[start.location.x,start.location.y,start.location.z],
           'A':[A.transform.location.x,A.transform.location.y,A.transform.location.z],
           'B':[B.transform.location.x,B.transform.location.y,B.transform.location.z]}
@@ -96,7 +97,7 @@ def run(args):
             actors.append(blocker)
         agent=BasicAgent(vehicle,target_speed=args.target_speed_kmh)
         goal='A';agent.set_destination(A.transform.location)
-        sim_start=None;changed=False;reached=False
+        sim_start=None;changed=False;reached=False;agent_done_seen=False;minimum_gap_m=float('inf')
         for tick in range(int(args.max_seconds/args.dt)):
             frame=world.tick();snap=world.get_snapshot()
             simtime=float(snap.timestamp.elapsed_seconds)
@@ -109,6 +110,8 @@ def run(args):
             loc=vehicle.get_location();vel=vehicle.get_velocity()
             sp=math.sqrt(vel.x**2+vel.y**2+vel.z**2)
             gap=loc.distance(dest)
+            minimum_gap_m=min(minimum_gap_m,gap)
+            agent_done_seen=agent_done_seen or bool(agent.done())
             rows.append({'tick':tick,'elapsed_s':round(elapsed,3),'x':loc.x,'y':loc.y,'z':loc.z,
                 'speed_mps':sp,'target':goal,'distance_to_goal_m':gap,'collisions_to_date':len(collision_events)})
             if gap<=args.arrival_radius_m:
@@ -116,6 +119,9 @@ def run(args):
         result.update({'status':'COMPLETED','goal':goal,'reached_goal_zone':reached,
             'elapsed_sim_s':rows[-1]['elapsed_s'] if rows else None,'ticks':len(rows),
             'collisions':len(collision_events),'collision_events':collision_events,
+            'minimum_goal_gap_m':minimum_gap_m, 'agent_done_seen':agent_done_seen,
+            'ended_speed_mps':rows[-1]['speed_mps'] if rows else None,
+            'stopped_near_goal':bool(reached and rows and rows[-1]['speed_mps']<=0.5),
             'vehicle_collision_free':None, # lack of callbacks is not an independently verified collision-free proof
             'no_collision_sensor_events_observed':len(collision_events)==0,
             'vehicle_motion_observed':bool(rows),
@@ -136,13 +142,14 @@ def main():
     p.add_argument('--output_dir',required=True);p.add_argument('--host',default='127.0.0.1');p.add_argument('--port',type=int,default=2000)
     p.add_argument('--map',default='Town03');p.add_argument('--mode',choices=['clear_A','blocked_A','blocked_A_redirect_B'],default='clear_A')
     p.add_argument('--spawn_index',type=int,default=0);p.add_argument('--seed',type=int,default=13)
+    p.add_argument('--a_steps',type=int,default=7);p.add_argument('--b_steps',type=int,default=8)
     p.add_argument('--redirect_at_s',type=float,default=8);p.add_argument('--target_speed_kmh',type=float,default=20)
     p.add_argument('--arrival_radius_m',type=float,default=4);p.add_argument('--max_seconds',type=float,default=50)
     p.add_argument('--dt',type=float,default=.05);p.add_argument('--timeout',type=float,default=30)
     p.add_argument('--blocker_blueprint',default='vehicle.tesla.model3');p.add_argument('--no_rendering',action='store_true')
     p.add_argument('--dry_run',action='store_true')
     a=p.parse_args()
-    if a.dt<=0 or a.max_seconds<=0 or a.redirect_at_s<0 or a.target_speed_kmh<=0:p.error('invalid timing or speed')
+    if a.dt<=0 or a.max_seconds<=0 or a.redirect_at_s<0 or a.target_speed_kmh<=0 or a.a_steps<=0 or a.b_steps<=0:p.error('invalid timing or speed')
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
     if a.dry_run:
         payload=offline_spec();payload.update({'status':'DRY_RUN_NO_SIMULATION','mode':a.mode});rows=[]
