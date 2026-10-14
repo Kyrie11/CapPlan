@@ -26,7 +26,7 @@ def rows(path):
 
 
 def run(dataset_dir,output_dir,episode_limit=50,seed=13,samples=3,already_consumed_m=0,
-        event_time_s=90):
+        event_time_s=90, profiles_jsonl=None,require_explicit_curb_connector=False):
     root=Path(dataset_dir)
     eps=list(rows(root/'episodes.jsonl'))
     random.Random(seed).shuffle(eps)
@@ -35,15 +35,24 @@ def run(dataset_dir,output_dir,episode_limit=50,seed=13,samples=3,already_consum
     anchors=defaultdict(list)
     for a in rows(root/'pudo_anchors.jsonl'):
         if a['episode_id'] in selected:anchors[a['episode_id']].append(a)
+    # Consumes exactly the same suite written by build_handoff_profile_suite,
+    # avoiding silently resampling a different profile for the sweep.
+    if profiles_jsonl:
+        all_profiles=list(rows(Path(profiles_jsonl)))
+        if not all_profiles or any(p.get('evaluation_suite')!='canonical_counterfactual' for p in all_profiles):
+            raise ValueError('profile sweep requires nonpopulation canonical suite')
+        active_profiles=all_profiles
+    else:
+        active_profiles=[make_profile(f'canonical:{arch}:{i}',arch,seed+1009*i+41*ia)
+                         for ia,arch in enumerate(ARCHETYPES) for i in range(samples)]
     out=Path(output_dir);out.mkdir(parents=True,exist_ok=True)
     result_count=Counter();denom=Counter();errors=[]
     with (out/'profile_witnesses.jsonl').open('w',encoding='utf-8') as f:
         for ep in eps:
             try:
                 graph=load_accessibility_graph(root,ep['episode_id'])
-                for ia,arch in enumerate(ARCHETYPES):
-                    for i in range(samples):
-                        p=make_profile(f'canonical:{arch}:{i}',arch,seed+1009*i+41*ia)
+                for p in active_profiles:
+                        arch=p.get('archetype','UNKNOWN')
                         m=p['mobility']
                         args=SimpleNamespace(distance_budget_m=float(m['max_access_distance_m']),
                           already_consumed_m=float(already_consumed_m),
@@ -51,7 +60,9 @@ def run(dataset_dir,output_dir,episode_limit=50,seed=13,samples=3,already_consum
                           max_cross_slope=float(m['max_cross_slope']),
                           min_confidence=float(p['uncertainty']['min_map_confidence']),
                           require_step_free=bool(m['step_free_required']),
-                          require_interface_complete=True,event_time_s=float(event_time_s))
+                          require_interface_complete=True,
+                          require_explicit_curb_connector=require_explicit_curb_connector,
+                          event_time_s=float(event_time_s))
                         pairs,counts=miner.mine_episode(ep,anchors[ep['episode_id']],graph,args,{})
                         denom[(arch,'evaluated_episode_contracts')]+=1
                         denom[(arch,'geometry_witnesses')]+=len(pairs)
@@ -68,7 +79,9 @@ def run(dataset_dir,output_dir,episode_limit=50,seed=13,samples=3,already_consum
                             result_count[arch]+=1
             except (FileNotFoundError,KeyError,ValueError) as exc:
                 errors.append({'episode_id':ep['episode_id'],'error':repr(exc)})
-    summary={'selected_episodes':len(eps),'samples_per_archetype':samples,'seed':seed,
+    summary={'selected_episodes':len(eps),'samples_per_archetype':samples if not profiles_jsonl else None,
+      'profile_count_per_episode':len(active_profiles),'profile_input':profiles_jsonl,
+      'require_explicit_curb_connector':require_explicit_curb_connector,'seed':seed,
       'population_statistics_permitted':False,
       'by_design_archetype':{a:{key:v for (kind,key),v in denom.items() if kind==a} for a in ARCHETYPES},
       'errors':errors,
@@ -83,5 +96,8 @@ if __name__=='__main__':
     a.add_argument('--episode_limit',type=int,default=50);a.add_argument('--seed',type=int,default=13)
     a.add_argument('--samples',type=int,default=3);a.add_argument('--already_consumed_m',type=float,default=0)
     a.add_argument('--event_time_s',type=float,default=90)
+    a.add_argument('--profiles_jsonl')
+    a.add_argument('--require_explicit_curb_connector',action='store_true')
+
     opts=a.parse_args()
     raise SystemExit(run(**vars(opts)))

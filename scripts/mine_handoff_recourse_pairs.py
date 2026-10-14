@@ -19,6 +19,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.data.accessibility_layer import load_accessibility_graph
+from capplan.handoff.evidence import packet_valid, packet_covers_event
+from capplan.handoff.audited_curb_overlay import apply_reviewed_connectors
 
 
 def _records(path: Path):
@@ -76,12 +78,8 @@ def _path(previous, start, target):
 
 
 def _motion_packet_valid(packet: dict) -> bool:
-    required = ("reachable", "collision_free", "legal_stop", "interface_verified", "method_specific_motion_checked")
-    return (
-        all(packet.get(key) is True for key in required)
-        and bool(packet.get("source"))
-        and float(packet["valid_end_s"]) > float(packet["valid_start_s"])
-    )
+    """Backward-compatible entry point; time coverage is checked separately."""
+    return packet_valid(packet)
 
 
 def mine_episode(episode, anchors, graph, args, motion_packets):
@@ -164,17 +162,10 @@ def mine_episode(episode, anchors, graph, args, motion_packets):
                 continue
             counts["two_anchor_distance_asymmetry"] += 1
             packet = motion_packets.get((episode["episode_id"], aid, bid))
-            motion_checked = bool(packet and _motion_packet_valid(packet))
-            # A window containing a single timestamp is insufficient to
-            # validate an executed motion. Require a declared execution
-            # duration and verify the complete interval is covered.
-            duration = packet.get("motion_duration_s") if packet else None
-            interval_valid = bool(
-                motion_checked and duration is not None
-                and math.isfinite(float(duration)) and float(duration) >= 0
-                and float(packet["valid_start_s"]) <= args.event_time_s
-                and args.event_time_s + float(duration) <= float(packet["valid_end_s"])
-            )
+            motion_checked = packet_valid(packet)
+            # This check covers the *mining timestamp only*. Sidecars may
+            # shift event timing and MUST recheck coverage of their own event.
+            interval_valid = packet_covers_event(packet, args.event_time_s)
             counts["motion_packet_present"] += int(packet is not None)
             counts["motion_packet_semantically_passed"] += int(motion_checked)
             counts["motion_time_window_verified"] += int(interval_valid)
@@ -232,6 +223,7 @@ def mine_episode(episode, anchors, graph, args, motion_packets):
                 },
                 "a_to_b_vehicle_motion_packet": packet,
                 "vehicle_reroute_checked": interval_valid,
+                "motion_checked_event_time_s": args.event_time_s,
                 "motion_packet_semantically_valid": motion_checked,
                 "interface_completeness_claim": bool(
                     a.get("deployment_clearance_m") is not None and
@@ -270,6 +262,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--event_time_s", type=float, default=90.0)
     parser.add_argument("--vehicle_reachability_jsonl")
+    parser.add_argument("--reviewed_curb_connectors_jsonl",
+                        help="independently reviewed curb records; augment in memory, never edit base dataset")
     parser.add_argument("--require_explicit_curb_connector", action="store_true",
                         help="require traversable typed curb edge incident to BOTH pedestrian PUDO nodes")
     parser.add_argument("--require_interface_complete", action="store_true",
@@ -299,13 +293,21 @@ def main() -> int:
                 raise ValueError(f"motion packet lacks motion_duration_s: {key}")
             packets[key] = row
 
+    reviews = defaultdict(list)
+    if args.reviewed_curb_connectors_jsonl:
+        for rec in _records(Path(args.reviewed_curb_connectors_jsonl)):
+            reviews[rec.get('episode_id')].append(rec)
+
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     all_rows, totals, errors = [], Counter(), []
     for episode in episodes:
         try:
             graph = load_accessibility_graph(root, episode["episode_id"])
-            rows, counts = mine_episode(episode, anchors[episode["episode_id"]], graph, args, packets)
+            ep_anchors, graph, review_counts = apply_reviewed_connectors(
+                episode, anchors[episode['episode_id']], graph, reviews.get(episode['episode_id'], []))
+            rows, counts = mine_episode(episode, ep_anchors, graph, args, packets)
+            counts.update(review_counts)
             all_rows.extend(rows)
             totals.update(counts)
             totals["episodes_read"] += 1

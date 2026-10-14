@@ -14,6 +14,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capplan.data.handoff_schema import validate_temporal_overlay
+from capplan.handoff.evidence import packet_covers_event
 
 
 def _rows(path: str):
@@ -53,6 +54,10 @@ def build_overlay(pair: dict, index: int, event_time_s: float, observation_delay
         schedule_provenance = 'PRIVILEGED_KNOWN_INTERVENTION_TIME_UPPER_BOUND_NOT_DEPLOYABLE'
     else:
         raise ValueError('unsupported observation schedule')
+    # The miner may have checked a different event clock (default 90 s).
+    # Motion evidence is valid ONLY if this sidecar's actual event is covered.
+    packet = pair.get('a_to_b_vehicle_motion_packet')
+    sidecar_motion_verified = packet_covers_event(packet, event_time_s)
     overlay = {
         "overlay_id": f'{pair["episode_id"]}:pickup_recourse:{index:04d}',
         "episode_id": pair["episode_id"],
@@ -79,7 +84,7 @@ def build_overlay(pair: dict, index: int, event_time_s: float, observation_delay
                 "anchor_id": a,
                 "direct_passenger_distance_m": float(distances["origin_to_a"]),
                 "from_a_to_b_distance_m": float(distances["a_to_b"]),
-                "vehicle_motion_evidence": pair.get("a_to_b_vehicle_motion_packet"),
+                "vehicle_motion_evidence": packet,
             },
             {
                 "anchor_id": b,
@@ -123,7 +128,10 @@ def build_overlay(pair: dict, index: int, event_time_s: float, observation_delay
                 and already + distances["origin_to_b"] <= budget
             ),
             "a_then_b_exceeds_budget": already + distances["origin_to_a"] + distances["a_to_b"] > budget,
-            "vehicle_a_to_b_verified_for_event_time": bool(pair.get("two_candidate_distance_and_vehicle_witness")),
+            "vehicle_a_to_b_verified_for_event_time": sidecar_motion_verified,
+            "vehicle_motion_packet_present": packet is not None,
+            "motion_checked_at_actual_sidecar_event_s": float(event_time_s),
+            "motion_checked_at_mining_event_s": pair.get('motion_checked_event_time_s'),
             "global_no_recovery_claim": False,
             "counterfactual_a_arrival_s": float(a_arrival_s),
             "counterfactual_event_time_s": float(event_time_s),

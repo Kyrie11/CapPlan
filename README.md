@@ -468,3 +468,15 @@ The primary scripts are `scripts/run_handoff_funnel.sh` and
 `scripts/run_handoff_sensitivity.sh`. The sidecars are controlled interventions,
 not measured real-world failure incidents or verified vehicle trajectories.
 
+
+## 2026-10-13 handoff motivation / external-evidence audit upgrade
+
+Read `docs/CapPlan_handoff_motivation_funnel_v2_20261013.md` before claiming
+real-world pickup loss of recourse, strict curb compliance, or motion verification.
+New commands: `scripts/diagnose_handoff_curb_connectors.py`,
+`scripts/review_handoff_bundles.py`, `scripts/build_handoff_falsification_suite.py`,
+`scripts/summarize_handoff_falsification.py`. An external reviewed curb overlay
+is opt-in; no base nuPlan/GIS data is modified. The canonical profile suite
+supports `--design coupled_quantile` and the sweep supports `--profiles_jsonl`.
+The uploaded result ZIPs may contain truncated illustrative JSONL examples;
+read `BUNDLE_MANIFEST.json` and use full server JSONL for statistical sampling.

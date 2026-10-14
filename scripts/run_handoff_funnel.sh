@@ -9,6 +9,7 @@ EXTRA=()
 if [[ -n "${MOTION_PACKETS:-}" ]]; then EXTRA+=(--vehicle_reachability_jsonl "$MOTION_PACKETS"); fi
 if [[ "${REQUIRE_INTERFACE:-0}" == 1 ]]; then EXTRA+=(--require_interface_complete); fi
 if [[ "${REQUIRE_CURB_CONNECTOR:-0}" == 1 ]]; then EXTRA+=(--require_explicit_curb_connector); fi
+if [[ -n "${REVIEWED_CURB_CONNECTORS:-}" ]]; then EXTRA+=(--reviewed_curb_connectors_jsonl "$REVIEWED_CURB_CONNECTORS"); fi
 cd "$ROOT"
 python scripts/mine_handoff_recourse_pairs.py --dataset_dir "$DATASET_TEST" \
  --output_dir "$OUTPUT_ROOT/mining" --episode_limit "$EPISODE_LIMIT" \
