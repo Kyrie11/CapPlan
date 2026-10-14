@@ -480,3 +480,11 @@ is opt-in; no base nuPlan/GIS data is modified. The canonical profile suite
 supports `--design coupled_quantile` and the sweep supports `--profiles_jsonl`.
 The uploaded result ZIPs may contain truncated illustrative JSONL examples;
 read `BUNDLE_MANIFEST.json` and use full server JSONL for statistical sampling.
+
+### Handoff research Gates V3 (evidence-first study)
+
+See [`docs/HANDOFF_RESEARCH_GATES_V3_CN.md`](docs/HANDOFF_RESEARCH_GATES_V3_CN.md)
+for conservative G0–G6 staging, city/site-balanced reviews, log-bound motion
+attestations, mid-route geometric falsification, partial profile/time grids,
+and non-promoting research decision reports. These are **not** closed-loop
+vehicle tests or established scientific novelty evidence.
