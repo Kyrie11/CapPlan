@@ -54,7 +54,7 @@ def run(args):
     if args.map and args.map not in world.get_map().name:
         world=client.load_world(args.map)
     original=world.get_settings();traffic=None
-    actors=[];collision_events=[];rows=[]
+    actors=[];collision_events=[];rows=[];controlled_traffic_lights=[]
     result={'evidence_type':'CARLA_CONTROLLED_VEHICLE_TRAJECTORY_ONLY', 'carla_map':world.get_map().name,
         'mode':args.mode,'seed':args.seed,'passenger_boarding_verified':False,'curb_legality_verified':False,
         'nuplan_episode_matched':False,'vehicle_motion_observed':False,'vehicle_collision_free':None,
@@ -64,6 +64,16 @@ def run(args):
         settings.no_rendering_mode=args.no_rendering
         world.apply_settings(settings)
         preexisting=[a.id for a in world.get_actors().filter('vehicle.*')]
+        traffic_lights=sorted(world.get_actors().filter('traffic.traffic_light*'),key=lambda x:x.id)
+        result['traffic_signal_count']=len(traffic_lights)
+        result['traffic_signals_controlled']=bool(args.freeze_traffic_lights)
+        if args.freeze_traffic_lights:
+            # A deliberately artificial, fixed common signal phase used ONLY
+            # for matched CARLA controls, never a natural traffic claim.
+            for light in traffic_lights:
+                controlled_traffic_lights.append((light,light.get_state()))
+                light.set_state(carla.TrafficLightState.Green)
+                light.freeze(True)
         result['other_vehicles_at_start']=len(preexisting)
         result['paired_controlled_comparability']=len(preexisting)==0
         start,A,B=choose_waypoints(world,carla,args.spawn_index,args.a_steps,args.b_steps)
@@ -98,6 +108,7 @@ def run(args):
         agent=BasicAgent(vehicle,target_speed=args.target_speed_kmh)
         goal='A';agent.set_destination(A.transform.location)
         sim_start=None;changed=False;reached=False;agent_done_seen=False;minimum_gap_m=float('inf')
+        in_goal_zone_once=False; braking_to_stop=False; stopped_dwell_s=0.0; best_dwell_s=0.0
         for tick in range(int(args.max_seconds/args.dt)):
             frame=world.tick();snap=world.get_snapshot()
             simtime=float(snap.timestamp.elapsed_seconds)
@@ -106,29 +117,56 @@ def run(args):
             if args.mode=='blocked_A_redirect_B' and not changed and elapsed>=args.redirect_at_s:
                 agent.set_destination(B.transform.location);goal='B';changed=True
             dest=A.transform.location if goal=='A' else B.transform.location
-            vehicle.apply_control(agent.run_step())
+            # V7: zone entry alone is not passenger handoff. In strict mode
+            # apply a documented scripted brake, and verify a stationary dwell.
+            # This is NOT a normal curb-parking planner or accessible boarding.
+            if args.service_stop_hold_s>0 and braking_to_stop:
+                vehicle.apply_control(carla.VehicleControl(throttle=0.0,brake=1.0,hand_brake=False))
+            else:
+                vehicle.apply_control(agent.run_step())
             loc=vehicle.get_location();vel=vehicle.get_velocity()
             sp=math.sqrt(vel.x**2+vel.y**2+vel.z**2)
             gap=loc.distance(dest)
             minimum_gap_m=min(minimum_gap_m,gap)
             agent_done_seen=agent_done_seen or bool(agent.done())
+            in_goal_zone_once = in_goal_zone_once or gap<=args.arrival_radius_m
+            if args.service_stop_hold_s>0 and gap<=args.arrival_radius_m:
+                braking_to_stop=True
+            if args.service_stop_hold_s>0 and braking_to_stop:
+                stopped_dwell_s=(stopped_dwell_s+args.dt if gap<=args.arrival_radius_m and sp<=args.stop_speed_mps else 0.0)
+                best_dwell_s=max(best_dwell_s,stopped_dwell_s)
             rows.append({'tick':tick,'elapsed_s':round(elapsed,3),'x':loc.x,'y':loc.y,'z':loc.z,
-                'speed_mps':sp,'target':goal,'distance_to_goal_m':gap,'collisions_to_date':len(collision_events)})
-            if gap<=args.arrival_radius_m:
+                'speed_mps':sp,'target':goal,'distance_to_goal_m':gap,'collisions_to_date':len(collision_events),
+                'scripted_braking':braking_to_stop,'stationary_dwell_s':round(stopped_dwell_s,3)})
+            if args.service_stop_hold_s>0:
+                if stopped_dwell_s+1e-8>=args.service_stop_hold_s:
+                    reached=True;break
+            elif gap<=args.arrival_radius_m:
                 reached=True;break
-        result.update({'status':'COMPLETED','goal':goal,'reached_goal_zone':reached,
+        service_stopped=bool(args.service_stop_hold_s>0 and reached and len(collision_events)==0)
+        result.update({'status':'COMPLETED','goal':goal,'reached_goal_zone':in_goal_zone_once,
             'elapsed_sim_s':rows[-1]['elapsed_s'] if rows else None,'ticks':len(rows),
             'collisions':len(collision_events),'collision_events':collision_events,
             'minimum_goal_gap_m':minimum_gap_m, 'agent_done_seen':agent_done_seen,
             'ended_speed_mps':rows[-1]['speed_mps'] if rows else None,
-            'stopped_near_goal':bool(reached and rows and rows[-1]['speed_mps']<=0.5),
+            'stopped_near_goal':service_stopped if args.service_stop_hold_s>0 else bool(reached and rows and rows[-1]['speed_mps']<=0.5),
+            'service_stop_hold_s_required':args.service_stop_hold_s,
+            'service_stop_best_dwell_s':best_dwell_s,
+            'service_stop_protocol':'SCRIPTED_BRAKE_IN_GOAL_ZONE; no curb legality or boarding',
+            'stationary_service_stop_observed':service_stopped,
+            'stop_speed_threshold_mps':args.stop_speed_mps,
             'vehicle_collision_free':None, # lack of callbacks is not an independently verified collision-free proof
             'no_collision_sensor_events_observed':len(collision_events)==0,
             'vehicle_motion_observed':bool(rows),
-            'vehicle_service_success_surrogate':bool(reached and not collision_events),
+            'vehicle_service_success_surrogate':bool(service_stopped if args.service_stop_hold_s>0 else reached and not collision_events),
             'research_boundary':'CARLA goal-zone arrival with collision sensor only; NOT a passenger handoff or legal accessible PUDO'})
         return result,rows
     finally:
+        for light,previous_state in controlled_traffic_lights:
+            try:
+                light.freeze(False)
+                light.set_state(previous_state)
+            except Exception:pass
         for a in reversed(actors):
             try:
                 if a.type_id.startswith('sensor.'):a.stop()
@@ -146,10 +184,13 @@ def main():
     p.add_argument('--redirect_at_s',type=float,default=8);p.add_argument('--target_speed_kmh',type=float,default=20)
     p.add_argument('--arrival_radius_m',type=float,default=4);p.add_argument('--max_seconds',type=float,default=50)
     p.add_argument('--dt',type=float,default=.05);p.add_argument('--timeout',type=float,default=30)
+    p.add_argument('--service_stop_hold_s',type=float,default=0.0,help='When positive, brake after zone entry and require stationary dwell; scripted surrogate only')
+    p.add_argument('--stop_speed_mps',type=float,default=0.5)
+    p.add_argument('--freeze_traffic_lights',action='store_true',help='Artificial all-green traffic lights for matched control; never a natural-road result')
     p.add_argument('--blocker_blueprint',default='vehicle.tesla.model3');p.add_argument('--no_rendering',action='store_true')
     p.add_argument('--dry_run',action='store_true')
     a=p.parse_args()
-    if a.dt<=0 or a.max_seconds<=0 or a.redirect_at_s<0 or a.target_speed_kmh<=0 or a.a_steps<=0 or a.b_steps<=0:p.error('invalid timing or speed')
+    if a.dt<=0 or a.max_seconds<=0 or a.redirect_at_s<0 or a.target_speed_kmh<=0 or a.a_steps<=0 or a.b_steps<=0 or a.service_stop_hold_s<0 or a.stop_speed_mps<=0:p.error('invalid timing or speed')
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
     if a.dry_run:
         payload=offline_spec();payload.update({'status':'DRY_RUN_NO_SIMULATION','mode':a.mode});rows=[]
