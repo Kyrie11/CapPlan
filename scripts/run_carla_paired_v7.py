@@ -62,9 +62,10 @@ def main():
     p.add_argument('--speed_kmh',type=float,default=8);p.add_argument('--radius_m',type=float,default=4)
     p.add_argument('--stop_hold_s',type=float,default=2);p.add_argument('--dt',type=float,default=.05)
     p.add_argument('--max_seconds',type=float,default=50);p.add_argument('--redirect_at_s',type=float,default=5)
+    p.add_argument('--preview_brake_decel_mps2',type=float,default=0.0)
     p.add_argument('--dry_run',action='store_true')
     a=p.parse_args()
-    if any(not math.isfinite(v) or v<=0 for v in (a.speed_kmh,a.radius_m,a.stop_hold_s,a.dt,a.max_seconds)) or a.max_trials<1:
+    if any(not math.isfinite(v) or v<=0 for v in (a.speed_kmh,a.radius_m,a.stop_hold_s,a.dt,a.max_seconds)) or a.max_trials<1 or not math.isfinite(a.preview_brake_decel_mps2) or a.preview_brake_decel_mps2<0:
         p.error('invalid positive parameters')
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
     candidate_data=json.loads(Path(a.calibration).read_text());candidate_data=candidate_data.get('calibrated_goal_zone_candidates',[])
@@ -79,10 +80,12 @@ def main():
             '--seed',str(a.seed),'--target_speed_kmh',str(a.speed_kmh),
             '--arrival_radius_m',str(a.radius_m),'--max_seconds',str(a.max_seconds),
             '--service_stop_hold_s',str(a.stop_hold_s),'--dt',str(a.dt),
-            '--redirect_at_s',str(a.redirect_at_s),'--freeze_traffic_lights']
+            '--redirect_at_s',str(a.redirect_at_s),'--freeze_traffic_lights',
+            '--preview_brake_decel_mps2',str(a.preview_brake_decel_mps2)]
         plan={'pair_id':i,'geometry':{'spawn_index':spawn,'a_steps':astep,'b_steps':a.b_steps},
               'parameters':{'seed':a.seed,'speed_kmh':a.speed_kmh,'radius_m':a.radius_m,
-                            'stop_hold_s':a.stop_hold_s,'redirect_at_s':a.redirect_at_s},'runs':{}}
+                            'stop_hold_s':a.stop_hold_s,'redirect_at_s':a.redirect_at_s,
+                            'preview_brake_decel_mps2':a.preview_brake_decel_mps2},'runs':{}}
         for mode in MODES:
             # In a fail-closed study, do not run induced obstruction when the
             # clear condition has not first achieved the required service stop.
