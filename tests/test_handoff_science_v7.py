@@ -21,11 +21,12 @@ def test_carla_paired_negative_control_gate():
 
 def test_carla_trace_validation(tmp_path):
     m=module('run_carla_paired_v7');path=tmp_path/'clear_A';path.mkdir()
-    trace=(json.dumps({'elapsed_s':0,'distance_to_goal_m':4})+'\n'+json.dumps({'elapsed_s':.05,'distance_to_goal_m':3})+'\n').encode()
+    trace=''.join(json.dumps({'elapsed_s':i*.05,'distance_to_goal_m':3.0,'speed_mps':0.,'target':'A'})+'\n' for i in range(65)).encode()
     (path/'trajectory.jsonl').write_bytes(trace)
     (path/'execution_report.json').write_text(json.dumps({'mode':'clear_A','status':'COMPLETED',
         'trajectory_file_sha256':hashlib.sha256(trace).hexdigest(),'stationary_service_stop_observed':True,
-        'service_stop_best_dwell_s':2.0,'collisions':0,'goal':'A','other_vehicles_at_start':0}))
+        'service_stop_best_dwell_s':2.0,'collisions':0,'goal':'A','other_vehicles_at_start':0,
+        'geometry_parameters':{'arrival_radius_m':4.},'stop_speed_threshold_mps':.5}))
     assert m.validate_run(path,'clear_A',2)['stop_with_dwell']
     assert not m.validate_run(path,'clear_A',3)['stop_with_dwell']
     (path/'trajectory.jsonl').write_text('broken\n')

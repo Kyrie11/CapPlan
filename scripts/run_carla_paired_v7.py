@@ -11,19 +11,51 @@ from pathlib import Path
 
 MODES=('clear_A','blocked_A','blocked_A_redirect_B')
 
+def trace_dwell(rows, radius_m, speed_limit_mps, target):
+    """Independent-from-report *trace-consistency* check, not physical proof.
+
+    Uses the CARLA trace's own sampled times and target to rederive dwell.
+    We accept the final sample's dt as a documented fixed-step approximation.
+    """
+    if not rows or not (math.isfinite(radius_m) and radius_m > 0 and
+                        math.isfinite(speed_limit_mps) and speed_limit_mps > 0):
+        return 0.0
+    intervals=[float(rows[i]['elapsed_s'])-float(rows[i-1]['elapsed_s']) for i in range(1,len(rows))]
+    if not intervals or any(not math.isfinite(dt) or dt<=0 for dt in intervals):return 0.0
+    dt=min(intervals);run=best=0.0
+    for i,r in enumerate(rows):
+        try:
+            inside=(str(r['target'])==target and
+                    0<=float(r['distance_to_goal_m'])<=radius_m+1e-5 and
+                    0<=float(r['speed_mps'])<=speed_limit_mps+1e-5)
+        except (KeyError,ValueError,TypeError):return 0.0
+        run=run+(intervals[i-1] if i else dt) if inside else 0.0
+        best=max(best,run)
+    return best
+
+
 def validate_run(output_dir,mode,hold_s):
     p=Path(output_dir);report=p/'execution_report.json';trace=p/'trajectory.jsonl'
     if not report.exists() or not trace.exists():return {'mode':mode,'valid':False,'status':'OUTPUT_MISSING'}
     d=json.loads(report.read_text());blob=trace.read_bytes()
     digest=hashlib.sha256(blob).hexdigest()==d.get('trajectory_file_sha256')
     rows=[json.loads(r) for r in blob.splitlines() if r.strip()]
-    stable=(all(rows[i]['elapsed_s']>rows[i-1]['elapsed_s'] for i in range(1,len(rows))) if rows else False)
+    stable=(bool(rows) and all(math.isfinite(float(r.get('elapsed_s',float('nan')))) for r in rows) and
+            all(rows[i]['elapsed_s']>rows[i-1]['elapsed_s'] for i in range(1,len(rows))))
+    params=d.get('geometry_parameters') or {}
+    radius=float(params.get('arrival_radius_m') or float('nan'))
+    stop_speed=float(d.get('stop_speed_threshold_mps') or float('nan'))
+    target=d.get('goal')
+    measured=trace_dwell(rows,radius,stop_speed,target) if stable else 0.0
     hold=float(d.get('service_stop_best_dwell_s') or 0)
-    stop=bool(d.get('stationary_service_stop_observed') and hold+1e-5>=hold_s)
+    stop=bool(d.get('stationary_service_stop_observed') and hold+1e-5>=hold_s and
+              measured+1e-4>=hold_s)
     clean=bool(d.get('collisions')==0)
     matched=bool(d.get('mode')==mode and d.get('status')=='COMPLETED' and digest and stable and len(rows)>0)
     return {'mode':mode,'valid':matched,'status':d.get('status'),'sha256_ok':digest,
-            'timestamps_ok':stable,'stop_with_dwell':stop,'goal_zone_entered':d.get('reached_goal_zone'),
+            'timestamps_ok':stable,'stop_with_dwell':stop,
+            'dwell_derived_from_trace_s':round(measured,4),
+            'goal_zone_entered':d.get('reached_goal_zone'),
             'collision_events':d.get('collisions'),'no_collision_sensor_events_observed':clean,
             'geometry':d.get('carla_locations'),'parameters':d.get('geometry_parameters'),
             'elapsed_sim_s':d.get('elapsed_sim_s'),'trajectory_rows':len(rows),'dwell_s':hold,
@@ -62,10 +94,9 @@ def main():
     p.add_argument('--speed_kmh',type=float,default=8);p.add_argument('--radius_m',type=float,default=4)
     p.add_argument('--stop_hold_s',type=float,default=2);p.add_argument('--dt',type=float,default=.05)
     p.add_argument('--max_seconds',type=float,default=50);p.add_argument('--redirect_at_s',type=float,default=5)
-    p.add_argument('--preview_brake_decel_mps2',type=float,default=0.0)
     p.add_argument('--dry_run',action='store_true')
     a=p.parse_args()
-    if any(not math.isfinite(v) or v<=0 for v in (a.speed_kmh,a.radius_m,a.stop_hold_s,a.dt,a.max_seconds)) or a.max_trials<1 or not math.isfinite(a.preview_brake_decel_mps2) or a.preview_brake_decel_mps2<0:
+    if any(not math.isfinite(v) or v<=0 for v in (a.speed_kmh,a.radius_m,a.stop_hold_s,a.dt,a.max_seconds)) or a.max_trials<1:
         p.error('invalid positive parameters')
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
     candidate_data=json.loads(Path(a.calibration).read_text());candidate_data=candidate_data.get('calibrated_goal_zone_candidates',[])
@@ -80,12 +111,10 @@ def main():
             '--seed',str(a.seed),'--target_speed_kmh',str(a.speed_kmh),
             '--arrival_radius_m',str(a.radius_m),'--max_seconds',str(a.max_seconds),
             '--service_stop_hold_s',str(a.stop_hold_s),'--dt',str(a.dt),
-            '--redirect_at_s',str(a.redirect_at_s),'--freeze_traffic_lights',
-            '--preview_brake_decel_mps2',str(a.preview_brake_decel_mps2)]
+            '--redirect_at_s',str(a.redirect_at_s),'--freeze_traffic_lights']
         plan={'pair_id':i,'geometry':{'spawn_index':spawn,'a_steps':astep,'b_steps':a.b_steps},
               'parameters':{'seed':a.seed,'speed_kmh':a.speed_kmh,'radius_m':a.radius_m,
-                            'stop_hold_s':a.stop_hold_s,'redirect_at_s':a.redirect_at_s,
-                            'preview_brake_decel_mps2':a.preview_brake_decel_mps2},'runs':{}}
+                            'stop_hold_s':a.stop_hold_s,'redirect_at_s':a.redirect_at_s},'runs':{}}
         for mode in MODES:
             # In a fail-closed study, do not run induced obstruction when the
             # clear condition has not first achieved the required service stop.

@@ -46,16 +46,6 @@ def choose_waypoints(world,carla,spawn_index,a_steps=7,b_steps=8):
     if A.transform.location.distance(B.transform.location)<15:raise RuntimeError('candidate A/B too close')
     return start,A,B
 
-def preview_brake_required(gap_m, speed_mps, radius_m, decel_mps2, is_approaching):
-    """A *control tuning* trigger, not a stopping-distance safety certificate.
-
-    Strong CARLA scripted brakes differ from ideal constant-deceleration physics;
-    only measured dwell inside the original strict goal radius counts as success.
-    """
-    if decel_mps2 <= 0 or not is_approaching:
-        return False
-    return gap_m <= radius_m + speed_mps * speed_mps / (2 * decel_mps2)
-
 def run(args):
     random.seed(args.seed)
     carla,BasicAgent=load_api()
@@ -119,7 +109,6 @@ def run(args):
         goal='A';agent.set_destination(A.transform.location)
         sim_start=None;changed=False;reached=False;agent_done_seen=False;minimum_gap_m=float('inf')
         in_goal_zone_once=False; braking_to_stop=False; stopped_dwell_s=0.0; best_dwell_s=0.0
-        previous_gap=None; first_brake_time_s=None; first_brake_gap_m=None
         for tick in range(int(args.max_seconds/args.dt)):
             frame=world.tick();snap=world.get_snapshot()
             simtime=float(snap.timestamp.elapsed_seconds)
@@ -141,14 +130,8 @@ def run(args):
             minimum_gap_m=min(minimum_gap_m,gap)
             agent_done_seen=agent_done_seen or bool(agent.done())
             in_goal_zone_once = in_goal_zone_once or gap<=args.arrival_radius_m
-            if args.service_stop_hold_s>0 and (gap<=args.arrival_radius_m or
-                    preview_brake_required(gap,sp,args.arrival_radius_m,args.preview_brake_decel_mps2,
-                                           previous_gap is not None and gap<previous_gap)):
-                if not braking_to_stop:
-                    first_brake_time_s=elapsed
-                    first_brake_gap_m=gap
+            if args.service_stop_hold_s>0 and gap<=args.arrival_radius_m:
                 braking_to_stop=True
-            previous_gap=gap
             if args.service_stop_hold_s>0 and braking_to_stop:
                 stopped_dwell_s=(stopped_dwell_s+args.dt if gap<=args.arrival_radius_m and sp<=args.stop_speed_mps else 0.0)
                 best_dwell_s=max(best_dwell_s,stopped_dwell_s)
@@ -169,9 +152,7 @@ def run(args):
             'stopped_near_goal':service_stopped if args.service_stop_hold_s>0 else bool(reached and rows and rows[-1]['speed_mps']<=0.5),
             'service_stop_hold_s_required':args.service_stop_hold_s,
             'service_stop_best_dwell_s':best_dwell_s,
-            'service_stop_protocol':'SCRIPTED_BRAKE_PREVIEW_OR_IN_GOAL_ZONE; no curb legality or boarding',
-            'preview_brake_decel_mps2':args.preview_brake_decel_mps2,
-            'first_brake_time_s':first_brake_time_s,'first_brake_gap_m':first_brake_gap_m,
+            'service_stop_protocol':'SCRIPTED_BRAKE_IN_GOAL_ZONE; no curb legality or boarding',
             'stationary_service_stop_observed':service_stopped,
             'stop_speed_threshold_mps':args.stop_speed_mps,
             'vehicle_collision_free':None, # lack of callbacks is not an independently verified collision-free proof
@@ -205,12 +186,11 @@ def main():
     p.add_argument('--dt',type=float,default=.05);p.add_argument('--timeout',type=float,default=30)
     p.add_argument('--service_stop_hold_s',type=float,default=0.0,help='When positive, brake after zone entry and require stationary dwell; scripted surrogate only')
     p.add_argument('--stop_speed_mps',type=float,default=0.5)
-    p.add_argument('--preview_brake_decel_mps2',type=float,default=0.0, help='Optional earlier braking control experiment; zero preserves V7 behavior')
     p.add_argument('--freeze_traffic_lights',action='store_true',help='Artificial all-green traffic lights for matched control; never a natural-road result')
     p.add_argument('--blocker_blueprint',default='vehicle.tesla.model3');p.add_argument('--no_rendering',action='store_true')
     p.add_argument('--dry_run',action='store_true')
     a=p.parse_args()
-    if a.dt<=0 or a.max_seconds<=0 or a.redirect_at_s<0 or a.target_speed_kmh<=0 or a.a_steps<=0 or a.b_steps<=0 or a.service_stop_hold_s<0 or a.stop_speed_mps<=0 or not math.isfinite(a.preview_brake_decel_mps2) or a.preview_brake_decel_mps2<0:p.error('invalid timing or speed')
+    if a.dt<=0 or a.max_seconds<=0 or a.redirect_at_s<0 or a.target_speed_kmh<=0 or a.a_steps<=0 or a.b_steps<=0 or a.service_stop_hold_s<0 or a.stop_speed_mps<=0:p.error('invalid timing or speed')
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
     if a.dry_run:
         payload=offline_spec();payload.update({'status':'DRY_RUN_NO_SIMULATION','mode':a.mode});rows=[]
