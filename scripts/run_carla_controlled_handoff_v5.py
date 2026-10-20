@@ -107,6 +107,28 @@ def run(args):
             actors.append(blocker)
         agent=BasicAgent(vehicle,target_speed=args.target_speed_kmh)
         goal='A';agent.set_destination(A.transform.location)
+        # V9 instrumentation only (does not change control). It distinguishes
+        # a poor target/route choice from vehicle inability to stop.
+        start_tf=vehicle.get_transform()
+        forward=start_tf.get_forward_vector()
+        delta=A.transform.location-start_tf.location
+        denom=max(1e-9,math.hypot(delta.x,delta.y)*math.hypot(forward.x,forward.y))
+        route_debug={'start_yaw_deg':float(start_tf.rotation.yaw),
+                     'heading_dot_to_goal_xy':float((delta.x*forward.x+delta.y*forward.y)/denom),
+                     'target_start_euclidean_m':float(math.hypot(delta.x,delta.y))}
+        try:
+            local=agent.get_local_planner()
+            route=list(local.get_plan()) if hasattr(local,'get_plan') else []
+            route_debug['planned_waypoint_count']=len(route)
+            route_debug['planned_first_5_xy']=[
+                [float(point.transform.location.x),float(point.transform.location.y)]
+                for point,_ in route[:5]]
+            if route:
+                coords=[start_tf.location]+[point.transform.location for point,_ in route]
+                route_debug['planned_route_length_m']=sum(coords[i].distance(coords[i+1]) for i in range(len(coords)-1))
+        except Exception as exc:
+            route_debug['route_introspection_unavailable']=type(exc).__name__
+        result['control_diagnostics_v9']=route_debug
         sim_start=None;changed=False;reached=False;agent_done_seen=False;minimum_gap_m=float('inf')
         in_goal_zone_once=False; braking_to_stop=False; stopped_dwell_s=0.0; best_dwell_s=0.0
         for tick in range(int(args.max_seconds/args.dt)):
