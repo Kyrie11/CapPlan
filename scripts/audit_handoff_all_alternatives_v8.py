@@ -66,7 +66,7 @@ def filtered_adjacency(graph,contract):
     return adj,explicit_curb,nodes
 
 
-def evaluate(pair,anchors,graph,notice_s,*,speed_mps=.8,ack_s=10.,pause=False,require_curb=True,compiled=None):
+def evaluate(pair,anchors,graph,notice_s,*,speed_mps=.8,ack_s=10.,pause=False,require_curb=True,compiled=None, max_returned_alternates=30):
     cont=pair['screening_contract']
     if compiled is None:
         adj,curb,nodes=filtered_adjacency(graph,cont)
@@ -113,7 +113,8 @@ def evaluate(pair,anchors,graph,notice_s,*,speed_mps=.8,ack_s=10.,pause=False,re
       'passenger_pauses_during_ack':pause,'distance_consumed_at_ack_m':round(consumed,4),
       'distance_budget_m':budget,'legal_unblocked_candidates_checked':examined,
       'graph_eligible_alternates_count':len(possible),'B_graph_feasible':b_feasible,
-      'non_B_alternate_graph_feasible':c_feasible,'alternates':possible[:30],
+      'non_B_alternate_graph_feasible':c_feasible,'alternates':possible if max_returned_alternates is None else possible[:max_returned_alternates],
+      'eligible_anchor_list_complete':max_returned_alternates is None or len(possible)<=max_returned_alternates,
       'filter_reasons':dict(reason),'terminal_A_to_B_over_budget_claim':bool(pair['reroute_total_m']>budget),
       'interpretation':'graph-level counterexample ONLY; no independent real curb, stop, vehicle, aid, physical board',
       'no_alternates_does_NOT_certify_stranding':True}
