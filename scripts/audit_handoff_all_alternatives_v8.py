@@ -52,7 +52,7 @@ def position_on_path(pair,notice_s,speed_mps,ack_s,pause):
     raise ValueError('progress could not be mapped onto pedestrian path')
 
 
-def filtered_adjacency(graph,contract):
+def filtered_adjacency(graph,contract,*,respect_direction=False):
     c=SimpleNamespace(require_step_free=bool(contract.get('require_step_free')),
        min_width_m=float(contract['min_width_m']),max_slope=float(contract['max_slope']),
        max_cross_slope=float(contract['max_cross_slope']),
@@ -60,16 +60,18 @@ def filtered_adjacency(graph,contract):
     adj=defaultdict(list);explicit_curb=set();nodes=set(n.node_id for n in graph.nodes)
     for e in graph.edges:
         if not _valid_edge(e,c):continue
-        adj[e.from_node].append((e.to_node,e));adj[e.to_node].append((e.from_node,e))
+        adj[e.from_node].append((e.to_node,e))
+        if not respect_direction:
+            adj[e.to_node].append((e.from_node,e))
         if str(e.crossing_type).lower()=='curb':
             explicit_curb.update((e.from_node,e.to_node))
     return adj,explicit_curb,nodes
 
 
-def evaluate(pair,anchors,graph,notice_s,*,speed_mps=.8,ack_s=10.,pause=False,require_curb=True,compiled=None, max_returned_alternates=30):
+def evaluate(pair,anchors,graph,notice_s,*,speed_mps=.8,ack_s=10.,pause=False,require_curb=True,compiled=None,respect_direction=False):
     cont=pair['screening_contract']
     if compiled is None:
-        adj,curb,nodes=filtered_adjacency(graph,cont)
+        adj,curb,nodes=filtered_adjacency(graph,cont,respect_direction=respect_direction)
         cache={}
     else:
         adj,curb,nodes,cache=compiled
@@ -83,7 +85,13 @@ def evaluate(pair,anchors,graph,notice_s,*,speed_mps=.8,ack_s=10.,pause=False,re
                 oldest=next(iter(cache))
                 if oldest!=origin:cache.pop(oldest)
         return cache[origin]
-    from_u=tree(u)
+    # When progress lies inside a directed u->v edge, reversing to u is
+    # permissible only if the filtered graph explicitly has v->u. Otherwise
+    # the optimistic old undirected approximation invents a recovery route.
+    # At an endpoint (du == 0 or dv == 0), no mid-edge reversal is needed.
+    reversal_possible=(not respect_direction or u==v or du<=1e-9 or
+                       (dv>1e-9 and any(n==u for n,_ in adj.get(v,()))))
+    from_u=tree(u) if reversal_possible else {}
     from_v=from_u if u==v else tree(v)
     consumed=float(cont.get('already_consumed_m',0))+progress
     budget=float(cont['distance_budget_m'])
@@ -96,7 +104,8 @@ def evaluate(pair,anchors,graph,notice_s,*,speed_mps=.8,ack_s=10.,pause=False,re
         examined+=1;node=anchor['adjacent_ped_node_id']
         if node not in nodes:reason['anchor_node_missing']+=1;continue
         if require_curb and node not in curb:reason['no_explicit_valid_typed_curb_edge']+=1;continue
-        path=min(du+from_u.get(node,math.inf),dv+from_v.get(node,math.inf))
+        path=min((du+from_u.get(node,math.inf)) if reversal_possible else math.inf,
+                 dv+from_v.get(node,math.inf))
         if not math.isfinite(path):reason['graph_path_unreachable']+=1;continue
         if consumed+path>budget+1e-9:reason['distance_budget_exceeded']+=1;continue
         possible.append({'anchor_id':anchor['anchor_id'],'physical_site_key':anchor.get('hybrid_physical_site_key'),
@@ -113,14 +122,15 @@ def evaluate(pair,anchors,graph,notice_s,*,speed_mps=.8,ack_s=10.,pause=False,re
       'passenger_pauses_during_ack':pause,'distance_consumed_at_ack_m':round(consumed,4),
       'distance_budget_m':budget,'legal_unblocked_candidates_checked':examined,
       'graph_eligible_alternates_count':len(possible),'B_graph_feasible':b_feasible,
-      'non_B_alternate_graph_feasible':c_feasible,'alternates':possible if max_returned_alternates is None else possible[:max_returned_alternates],
-      'eligible_anchor_list_complete':max_returned_alternates is None or len(possible)<=max_returned_alternates,
+      'non_B_alternate_graph_feasible':c_feasible,'alternates':possible[:30],
       'filter_reasons':dict(reason),'terminal_A_to_B_over_budget_claim':bool(pair['reroute_total_m']>budget),
       'interpretation':'graph-level counterexample ONLY; no independent real curb, stop, vehicle, aid, physical board',
-      'no_alternates_does_NOT_certify_stranding':True}
+      'no_alternates_does_NOT_certify_stranding':True,
+      'pedestrian_direction_mode':('DIRECTED_SENSITIVITY_GRAPH_ENCODING_MUST_BE_AUDITED'
+                                  if respect_direction else 'OPTIMISTIC_UNDIRECTED')}
 
 
-def run(dataset_dir,pairs,output,notice_times,limit=32,speed_mps=.8,ack_s=10.,pause=False,require_curb=True):
+def run(dataset_dir,pairs,output,notice_times,limit=32,speed_mps=.8,ack_s=10.,pause=False,require_curb=True,respect_direction=False):
     if limit<1:raise ValueError('limit must be positive')
     selected=[]
     for p in records(pairs):
@@ -147,11 +157,12 @@ def run(dataset_dir,pairs,output,notice_times,limit=32,speed_mps=.8,ack_s=10.,pa
             for p in episode_pairs:
                 counts['attempted_pairs']+=1
                 try:
-                    adjacency,curb,nodes=filtered_adjacency(graph,p['screening_contract'])
+                    adjacency,curb,nodes=filtered_adjacency(graph,p['screening_contract'],respect_direction=respect_direction)
                     compiled=(adjacency,curb,nodes,{})
                     for t in notice_times:
                         row=evaluate(p,per_episode.get(ep,()),graph,t,speed_mps=speed_mps,ack_s=ack_s,
-                            pause=pause,require_curb=require_curb,compiled=compiled)
+                            pause=pause,require_curb=require_curb,compiled=compiled,
+                            respect_direction=respect_direction)
                         f.write(json.dumps(row,ensure_ascii=False)+'\n');counts['grid_rows']+=1
                         counts['B_graph_feasible']+=int(row['B_graph_feasible'])
                         counts['third_option_graph_feasible']+=int(row['non_B_alternate_graph_feasible'])
@@ -160,7 +171,9 @@ def run(dataset_dir,pairs,output,notice_times,limit=32,speed_mps=.8,ack_s=10.,pa
                 except (KeyError,ValueError,TypeError,OverflowError) as exc:
                     errors.append({'episode_id':ep,'a_anchor':p.get('a_anchor'),'exception':repr(exc)})
     summary={'counts':dict(counts),'errors':errors,'times_s':notice_times,
-       'symmetric_pedestrian_edges_assumed':True,'require_typed_curb_connector':require_curb,
+       'symmetric_pedestrian_edges_assumed':not respect_direction,
+       'directed_edge_encoding_verified':False,
+       'require_typed_curb_connector':require_curb,
        'exact_graph_only_not_physical':'No verified passenger boarding, curb permission or motion trajectories',
        'cannot_estimate_incidence':True,'selection':'previously mined conditional asymmetry pairs; no random population sample'}
     dump_json(output.with_suffix('.summary.json'),summary)
@@ -174,10 +187,12 @@ def main():
     p.add_argument('--ack_s',type=float,default=10);p.add_argument('--limit',type=int,default=32)
     p.add_argument('--pause_during_ack',action='store_true')
     p.add_argument('--allow_missing_typed_curb',action='store_true',help='OPTIMISTIC sensitivity ONLY; never physical truth')
+    p.add_argument('--respect_directed_pedestrian_edges',action='store_true',
+                   help='Sensitivity: require explicit reverse arcs; may be pessimistic if source encodes an undirected edge only once')
     a=p.parse_args();ts=[float(v) for v in a.notice_times_s.split(',')]
     if not ts or any(not math.isfinite(t) or t<0 for t in ts):p.error('invalid notice times')
     summary=run(a.dataset_dir,a.pairs,a.output,ts,a.limit,a.speed_mps,a.ack_s,a.pause_during_ack,
-                not a.allow_missing_typed_curb)
+                not a.allow_missing_typed_curb,a.respect_directed_pedestrian_edges)
     print(json.dumps(summary['counts'],ensure_ascii=False))
 
 if __name__=='__main__':main()

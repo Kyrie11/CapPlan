@@ -97,6 +97,12 @@ class FiniteCommitmentModel:
         self.ttl = int(scenario['evidence_ttl_ticks'])
         self.board_ticks = int(scenario['boarding_ticks'])
         self.require_evidence = bool(scenario.get('require_evidence_for_board', True))
+        # V11 falsification switch. Original V10 serial dispatch remains the
+        # default for bit-for-bit lineage of historical controlled results.
+        # Actual dispatch systems can send a passenger message and a vehicle
+        # goal in the same scheduling tick; silently serializing them can
+        # manufacture a three-way timing interaction.
+        self.allow_parallel_control_actions = bool(scenario.get('allow_parallel_control_actions', False))
         self.worlds = {w['id']:w for w in scenario['worlds']}
         if not self.sites or not self.worlds or len(self.worlds)!=len(scenario['worlds']):
             raise ValueError('non-empty sites and unique world IDs required')
@@ -212,6 +218,14 @@ class FiniteCommitmentModel:
         if s.vehicle in self.sites:
             actions.append('verify:'+s.vehicle)
             actions.append('board:'+s.vehicle)
+        if self.allow_parallel_control_actions:
+            # Concurrent *commands* only: one guide + one vehicle command OR
+            # one guide + an observation at the vehicle's current position.
+            # They still take a full tick to execute; no early observation or
+            # advance ACK is created. Boarding is never combined with a command.
+            guides=[a for a in actions if a.startswith('guide:')]
+            vehicle_commands=[a for a in actions if a.startswith(('vehicle:', 'verify:'))]
+            actions += [g+'|'+v for g in guides for v in vehicle_commands]
         return tuple(actions)
 
     def successors(self,s:State,act:str):
@@ -221,21 +235,23 @@ class FiniteCommitmentModel:
         different compatible world supports only after a completed observation.
         """
         if act not in self.actions(s):return None
-        if act.startswith('board:'):
-            if not self._board_possible(s,act.split(':',1)[1]):
+        commands=act.split('|')
+        if len(commands)==1 and commands[0].startswith('board:'):
+            if not self._board_possible(s,commands[0].split(':',1)[1]):
                 return None
             return ((('success',None),),0.0)
         p_pending=s.pending_instruction;due=s.acknowledgement_due
         v_target=s.vehicle_target
         verified=None
-        if act.startswith('guide:'):
-            p_pending=act.partition(':')[2]
-            due=s.tick+self.ack
-        elif act.startswith('vehicle:'):
-            v_target=act.partition(':')[2]
-        elif act.startswith('verify:'):
-            verified=act.partition(':')[2]
-            if verified!=s.vehicle:return None
+        for command in commands:
+            if command.startswith('guide:'):
+                p_pending=command.partition(':')[2]
+                due=s.tick+self.ack
+            elif command.startswith('vehicle:'):
+                v_target=command.partition(':')[2]
+            elif command.startswith('verify:'):
+                verified=command.partition(':')[2]
+                if verified!=s.vehicle:return None
         active=s.active_instruction
         if p_pending is not None and due is not None and due<=s.tick:
             active=p_pending;p_pending=None;due=None
@@ -255,7 +271,7 @@ class FiniteCommitmentModel:
         if walked>self.max_dist+1e-8 or waited>self.max_wait or tick>self.horizon:
             return None
         local_cost=1.0+0.02*max(0,walked-s.walked)+0.02*int(veh!=s.vehicle)
-        if act.startswith('guide:'):local_cost+=0.05
+        if any(x.startswith('guide:') for x in commands):local_cost+=0.05
         if verified is None:
             return ((('unobserved',replace(s,tick=tick,passenger=loc,walked=walked,waited=waited,
                                           active_instruction=active,pending_instruction=p_pending,
