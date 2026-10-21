@@ -76,6 +76,22 @@ def run(args):
                 light.freeze(True)
         result['other_vehicles_at_start']=len(preexisting)
         result['paired_controlled_comparability']=len(preexisting)==0
+        # V12: paired-control attestation requires identical scenario/control
+        # settings except the deliberate blockage/redirect intervention.
+        # The existing vehicle-only planner is unchanged.
+        result['experiment_config']={
+            'mode':args.mode,'map':world.get_map().name,'seed':args.seed,
+            'spawn_index':args.spawn_index,'a_steps':args.a_steps,'b_steps':args.b_steps,
+            'target_speed_kmh':args.target_speed_kmh,
+            'arrival_radius_m':args.arrival_radius_m,
+            'max_seconds':args.max_seconds,'dt':args.dt,
+            'service_stop_hold_s':args.service_stop_hold_s,
+            'stop_speed_mps':args.stop_speed_mps,
+            'freeze_traffic_lights':args.freeze_traffic_lights,
+            'no_rendering':args.no_rendering,
+            'other_vehicles_at_start':len(preexisting),
+            'blocker_blueprint':args.blocker_blueprint,
+            'redirect_at_s':args.redirect_at_s}
         start,A,B=choose_waypoints(world,carla,args.spawn_index,args.a_steps,args.b_steps)
         result['geometry_parameters']={'spawn_index':args.spawn_index,'a_steps':args.a_steps,'b_steps':args.b_steps,'arrival_radius_m':args.arrival_radius_m}
         result['carla_locations']={'start':[start.location.x,start.location.y,start.location.z],
@@ -89,6 +105,7 @@ def run(args):
             vehicle=world.try_spawn_actor(bp,start)
             if vehicle:break
         if vehicle is None:raise RuntimeError('no spawn available for ego')
+        result['experiment_config']['ego_blueprint']=vehicle.type_id
         actors.append(vehicle)
         collision_bp=library.find('sensor.other.collision')
         collision=world.spawn_actor(collision_bp,carla.Transform(),attach_to=vehicle)
