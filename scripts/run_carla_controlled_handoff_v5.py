@@ -122,6 +122,12 @@ def run(args):
             blocker=world.try_spawn_actor(blocker_bp,block_tf)
             if blocker is None:raise RuntimeError('could not spawn lane blocker; change spawn index or map')
             actors.append(blocker)
+            result['controlled_blocker_spawned']=True
+            loc=blocker.get_location()
+            result['controlled_blocker_location_xyz']=[float(loc.x),float(loc.y),float(loc.z)]
+            result['controlled_blocker_spatial_claim']='CARLA_LANE_CENTER_NOT_REAL_CURB_OR_DEPLOYMENT_REGION'
+        else:
+            result['controlled_blocker_spawned']=False
         agent=BasicAgent(vehicle,target_speed=args.target_speed_kmh)
         goal='A';agent.set_destination(A.transform.location)
         # V9 instrumentation only (does not change control). It distinguishes
@@ -148,13 +154,21 @@ def run(args):
         result['control_diagnostics_v9']=route_debug
         sim_start=None;changed=False;reached=False;agent_done_seen=False;minimum_gap_m=float('inf')
         in_goal_zone_once=False; braking_to_stop=False; stopped_dwell_s=0.0; best_dwell_s=0.0
+        redirect_applied=False;redirect_actual_s=None;redirect_preceded_by_A_stop=False
         for tick in range(int(args.max_seconds/args.dt)):
             frame=world.tick();snap=world.get_snapshot()
             simtime=float(snap.timestamp.elapsed_seconds)
             if sim_start is None:sim_start=simtime
             elapsed=simtime-sim_start
             if args.mode=='blocked_A_redirect_B' and not changed and elapsed>=args.redirect_at_s:
+                # Old code retained the A-stop brake latch after a redirect.
+                # A goal switch must release the A hold and restart the B
+                # dwell/arrival measurements. The vehicle has NOT yet reached B.
+                redirect_preceded_by_A_stop=braking_to_stop
                 agent.set_destination(B.transform.location);goal='B';changed=True
+                redirect_applied=True;redirect_actual_s=float(elapsed)
+                braking_to_stop=False;stopped_dwell_s=0.0;best_dwell_s=0.0
+                in_goal_zone_once=False;minimum_gap_m=float('inf')
             dest=A.transform.location if goal=='A' else B.transform.location
             # V7: zone entry alone is not passenger handoff. In strict mode
             # apply a documented scripted brake, and verify a stationary dwell.
@@ -179,11 +193,24 @@ def run(args):
                 'scripted_braking':braking_to_stop,'stationary_dwell_s':round(stopped_dwell_s,3)})
             if args.service_stop_hold_s>0:
                 if stopped_dwell_s+1e-8>=args.service_stop_hold_s:
-                    reached=True;break
+                    # Do NOT call it a B redirect success when A finishes
+                    # before the scheduled redirect_at_s. Keep the A hold
+                    # until the B command becomes actionable.
+                    if args.mode=='blocked_A_redirect_B' and not redirect_applied:
+                        pass
+                    else:
+                        reached=True;break
             elif gap<=args.arrival_radius_m:
-                reached=True;break
+                if args.mode=='blocked_A_redirect_B' and not redirect_applied:
+                    pass
+                else:
+                    reached=True;break
         service_stopped=bool(args.service_stop_hold_s>0 and reached and len(collision_events)==0)
         result.update({'status':'COMPLETED','goal':goal,'reached_goal_zone':in_goal_zone_once,
+            'redirect_command_applied':redirect_applied,
+            'redirect_actual_s':redirect_actual_s,
+            'redirect_preceded_by_A_stop':redirect_preceded_by_A_stop,
+            'B_stationary_stop_after_redirect':bool(redirect_applied and goal=='B' and service_stopped),
             'elapsed_sim_s':rows[-1]['elapsed_s'] if rows else None,'ticks':len(rows),
             'collisions':len(collision_events),'collision_events':collision_events,
             'minimum_goal_gap_m':minimum_gap_m, 'agent_done_seen':agent_done_seen,
@@ -230,6 +257,8 @@ def main():
     p.add_argument('--dry_run',action='store_true')
     a=p.parse_args()
     if a.dt<=0 or a.max_seconds<=0 or a.redirect_at_s<0 or a.target_speed_kmh<=0 or a.a_steps<=0 or a.b_steps<=0 or a.service_stop_hold_s<0 or a.stop_speed_mps<=0:p.error('invalid timing or speed')
+    if a.mode=='blocked_A_redirect_B' and a.redirect_at_s>=a.max_seconds:
+        p.error('redirect_at_s must precede the experiment horizon')
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
     if a.dry_run:
         payload=offline_spec();payload.update({'status':'DRY_RUN_NO_SIMULATION','mode':a.mode});rows=[]
