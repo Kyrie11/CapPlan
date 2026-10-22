@@ -1,0 +1,12 @@
+{
+  "truth_claim_scope": "CONTROLLED_SYNTHETIC_INTERVENTION_NOT_REAL_MEASUREMENT",
+  "study_purpose": "H2/H4' mechanism sensitivity, not real-world failure incidence",
+  "speed_mps": 0.8,
+  "boarding_duration_s": 25,
+  "passenger_wait_remaining_s": 45,
+  "passenger_arrival_uncertainty_s": 5,
+  "vehicle_dwell_s": 50,
+  "budget_offsets_m": [0, 40],
+  "evidence_expiry_offsets_s": [35, 120],
+  "vehicle_start_offsets_s": [0, 90]
+}

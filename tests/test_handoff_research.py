@@ -44,6 +44,25 @@ def test_fresh_directional_paths_recomputed_despite_old_reverse_witness():
     assert r['real_physical_handoff_verified'] is False
 
 
+def test_directional_suffix_has_edge_source_but_no_real_street_attestation():
+    edges=[edge('O','P',50,'op'),edge('P','A',50,'pa'),
+           edge('O','B',130,'ob'),edge('P','B',70,'pb'),edge('A','B',200,'ab')]
+    for e in edges:
+        e.source='derived_gis_test'
+        e.metadata={'field_provenance':{'width_m':{'kind':'derived'}}}
+    r=inspect_graph_pair(pair(),SimpleNamespace(edges=edges),[20],speed_mps=1,ack_s=0)
+    assert r['path_O_A_edges'][0]['recorded_edge_source']=='derived_gis_test'
+    assert r['path_O_A_edges'][0]['recorded_provenance_kinds']['width_m']=='derived'
+    m=r['midroute'][0]
+    witness=m['B_directed_suffix_witness']
+    assert witness['first_segment']['direction']=='FORWARD_ON_STORED_ARC'
+    assert witness['directed_suffix_to_B'][0]['edge_id']=='pb'
+    assert witness['directed_suffix_to_B'][0]['from']=='P'
+    assert witness['directed_suffix_to_B'][0]['physical_direction_independently_attested'] is False
+    distance=witness['first_segment']['distance_m']+sum(e['length_m'] for e in witness['directed_suffix_to_B'])
+    assert abs(distance-m['distance_to_B_m'])<1e-8
+
+
 def test_only_reverse_arc_encoded_yields_explicit_invalidity_and_optimistic_sensitivity():
     g=SimpleNamespace(edges=[edge('P','O',50,'op'),edge('P','A',50,'pa'),
                               edge('O','B',130,'ob'),edge('A','B',200,'ab')])

@@ -67,10 +67,15 @@ def audit(root: Path) -> dict:
         counts['matched_fiveway_controls']+=int(aligned)
         for m in FOLDERS:counts[m+'_stop_proxy']+=int(mode_success[m])
         counts[category]+=1
+        if aligned and mode_success['clear_B'] and mode_success['clear_A_redirect_B']:
+            counts['matched_with_B_direct_and_unblocked_redirect_success']+=1
+            counts['matched_lost_blocked_redirect_stop_proxy']+=int(not mode_success['blocked_A_redirect_B'])
         rows.append({'trial':trial,'status':category,'config_match_except_intervention':same_configuration,
                      'geometry_match':same_geometry,'surrogate_success_by_mode':mode_success,
                      'real_site_verified':False,'passenger_boarding_verified':False})
     return {'scope':'CARLA_CONTROLLED_VEHICLE_ONLY_NO_REAL_CURB_OR_BOARDING',
             'counts':dict(counts),'trials':rows,
             'interpretation':'B-direct control isolates target accessibility, no-blocker redirect isolates control timing; blocker influence can be tested only after both succeed.',
-            'physical_handoff_verified':False}
+            'physical_handoff_verified':False,
+            'blocker_specific_causality_not_established_without_repeated_traffic_and_collision_controls':True,
+            'same_spawn_configs_are_not_independent_city_sites':True}

@@ -69,8 +69,39 @@ def main(argv=None):
     c = s.add_parser("temporal-check", help="Existing restricted interval vs independent grid; not a published shield")
     c.add_argument("--cases", required=True)
     c.add_argument("--output", required=True)
+    bridge = s.add_parser("progress-packets", help="Export geometry-grounded mid-route state with UNKNOWN vehicle/evidence fields")
+    bridge.add_argument("--remine", required=True)
+    bridge.add_argument("--pairs", help="original screened pairs for declared capability thresholds")
+    bridge.add_argument("--dataset-dir", help="optional PUDO hybrid field provenance; streams only requested anchors")
+    bridge.add_argument("--output", required=True)
+    bridge.add_argument("--max-packets", type=int, default=300)
+    fact = s.add_parser("controlled-factorial", help="Separate, explicitly SYNTHETIC 2x2x2 resource/evidence/vehicle clocks")
+    fact.add_argument("--packets", required=True)
+    fact.add_argument("--assumptions", required=True)
+    fact.add_argument("--output", required=True)
+    fact.add_argument("--max-packets", type=int, default=200)
+    census = s.add_parser("dataset-evidence-audit", help="Stream original PUDO provenance without modifying any dataset")
+    census.add_argument("--dataset-root", required=True, help="data/outputs/datasets (not data/outputs)")
+    census.add_argument("--output", required=True)
+    census.add_argument("--splits", default="train,val,test")
+    census.add_argument("--max-rows-per-split", type=int, default=0, help="0 = read all PUDO rows; positive is PREFIX only")
     args = p.parse_args(argv)
-    if args.command == "carla-triplets":
+    if args.command == "progress-packets":
+        from capplan.handoff.evidence_bridge import export_progress_packets
+        result=export_progress_packets(remine=Path(args.remine),output=Path(args.output),
+            pairs=Path(args.pairs) if args.pairs else None,
+            dataset=Path(args.dataset_dir) if args.dataset_dir else None,
+            max_packets=args.max_packets)
+    elif args.command == "controlled-factorial":
+        from capplan.handoff.evidence_bridge import controlled_factorial
+        result=controlled_factorial(packets=Path(args.packets),assumptions=Path(args.assumptions),
+            output=Path(args.output),max_packets=args.max_packets)
+    elif args.command == "dataset-evidence-audit":
+        from capplan.handoff.evidence_bridge import audit_dataset_sources
+        result=audit_dataset_sources(dataset_root=Path(args.dataset_root),output=Path(args.output),
+            splits=tuple(x.strip() for x in args.splits.split(',') if x.strip()),
+            max_pudo_rows_per_split=args.max_rows_per_split)
+    elif args.command == "carla-triplets":
         result = classify_carla_triplet(Path(args.study))
         _atomic_json(Path(args.output), result)
     elif args.command == "carla-fiveway":
@@ -124,7 +155,9 @@ def main(argv=None):
         names=("carla_triplets.json","directed_remine.summary.json",
                "site_evidence.json","temporal.summary.json","observation_benchmark.json",
                "legacy_inventory.json","outputs_inventory.json",
-               "baseline_comparison.summary.json","research_gates.json", "carla_fiveway.json")
+               "baseline_comparison.summary.json","research_gates.json", "carla_fiveway.json",
+               "geometry_progress.summary.json","controlled_factorial.summary.json",
+               "dataset_evidence_audit.json")
         manifest={"schema":"capplan_handoff_study_review_bundle",
                   "scope":"METADATA_ONLY_NO_RAW_GRAPH_OR_VEHICLE_TRAJECTORIES",
                   "files":{},"missing":[]}

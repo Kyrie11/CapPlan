@@ -184,7 +184,7 @@ def _edges_for_contract(graph, contract, *, directed: bool):
         cost = float(e.length_m)
         adj[e.from_node].append((e.to_node, cost, e))
         rev[e.to_node].append((e.from_node, cost, e))
-        by_id[e.edge_id].append((e.from_node, e.to_node))
+        by_id[str(e.edge_id)].append((e.from_node, e.to_node, e))
         if not directed:
             adj[e.to_node].append((e.from_node, cost, e))
             rev[e.from_node].append((e.to_node, cost, e))
@@ -249,7 +249,7 @@ def inspect_graph_pair(pair, graph, notice_times, *, speed_mps: float, ack_s: fl
     contract = pair["screening_contract"]
     node = pair["pedestrian_graph_nodes"]
     origin, A, B = node["origin"], node["A"], node["B"]
-    adj, rev, _ = _edges_for_contract(graph, contract, directed=directed)
+    adj, rev, edge_index = _edges_for_contract(graph, contract, directed=directed)
     dist_O, prev_O = _tree(adj, origin)
     path_A, nodes_A = _recover_path(prev_O, origin, A)
     distance_budget = float(contract["distance_budget_m"])
@@ -264,7 +264,7 @@ def inspect_graph_pair(pair, graph, notice_times, *, speed_mps: float, ack_s: fl
                 "wait_budgets_and_evidence_time_checked": False,
                 "real_physical_handoff_verified": False,
                 "evidence_level": "ENCODED_GRAPH_ONLY", "real_world_unreachable": None}
-    dist_to_B, _ = _tree(rev, B)
+    dist_to_B, prev_to_B = _tree(rev, B)
     dist_A_B = dist_to_B.get(A, float("inf"))
     distance_A = dist_O[A]
     distance_B = dist_O[B]
@@ -280,6 +280,63 @@ def inspect_graph_pair(pair, graph, notice_times, *, speed_mps: float, ack_s: fl
     for u, outs in adj.items():
         for v, weight, _ in outs:
             reverse_costs[(u, v)] = min(weight, reverse_costs.get((u, v), float("inf")))
+    def edge_witness(u, v, edge_id, length):
+        candidates=edge_index.get(str(edge_id), ())
+        edge=next((entry[2] for entry in candidates if entry[0]==u and entry[1]==v),None)
+        if edge is None and not directed:
+            edge=next((entry[2] for entry in candidates if entry[0]==v and entry[1]==u),None)
+        metadata=getattr(edge,'metadata',None)
+        metadata=metadata if isinstance(metadata,dict) else {}
+        fp=metadata.get('field_provenance') or metadata.get('provenance')
+        provenance_kinds={}
+        if isinstance(fp,dict):
+            for field in ('width_m','slope','cross_slope','step_free','length_m'):
+                item=fp.get(field)
+                if isinstance(item,dict):provenance_kinds[field]=item.get('kind','unknown')
+        return {'edge_id':str(edge_id),'from':str(u),'to':str(v),
+                'length_m':round(float(length),6),
+                'recorded_edge_source':getattr(edge,'source',None),
+                'recorded_provenance_kinds':provenance_kinds,
+                'physical_direction_independently_attested':False}
+
+    def suffix_witness(start):
+        """Walk start->B by reversing the reverse-Dijkstra predecessor chain."""
+        revpath,_ = _recover_path(prev_to_B,B,start)
+        if revpath is None:return None
+        return [edge_witness(v,u,eid,ln) for u,v,ln,eid in reversed(revpath)]
+
+    def midroute_suffix(progress):
+        """A fractional first-arc connector plus a concrete directed B suffix."""
+        if not path_A:return None
+        total=sum(x[2] for x in path_A)
+        if progress>=total-1e-8:
+            return {'first_segment':None,'directed_suffix_to_B':suffix_witness(A),
+                    'fractional_location_is_synthetic_interpolation':True}
+        along=0.
+        for u,v,ln,eid in path_A:
+            if progress<=along+ln+1e-8:
+                used=max(0.,progress-along)
+                ahead=(ln-used)+dist_to_B.get(v,float('inf'))
+                backward_edge=next(((w,edge) for to,w,edge in adj.get(v,()) if to==u),None)
+                back_cost=(used/ln*backward_edge[0]+dist_to_B.get(u,float('inf'))
+                           if backward_edge and ln>0 else float('inf'))
+                if used<=1e-8 and dist_to_B.get(u,float('inf'))<=min(ahead,back_cost)+1e-8:
+                    return {'first_segment':None,'directed_suffix_to_B':suffix_witness(u),
+                            'fractional_location_is_synthetic_interpolation':True}
+                if ahead<=back_cost:
+                    first={'from_fractional_position_to_node':v,'direction':'FORWARD_ON_STORED_ARC',
+                           'edge_id':eid,'distance_m':round(ln-used,6)}
+                    target=v
+                else:
+                    first={'from_fractional_position_to_node':u,'direction':'REVERSE_ARC_PRESENT',
+                           'edge_id':str(backward_edge[1].edge_id),
+                           'distance_m':round(used/ln*backward_edge[0],6)}
+                    target=u
+                return {'first_segment':first,'directed_suffix_to_B':suffix_witness(target),
+                        'fractional_location_is_synthetic_interpolation':True}
+            along+=ln
+        return None
+
     rest = []
     other_nodes = {str(z.get("anchor_id")): z.get("adjacent_ped_node_id") or z.get("anchor_id")
                    for z in other_anchors if z.get("legal_stop") is True and
@@ -318,13 +375,14 @@ def inspect_graph_pair(pair, graph, notice_times, *, speed_mps: float, ack_s: fl
                      "distance_to_B_m": round(dB, 3) if math.isfinite(dB) else None,
                      "B_within_distance_budget": bool(math.isfinite(dB) and consumed + progress + dB <= distance_budget + 1e-9),
                      "third_graph_feasible_count": len(third), "third_graph_examples": third[:10],
+                     "B_directed_suffix_witness":midroute_suffix(progress),
                      "unknown_physical_stopping_legality_and_vehicle_time": True})
     return {"episode_id": pair.get("episode_id"), "a_anchor": pair.get("a_anchor"),
             "b_anchor": pair.get("b_anchor"), "city": _mode_city(pair),
             "status": state, "direction_mode": "AS_ENCODED" if directed else "OPTIMISTIC_SYMMETRIZED",
             "direction_encoding_independently_audited": False,
             "path_O_A_node_ids": nodes_A,
-            "path_O_A_edges": [{"edge_id": eid, "from": u, "to": v, "length_m": ln} for u, v, ln, eid in path_A],
+            "path_O_A_edges": [edge_witness(u,v,eid,ln) for u,v,ln,eid in path_A],
             "O_A_m": round(distance_A, 4), "O_B_m": round(distance_B, 4),
             "A_B_m": round(dist_A_B, 4) if math.isfinite(dist_A_B) else None,
             "original_pair_distances_m": pair.get("distances_m"),
