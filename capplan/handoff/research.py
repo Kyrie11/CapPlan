@@ -256,8 +256,13 @@ def inspect_graph_pair(pair, graph, notice_times, *, speed_mps: float, ack_s: fl
     consumed = float(contract.get("already_consumed_m", 0.0))
     if path_A is None or B not in dist_O:
         return {"episode_id": pair.get("episode_id"), "a_anchor": pair.get("a_anchor"),
-                "b_anchor": pair.get("b_anchor"), "status": "NO_TWO_DIRECT_PATHS_UNDER_ENCODING",
+                "b_anchor": pair.get("b_anchor"), "city": _mode_city(pair),
+                "direction_mode": "AS_ENCODED" if directed else "OPTIMISTIC_SYMMETRIZED",
+                "status": "NO_TWO_DIRECT_PATHS_UNDER_ENCODING",
                 "origin_to_A_available": path_A is not None, "origin_to_B_available": B in dist_O,
+                "direction_encoding_independently_audited": False,
+                "wait_budgets_and_evidence_time_checked": False,
+                "real_physical_handoff_verified": False,
                 "evidence_level": "ENCODED_GRAPH_ONLY", "real_world_unreachable": None}
     dist_to_B, _ = _tree(rev, B)
     dist_A_B = dist_to_B.get(A, float("inf"))
@@ -347,25 +352,55 @@ def run_graph_screen(dataset_dir: Path, pairs_file: Path, output: Path, *, per_c
     counts = Counter()
     sample_by_city = Counter()
     errors = []
+    successful_pairs = set()
+    failed_pairs = set()
+    written_rows = 0
     with output.open("w", encoding="utf-8") as handle:
         for episode, subset in sorted(group.items()):
             try:
                 graph = load_accessibility_graph(dataset_dir, episode)
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                errors.append({"episode_id": episode, "stage": "load_graph", "error": repr(exc)})
                 for pair in subset:
                     sample_by_city[_mode_city(pair)] += 1
-                    for directed in (True, False):
+                    failed_pairs.add((episode, str(pair.get("a_anchor")), str(pair.get("b_anchor"))))
+                    handle.write(json.dumps({"episode_id": episode,
+                        "a_anchor": pair.get("a_anchor"), "b_anchor": pair.get("b_anchor"),
+                        "status": "UNKNOWN_GRAPH_LOAD_ERROR", "error": repr(exc),
+                        "evidence_level": "ENCODED_GRAPH_ONLY"}, ensure_ascii=False) + "\n")
+                    written_rows += 1
+                continue
+            for pair in subset:
+                sample_by_city[_mode_city(pair)] += 1
+                key = (episode, str(pair.get("a_anchor")), str(pair.get("b_anchor")))
+                any_error = False
+                for directed in (True, False):
+                    mode = "AS_ENCODED" if directed else "OPTIMISTIC_SYMMETRIZED"
+                    try:
                         r = inspect_graph_pair(pair, graph, list(times), speed_mps=speed_mps,
                                                ack_s=ack_s, directed=directed,
                                                other_anchors=anchors_by_ep[episode])
-                        counts[f"{r['direction_mode']}::{r['status']}"] += 1
-                        handle.write(json.dumps(r, ensure_ascii=False) + "\n")
-            except (ValueError, TypeError, KeyError, OSError) as exc:
-                errors.append({"episode_id": episode, "error": repr(exc)})
+                    except (ValueError, TypeError, KeyError, OSError, ZeroDivisionError) as exc:
+                        any_error = True
+                        r = {"episode_id": episode, "a_anchor": pair.get("a_anchor"),
+                             "b_anchor": pair.get("b_anchor"), "direction_mode": mode,
+                             "status": "UNKNOWN_PAIR_EVALUATION_ERROR", "error": repr(exc),
+                             "evidence_level": "ENCODED_GRAPH_ONLY"}
+                        errors.append({"episode_id": episode, "direction_mode": mode,
+                                       "stage": "evaluate_pair", "error": repr(exc)})
+                    counts[f"{mode}::{r['status']}"] += 1
+                    handle.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    written_rows += 1
+                (failed_pairs if any_error else successful_pairs).add(key)
     report = {
         "schema": "capplan_handoff_directed_remine",
         "selection": "HASH_RANKED_SITE_PAIR_DEDUPLICATED_FROM_PREVIOUSLY_SCREENED_CANDIDATES",
         "not_natural_event_incidence": True, "source_pairs_file_sha256": _digest_file(pairs_file),
         "original_selected_pairs": len(chosen), "selected_by_city": dict(sample_by_city),
+        "evaluated_pair_count": len(successful_pairs),
+        "unknown_pair_count": len(failed_pairs),
+        "direction_evaluation_rows_expected": 2 * len(chosen),
+        "direction_evaluation_rows_written": written_rows,
         "counts": dict(counts), "errors": errors[:30], "third_options_checked": third_options,
         "screening_contract_and_arc_direction_must_be_independently_audited": True,
         "scope": "GRAPH_REMINING_ONLY_NO_PHYSICAL_HANDOFF_OR_GLOBAL_STRANDING_CERTIFICATE",

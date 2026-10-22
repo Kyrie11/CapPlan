@@ -13,7 +13,7 @@ from capplan.handoff.carla_calibration_v12 import audit
 
 
 def construct(clear_dir,out_dir,*,runner='scripts/run_carla_controlled_handoff_v5.py',max_controls=6,
-              port=2000,host='127.0.0.1',redirect_s=8.0):
+              port=2000,host='127.0.0.1',redirect_s=8.0,extended_controls=False):
     out=Path(out_dir);out.mkdir(parents=True,exist_ok=True)
     r=audit(clear_dir);eligible=[];skipped=[]
     for trial in r.get('trials',[]):
@@ -44,10 +44,14 @@ def construct(clear_dir,out_dir,*,runner='scripts/run_carla_controlled_handoff_v
             '--stop_speed_mps',str(control['stop_speed_mps'])]
         if control.get('freeze_traffic_lights'):opts.append('--freeze_traffic_lights')
         if control.get('no_rendering'):opts.append('--no_rendering')
-        for mode in ('clear_A','blocked_A','blocked_A_redirect_B'):
-            target=out/({'clear_A':'clear_A','blocked_A':'blocked_A','blocked_A_redirect_B':'redirect_B'}[mode])/trial['trial']
+        modes = ('clear_A','blocked_A','blocked_A_redirect_B',
+                 'clear_B','clear_A_redirect_B') if extended_controls else (
+                 'clear_A','blocked_A','blocked_A_redirect_B')
+        for mode in modes:
+            target=out/({'clear_A':'clear_A','blocked_A':'blocked_A','blocked_A_redirect_B':'redirect_B',
+                         'clear_B':'clear_B','clear_A_redirect_B':'clear_A_redirect_B'}[mode])/trial['trial']
             cmd=['python',runner,'--mode',mode,'--output_dir',str(target),*opts]
-            if mode=='blocked_A_redirect_B':cmd+=['--redirect_at_s',str(redirect_s)]
+            if mode in ('blocked_A_redirect_B','clear_A_redirect_B'):cmd+=['--redirect_at_s',str(redirect_s)]
             lines.append(' '.join(shlex.quote(x) for x in cmd))
             if mode=='clear_A':
                 # Re-run the matched control in the SAME software and CARLA
@@ -62,7 +66,9 @@ def construct(clear_dir,out_dir,*,runner='scripts/run_carla_controlled_handoff_v
     summary={'controls_selected':len(eligible),'jobs_planned':len(jobs),'skipped':skipped,
              'jobs':jobs,'run_script':str(script), 'status':'PLAN_ONLY_NOT_EXECUTED',
              'this_is_real_pudo_evidence':False,'must_audit_with_existing_v12_paired_gate':True,
-             'must_rerun_successful_clear_in_same_runtime':True}
+             'must_rerun_successful_clear_in_same_runtime':True,
+             'extended_controls':bool(extended_controls),
+             'added_B_direct_and_unblocked_redirect_controls':bool(extended_controls)}
     (out/'paired_plan_manifest_v13.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
     return summary
 
@@ -71,8 +77,10 @@ def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--clear_dir',required=True)
     p.add_argument('--output_dir',required=True);p.add_argument('--max_controls',type=int,default=6)
     p.add_argument('--port',type=int,default=2000);p.add_argument('--host',default='127.0.0.1')
-    p.add_argument('--redirect_at_s',type=float,default=8);a=p.parse_args()
+    p.add_argument('--redirect_at_s',type=float,default=8)
+    p.add_argument('--extended-controls',action='store_true')
+    a=p.parse_args()
     if a.max_controls<1 or a.redirect_at_s<0:p.error('invalid controls or redirect time')
-    r=construct(a.clear_dir,a.output_dir,max_controls=a.max_controls,port=a.port,host=a.host,redirect_s=a.redirect_at_s)
+    r=construct(a.clear_dir,a.output_dir,max_controls=a.max_controls,port=a.port,host=a.host,redirect_s=a.redirect_at_s,extended_controls=a.extended_controls)
     print(json.dumps({'selected':r['controls_selected'],'jobs':r['jobs_planned'],'script':r['run_script'],'executed':False}))
 if __name__=='__main__':main()

@@ -19,6 +19,9 @@ def main(argv=None):
     a = s.add_parser("carla-triplets", help="Require actual redirect_B and matched per-trial controls")
     a.add_argument("--study", required=True, help="directory containing clear_A/blocked_A/redirect_B")
     a.add_argument("--output", required=True)
+    five = s.add_parser("carla-fiveway", help="Audit clear-A, blocked-A, clear-B, unblocked-redirect, blocked-redirect controls")
+    five.add_argument("--study", required=True)
+    five.add_argument("--output", required=True)
     b = s.add_parser("directed-remine", help="Fresh directional shortest paths, strict+optimistic sensitivity")
     b.add_argument("--dataset-dir", required=True)
     b.add_argument("--pairs", required=True)
@@ -45,6 +48,8 @@ def main(argv=None):
     a5.add_argument("--redirect-at-s", type=float, default=8)
     a5.add_argument("--host", default="127.0.0.1")
     a5.add_argument("--port", type=int, default=2000)
+    a5.add_argument("--extended-controls", action="store_true",
+                    help="also run clear_B and clear_A_redirect_B to isolate route vs blocker vs redirect")
     a7 = s.add_parser("observation-benchmark", help="Restricted one-observation synthetic comparison, NOT published shield")
     a7.add_argument("--output", required=True)
     a7.add_argument("--seed", type=int, default=13)
@@ -52,6 +57,12 @@ def main(argv=None):
     a7.add_argument("--horizon", type=int, default=100)
     a7.add_argument("--options", type=int, default=5)
     a7.add_argument("--worlds", type=int, default=4)
+    ba = s.add_parser("baseline-audit", help="Marginal/separated vs joint safe actions vs independent exact grid; NO published shield reproduction")
+    ba.add_argument("--cases", required=True)
+    ba.add_argument("--output", required=True)
+    rg = s.add_parser("review-gates", help="Verify current compact review bundle checksums and fail-closed H1-H5 status")
+    rg.add_argument("--review-dir", required=True)
+    rg.add_argument("--output", required=True)
     a6 = s.add_parser("review-pack", help="Create small, checksum-audited evidence ZIP")
     a6.add_argument("--study", required=True)
     a6.add_argument("--output", required=True)
@@ -61,6 +72,10 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.command == "carla-triplets":
         result = classify_carla_triplet(Path(args.study))
+        _atomic_json(Path(args.output), result)
+    elif args.command == "carla-fiveway":
+        from capplan.handoff.carla_experiments import audit
+        result = audit(Path(args.study))
         _atomic_json(Path(args.output), result)
     elif args.command == "directed-remine":
         result = run_graph_screen(Path(args.dataset_dir), Path(args.pairs), Path(args.output),
@@ -82,7 +97,8 @@ def main(argv=None):
     elif args.command == "carla-plan":
         from scripts.plan_carla_matched_v13 import construct
         result=construct(args.clear_dir,args.output_dir,max_controls=args.max_controls,
-                         port=args.port,host=args.host,redirect_s=args.redirect_at_s)
+                         port=args.port,host=args.host,redirect_s=args.redirect_at_s,
+                         extended_controls=args.extended_controls)
         result={"controls_selected":result["controls_selected"],
                 "jobs_planned":result["jobs_planned"],
                 "script":result["run_script"],"executed":False}
@@ -92,6 +108,13 @@ def main(argv=None):
             p.error("replicates, horizon, options, worlds must be positive")
         result=run(args.seed,args.replicates,args.horizon,args.options,args.worlds)
         _atomic_json(Path(args.output),result)
+    elif args.command == "baseline-audit":
+        from capplan.handoff.baselines import analyze_files
+        result = analyze_files(Path(args.cases), Path(args.output))
+    elif args.command == "review-gates":
+        from capplan.handoff.review_gates import review
+        result = review(Path(args.review_dir))
+        _atomic_json(Path(args.output),result)
     elif args.command == "review-pack":
         from zipfile import ZipFile, ZIP_DEFLATED
         from capplan.handoff.research import _digest_file
@@ -100,7 +123,8 @@ def main(argv=None):
         output.parent.mkdir(parents=True,exist_ok=True)
         names=("carla_triplets.json","directed_remine.summary.json",
                "site_evidence.json","temporal.summary.json","observation_benchmark.json",
-               "legacy_inventory.json","outputs_inventory.json")
+               "legacy_inventory.json","outputs_inventory.json",
+               "baseline_comparison.summary.json","research_gates.json", "carla_fiveway.json")
         manifest={"schema":"capplan_handoff_study_review_bundle",
                   "scope":"METADATA_ONLY_NO_RAW_GRAPH_OR_VEHICLE_TRAJECTORIES",
                   "files":{},"missing":[]}

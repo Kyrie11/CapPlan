@@ -135,7 +135,7 @@ def test_legacy_planner_does_not_halt_early_when_redirect_pending():
     # Regression guard until the CARLA agent is isolated behind a mockable API.
     assert 'redirect_command_applied' in text
     assert 'redirect_applied' in text
-    assert "if args.mode=='blocked_A_redirect_B' and not redirect_applied" in text
+    assert "if args.mode in ('blocked_A_redirect_B','clear_A_redirect_B') and not redirect_applied" in text
     assert 'braking_to_stop=False;stopped_dwell_s=0.0;best_dwell_s=0.0' in text
 
 

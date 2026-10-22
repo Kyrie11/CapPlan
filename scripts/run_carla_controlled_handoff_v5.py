@@ -11,7 +11,7 @@ import argparse, hashlib, json, math, os, sys, random
 from pathlib import Path
 
 def offline_spec():
-    return {'simulator':'CARLA 0.9.15','run_modes':['clear_A','blocked_A','blocked_A_redirect_B'],
+    return {'simulator':'CARLA 0.9.15','run_modes':['clear_A','blocked_A','clear_B','clear_A_redirect_B','blocked_A_redirect_B'],
       'scene':'CARLA native town, uncalibrated to nuPlan four-city geometry',
       'limits':['no actual PUDO legal status','no sidewalk connection/ADA geometry','no passenger capability','no independent boarding confirmation',
                 'no nuPlan-to-CARLA coordinate registration'],
@@ -114,7 +114,7 @@ def run(args):
             other=getattr(ev.other_actor,'type_id','unknown')
             collision_events.append({'frame':int(ev.frame),'other_actor':other})
         collision.listen(on_collision)
-        if args.mode!='clear_A':
+        if args.mode in ('blocked_A','blocked_A_redirect_B'):
             blocker_bp=library.find(args.blocker_blueprint)
             # Using a CARLA lane-center obstruction, NOT a real curb construction.
             block_tf=A.transform
@@ -129,16 +129,18 @@ def run(args):
         else:
             result['controlled_blocker_spawned']=False
         agent=BasicAgent(vehicle,target_speed=args.target_speed_kmh)
-        goal='A';agent.set_destination(A.transform.location)
+        goal='B' if args.mode=='clear_B' else 'A';agent.set_destination(B.transform.location if goal=='B' else A.transform.location)
         # V9 instrumentation only (does not change control). It distinguishes
         # a poor target/route choice from vehicle inability to stop.
         start_tf=vehicle.get_transform()
         forward=start_tf.get_forward_vector()
-        delta=A.transform.location-start_tf.location
+        initial_destination=(B.transform.location if goal=='B' else A.transform.location)
+        delta=initial_destination-start_tf.location
         denom=max(1e-9,math.hypot(delta.x,delta.y)*math.hypot(forward.x,forward.y))
         route_debug={'start_yaw_deg':float(start_tf.rotation.yaw),
                      'heading_dot_to_goal_xy':float((delta.x*forward.x+delta.y*forward.y)/denom),
-                     'target_start_euclidean_m':float(math.hypot(delta.x,delta.y))}
+                     'target_start_euclidean_m':float(math.hypot(delta.x,delta.y)),
+                     'initial_destination':goal}
         try:
             local=agent.get_local_planner()
             route=list(local.get_plan()) if hasattr(local,'get_plan') else []
@@ -160,7 +162,7 @@ def run(args):
             simtime=float(snap.timestamp.elapsed_seconds)
             if sim_start is None:sim_start=simtime
             elapsed=simtime-sim_start
-            if args.mode=='blocked_A_redirect_B' and not changed and elapsed>=args.redirect_at_s:
+            if args.mode in ('blocked_A_redirect_B','clear_A_redirect_B') and not changed and elapsed>=args.redirect_at_s:
                 # Old code retained the A-stop brake latch after a redirect.
                 # A goal switch must release the A hold and restart the B
                 # dwell/arrival measurements. The vehicle has NOT yet reached B.
@@ -196,12 +198,12 @@ def run(args):
                     # Do NOT call it a B redirect success when A finishes
                     # before the scheduled redirect_at_s. Keep the A hold
                     # until the B command becomes actionable.
-                    if args.mode=='blocked_A_redirect_B' and not redirect_applied:
+                    if args.mode in ('blocked_A_redirect_B','clear_A_redirect_B') and not redirect_applied:
                         pass
                     else:
                         reached=True;break
             elif gap<=args.arrival_radius_m:
-                if args.mode=='blocked_A_redirect_B' and not redirect_applied:
+                if args.mode in ('blocked_A_redirect_B','clear_A_redirect_B') and not redirect_applied:
                     pass
                 else:
                     reached=True;break
@@ -244,7 +246,7 @@ def run(args):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--output_dir',required=True);p.add_argument('--host',default='127.0.0.1');p.add_argument('--port',type=int,default=2000)
-    p.add_argument('--map',default='Town03');p.add_argument('--mode',choices=['clear_A','blocked_A','blocked_A_redirect_B'],default='clear_A')
+    p.add_argument('--map',default='Town03');p.add_argument('--mode',choices=['clear_A','blocked_A','clear_B','clear_A_redirect_B','blocked_A_redirect_B'],default='clear_A')
     p.add_argument('--spawn_index',type=int,default=0);p.add_argument('--seed',type=int,default=13)
     p.add_argument('--a_steps',type=int,default=7);p.add_argument('--b_steps',type=int,default=8)
     p.add_argument('--redirect_at_s',type=float,default=8);p.add_argument('--target_speed_kmh',type=float,default=20)
@@ -257,7 +259,7 @@ def main():
     p.add_argument('--dry_run',action='store_true')
     a=p.parse_args()
     if a.dt<=0 or a.max_seconds<=0 or a.redirect_at_s<0 or a.target_speed_kmh<=0 or a.a_steps<=0 or a.b_steps<=0 or a.service_stop_hold_s<0 or a.stop_speed_mps<=0:p.error('invalid timing or speed')
-    if a.mode=='blocked_A_redirect_B' and a.redirect_at_s>=a.max_seconds:
+    if a.mode in ('blocked_A_redirect_B','clear_A_redirect_B') and a.redirect_at_s>=a.max_seconds:
         p.error('redirect_at_s must precede the experiment horizon')
     out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True)
     if a.dry_run:
