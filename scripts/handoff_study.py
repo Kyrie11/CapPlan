@@ -85,8 +85,29 @@ def main(argv=None):
     census.add_argument("--output", required=True)
     census.add_argument("--splits", default="train,val,test")
     census.add_argument("--max-rows-per-split", type=int, default=0, help="0 = read all PUDO rows; positive is PREFIX only")
+    fa = s.add_parser("factorial-science", help="Audit full 2x2x2 interaction table; SYNTHETIC responses only")
+    fa.add_argument("--rows", required=True, help="controlled_factorial.jsonl, not its summary")
+    fa.add_argument("--output", required=True)
+    queue = s.add_parser("physical-review-queue", help="Create UNKNOWN-only independent site review worklist")
+    queue.add_argument("--packets", required=True, help="geometry_progress.jsonl, not its summary")
+    queue.add_argument("--output", required=True)
+    queue.add_argument("--max-sites", type=int, default=60)
+    sh = s.add_parser("causal-exact", help="Paired generic finite AND/OR vs exact interval-boarding checker; NOT published shield")
+    sh.add_argument("--cases", required=True, help="Explicit model JSONL, with world windows and directed movement")
+    sh.add_argument("--output", required=True)
+    sh.add_argument("--max-states", type=int, default=20000)
+    sh.add_argument("--max-cases", type=int, default=0)
     args = p.parse_args(argv)
-    if args.command == "progress-packets":
+    if args.command == "factorial-science":
+        from capplan.handoff.factorial_science_v2 import analyze_factorial
+        result = analyze_factorial(Path(args.rows), Path(args.output))
+    elif args.command == "physical-review-queue":
+        from capplan.handoff.site_review_queue_v2 import make_review_queue
+        result = make_review_queue(Path(args.packets), Path(args.output), max_sites=args.max_sites)
+    elif args.command == "causal-exact":
+        from capplan.handoff.causal_policy_v2 import compare_jsonl
+        result = compare_jsonl(Path(args.cases), Path(args.output),max_states=args.max_states,max_cases=args.max_cases)
+    elif args.command == "progress-packets":
         from capplan.handoff.evidence_bridge import export_progress_packets
         result=export_progress_packets(remine=Path(args.remine),output=Path(args.output),
             pairs=Path(args.pairs) if args.pairs else None,
